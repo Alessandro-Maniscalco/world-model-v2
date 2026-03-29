@@ -1,0 +1,9 @@
+h5py
+numpy
+pyarrow
+huggingface_hub
+torch==2.7.1
+torchvision==0.22.1
+Pillow
+imageio
+pytest

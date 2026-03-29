@@ -1,8 +1,8 @@
 <INSTRUCTIONS>
 ## Docstrings
-- Every source file must start with a top of the file module docstring describing the module’s purpose.
+- Source file must start with a top of the file module docstring describing the purpose.
 - Exclude vendored, generated, or third-party code.
-- Every function should have a concise docstring describing its purpose.
+- Every function should have a concise docstring.
 ## Testing
 - Every new source file containing logic should have a corresponding test file in the `tests/` directory.
 - Exception: lightweight smoke-check scripts under `scripts/check/` do not require a corresponding pytest file when they are only intended for manual execution.

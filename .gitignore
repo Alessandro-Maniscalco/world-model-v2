@@ -27,3 +27,4 @@ assets/**
 /latent
 /preprocessed
 /tmp_vace/
+/outputs/
