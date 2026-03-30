@@ -27,14 +27,15 @@ Python.
 
 - `world_model_v2/algorithms/latent_dynamics/latent_world_model.py`
 
-Primary Stage-1 model class:
+Primary Stage-1/2/3 model class:
 
 - `LatentWorldModel`
 
 Responsibilities:
 
-- Stage-1 loss computation
-- reconstruction
+- stage-aware loss computation
+- checkpoint bootstrapping
+- reconstruction and rollout
 - validation preview stats
 
 - `world_model_v2/algorithms/latent_dynamics/noise_scheduler.py`
@@ -53,6 +54,10 @@ Small CNN image encoder.
 - `world_model_v2/algorithms/models/cm_decoder.py`
 
 Consistency-style decoder with latent conditioning.
+
+- `world_model_v2/algorithms/models/cm_latent_dynamics.py`
+
+Lightweight action-conditioned latent dynamics model.
 
 - `world_model_v2/algorithms/models/blocks.py`
 
@@ -107,6 +112,11 @@ Loads a checkpoint, reconstructs one episode, and writes:
 - side-by-side grid
 - side-by-side GIF
 - stats JSON
+
+- `world_model_v2/infer/predict_rollout.py`
+
+Loads a Stage-2 or Stage-3 checkpoint, predicts a rollout, and writes the same
+artifact set.
 
 ## Utils
 
@@ -169,12 +179,12 @@ Tests live in `tests/` and cover:
 Implemented:
 
 - Stage 1 autoencoder training
-- checkpoint reload
-- reconstruction visualization
+- Stage 2 latent dynamics training
+- Stage 3 decoder finetuning
+- checkpoint reload / bootstrap
+- reconstruction and rollout visualization
 
 Not implemented yet:
 
-- Stage 2 latent dynamics training
-- Stage 3 decoder finetuning
 - upstream zarr/cache path
 - Hydra / Lightning / W&B stack

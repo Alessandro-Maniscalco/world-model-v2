@@ -1,4 +1,4 @@
-"""Dataclass-based run configuration for the upstream-shaped Stage-1 pipeline."""
+"""Dataclass-based run configuration for the three-stage latent world model."""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ class DatasetConfig:
 
 @dataclass
 class AlgorithmConfig:
-    """Algorithm settings for the Stage-1 latent world model."""
+    """Algorithm settings for the three-stage latent world model."""
 
     training_stage: int = 1
     latent_channels: int = 4
@@ -68,6 +68,18 @@ class AlgorithmConfig:
     sigma_min: float = 0.01
     sigma_max: float = 1.0
     infer_steps: int = 2
+    dyn_infer_steps: int = 1
+    load_ae: str = ""
+    action_dim: int = 4
+    dynamics_hidden_channels: int = 64
+    action_emb_dim: int = 128
+    dynamics_attention_heads: int = 4
+    mask_prev_action: bool = False
+    sampling_strategy: str = "uniform"
+    prev_frame_noise_scale: float = 0.1
+    last_frame_loss_only: bool = False
+    loss_weighting: str = "auto"
+    stage3_latent_noise_std: float = 0.02
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the config into a JSON-serializable dictionary."""
@@ -95,10 +107,28 @@ class AlgorithmConfig:
             infer_steps=3,
         )
 
+    @classmethod
+    def upstream_stage2(cls, num_views: int) -> "AlgorithmConfig":
+        """Return upstream-like Stage-2 defaults for overlapping local config fields."""
+
+        if num_views < 1:
+            raise ValueError("num_views must be at least 1")
+        return cls(
+            training_stage=2,
+            latent_channels=4 * num_views,
+            latent_dim=512,
+            hidden_channels=64,
+            timesteps=1000,
+            infer_steps=3,
+            dyn_infer_steps=1,
+            sampling_strategy="terminal_only",
+            loss_weighting="uniform",
+        )
+
 
 @dataclass
 class ExperimentConfig:
-    """Experiment runner settings for Stage-1 training."""
+    """Experiment runner settings for training and validation."""
 
     run_name: str = ""
     output_dir: str = "outputs/stage1"

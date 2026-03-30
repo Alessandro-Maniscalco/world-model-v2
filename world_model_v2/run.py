@@ -1,4 +1,4 @@
-"""Upstream-shaped plain-Python entrypoint for Stage-1 latent world model training."""
+"""Upstream-shaped plain-Python entrypoint for three-stage latent world model training."""
 
 from __future__ import annotations
 
@@ -43,6 +43,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     algorithm_group.add_argument("--sigma-min", type=float, default=0.01)
     algorithm_group.add_argument("--sigma-max", type=float, default=1.0)
     algorithm_group.add_argument("--infer-steps", type=int, default=2)
+    algorithm_group.add_argument("--dyn-infer-steps", type=int, default=1)
+    algorithm_group.add_argument("--load-ae", default="")
+    algorithm_group.add_argument("--action-dim", type=int, default=4)
+    algorithm_group.add_argument("--dynamics-hidden-channels", type=int, default=64)
+    algorithm_group.add_argument("--action-emb-dim", type=int, default=128)
+    algorithm_group.add_argument("--dynamics-attention-heads", type=int, default=4)
+    algorithm_group.add_argument("--mask-prev-action", action="store_true")
+    algorithm_group.add_argument("--sampling-strategy", default="uniform")
+    algorithm_group.add_argument("--prev-frame-noise-scale", type=float, default=0.1)
+    algorithm_group.add_argument("--last-frame-loss-only", action="store_true")
+    algorithm_group.add_argument("--loss-weighting", default="auto")
+    algorithm_group.add_argument("--stage3-latent-noise-std", type=float, default=0.02)
 
     experiment_group = parser.add_argument_group("experiment")
     experiment_group.add_argument("--run-name", default="")
@@ -90,6 +102,9 @@ def build_run_config(args: argparse.Namespace) -> RunConfig:
         timesteps = args.timesteps
         infer_steps = args.infer_steps
 
+    if args.training_stage in (2, 3) and not args.load_ae:
+        raise ValueError("--load-ae is required for training-stage 2 and 3")
+
     return RunConfig(
         dataset=DatasetConfig(
             data_root=args.data_root,
@@ -110,6 +125,18 @@ def build_run_config(args: argparse.Namespace) -> RunConfig:
             sigma_min=args.sigma_min,
             sigma_max=args.sigma_max,
             infer_steps=infer_steps,
+            dyn_infer_steps=args.dyn_infer_steps,
+            load_ae=args.load_ae,
+            action_dim=args.action_dim,
+            dynamics_hidden_channels=args.dynamics_hidden_channels,
+            action_emb_dim=args.action_emb_dim,
+            dynamics_attention_heads=args.dynamics_attention_heads,
+            mask_prev_action=args.mask_prev_action,
+            sampling_strategy=args.sampling_strategy,
+            prev_frame_noise_scale=args.prev_frame_noise_scale,
+            last_frame_loss_only=args.last_frame_loss_only,
+            loss_weighting=args.loss_weighting,
+            stage3_latent_noise_std=args.stage3_latent_noise_std,
         ),
         experiment=ExperimentConfig(
             run_name=args.run_name,
@@ -137,7 +164,7 @@ def build_run_config(args: argparse.Namespace) -> RunConfig:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Build the experiment from CLI args and run Stage-1 training."""
+    """Build the experiment from CLI args and run the requested training stage."""
 
     args = parse_args(argv)
     cfg = build_run_config(args)

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from world_model_v2.run import build_run_config, main, parse_args
 
 
@@ -88,3 +90,59 @@ def test_build_run_config_supports_early_stop_flags() -> None:
     assert cfg.experiment.early_stop_patience_windows == 4
     assert cfg.experiment.early_stop_min_delta == 0.005
     assert cfg.experiment.early_stop_warmup_steps == 1000
+
+
+def test_build_run_config_supports_stage2_flags() -> None:
+    """The runner should expose the Stage-2 and Stage-3 algorithm options."""
+
+    args = parse_args(
+        [
+            "--training-stage",
+            "2",
+            "--load-ae",
+            "stage1.pt",
+            "--dyn-infer-steps",
+            "3",
+            "--action-dim",
+            "4",
+            "--dynamics-hidden-channels",
+            "32",
+            "--action-emb-dim",
+            "96",
+            "--dynamics-attention-heads",
+            "2",
+            "--mask-prev-action",
+            "--sampling-strategy",
+            "terminal_only",
+            "--prev-frame-noise-scale",
+            "0.2",
+            "--last-frame-loss-only",
+            "--loss-weighting",
+            "uniform",
+            "--stage3-latent-noise-std",
+            "0.05",
+        ]
+    )
+    cfg = build_run_config(args)
+    assert cfg.algorithm.training_stage == 2
+    assert cfg.algorithm.load_ae == "stage1.pt"
+    assert cfg.algorithm.dyn_infer_steps == 3
+    assert cfg.algorithm.action_dim == 4
+    assert cfg.algorithm.dynamics_hidden_channels == 32
+    assert cfg.algorithm.action_emb_dim == 96
+    assert cfg.algorithm.dynamics_attention_heads == 2
+    assert cfg.algorithm.mask_prev_action is True
+    assert cfg.algorithm.sampling_strategy == "terminal_only"
+    assert cfg.algorithm.prev_frame_noise_scale == 0.2
+    assert cfg.algorithm.last_frame_loss_only is True
+    assert cfg.algorithm.loss_weighting == "uniform"
+    assert cfg.algorithm.stage3_latent_noise_std == 0.05
+
+
+def test_build_run_config_requires_load_ae_for_stage2_and_stage3() -> None:
+    """Later training stages should fail fast when no bootstrap checkpoint is given."""
+
+    with pytest.raises(ValueError):
+        build_run_config(parse_args(["--training-stage", "2"]))
+    with pytest.raises(ValueError):
+        build_run_config(parse_args(["--training-stage", "3"]))

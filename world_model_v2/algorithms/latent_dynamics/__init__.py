@@ -1,2 +1,1 @@
-"""Latent-dynamics algorithms for the upstream-shaped Stage-1 package."""
-
+"""Latent-dynamics algorithms for the upstream-shaped three-stage package."""

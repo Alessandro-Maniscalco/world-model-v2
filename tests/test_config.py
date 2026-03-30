@@ -10,7 +10,22 @@ def test_run_config_round_trip_preserves_nested_sections() -> None:
 
     cfg = RunConfig(
         dataset=DatasetConfig(obs_keys=("camera_1_color",), horizon=1, val_horizon=6),
-        algorithm=AlgorithmConfig(training_stage=1, latent_dim=64),
+        algorithm=AlgorithmConfig(
+            training_stage=2,
+            latent_dim=64,
+            dyn_infer_steps=2,
+            load_ae="stage1.pt",
+            action_dim=4,
+            dynamics_hidden_channels=32,
+            action_emb_dim=96,
+            dynamics_attention_heads=2,
+            mask_prev_action=True,
+            sampling_strategy="terminal_only",
+            prev_frame_noise_scale=0.2,
+            last_frame_loss_only=True,
+            loss_weighting="uniform",
+            stage3_latent_noise_std=0.05,
+        ),
         experiment=ExperimentConfig(
             run_name="demo",
             device="cpu",
@@ -26,6 +41,19 @@ def test_run_config_round_trip_preserves_nested_sections() -> None:
     restored = RunConfig.from_dict(cfg.to_dict())
     assert restored.dataset.obs_keys == ("camera_1_color",)
     assert restored.algorithm.latent_dim == 64
+    assert restored.algorithm.training_stage == 2
+    assert restored.algorithm.dyn_infer_steps == 2
+    assert restored.algorithm.load_ae == "stage1.pt"
+    assert restored.algorithm.action_dim == 4
+    assert restored.algorithm.dynamics_hidden_channels == 32
+    assert restored.algorithm.action_emb_dim == 96
+    assert restored.algorithm.dynamics_attention_heads == 2
+    assert restored.algorithm.mask_prev_action is True
+    assert restored.algorithm.sampling_strategy == "terminal_only"
+    assert restored.algorithm.prev_frame_noise_scale == 0.2
+    assert restored.algorithm.last_frame_loss_only is True
+    assert restored.algorithm.loss_weighting == "uniform"
+    assert restored.algorithm.stage3_latent_noise_std == 0.05
     assert restored.experiment.run_name == "demo"
     assert restored.experiment.save_preview_initial_minutes == 10.0
     assert restored.experiment.save_preview_late_minutes == 30.0
@@ -46,3 +74,18 @@ def test_upstream_stage1_config_matches_published_overlapping_sizes() -> None:
     assert cfg.hidden_channels == 64
     assert cfg.timesteps == 1000
     assert cfg.infer_steps == 3
+
+
+def test_upstream_stage2_config_matches_published_overlapping_sizes() -> None:
+    """The upstream Stage-2 helper should mirror the local overlap with the upstream recipe."""
+
+    cfg = AlgorithmConfig.upstream_stage2(num_views=2)
+    assert cfg.training_stage == 2
+    assert cfg.latent_channels == 8
+    assert cfg.latent_dim == 512
+    assert cfg.hidden_channels == 64
+    assert cfg.timesteps == 1000
+    assert cfg.infer_steps == 3
+    assert cfg.dyn_infer_steps == 1
+    assert cfg.sampling_strategy == "terminal_only"
+    assert cfg.loss_weighting == "uniform"

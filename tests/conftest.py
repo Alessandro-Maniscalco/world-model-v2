@@ -45,13 +45,13 @@ def fake_dataset_root(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def saved_checkpoint(tmp_path: Path) -> Path:
-    """Create a small valid checkpoint for inference tests."""
+def saved_stage1_checkpoint(fake_dataset_root: Path, tmp_path: Path) -> Path:
+    """Create a small valid Stage-1 checkpoint for inference and bootstrap tests."""
 
-    checkpoint_path = tmp_path / "checkpoint.pt"
+    checkpoint_path = tmp_path / "stage1_checkpoint.pt"
     run_config = RunConfig(
         dataset=DatasetConfig(
-            data_root=str(tmp_path / "data"),
+            data_root=str(fake_dataset_root),
             split="train",
             obs_keys=("camera_1_color",),
             resolution=32,
@@ -82,3 +82,64 @@ def saved_checkpoint(tmp_path: Path) -> Path:
         normalization_stats,
     )
     return checkpoint_path
+
+
+@pytest.fixture()
+def saved_stage2_checkpoint(
+    fake_dataset_root: Path,
+    saved_stage1_checkpoint: Path,
+    tmp_path: Path,
+) -> Path:
+    """Create a small valid Stage-2 checkpoint bootstrapped from Stage 1."""
+
+    checkpoint_path = tmp_path / "stage2_checkpoint.pt"
+    run_config = RunConfig(
+        dataset=DatasetConfig(
+            data_root=str(fake_dataset_root),
+            split="train",
+            obs_keys=("camera_1_color",),
+            resolution=32,
+            horizon=4,
+            val_horizon=6,
+        ),
+        algorithm=AlgorithmConfig(
+            training_stage=2,
+            latent_channels=4,
+            latent_dim=64,
+            hidden_channels=32,
+            timesteps=8,
+            sigma_min=0.01,
+            sigma_max=0.5,
+            infer_steps=2,
+            dyn_infer_steps=1,
+            load_ae=str(saved_stage1_checkpoint),
+            action_dim=4,
+            dynamics_hidden_channels=32,
+            action_emb_dim=64,
+            dynamics_attention_heads=4,
+        ),
+        experiment=ExperimentConfig(run_name="fixture_stage2", device="cpu"),
+    )
+    model = LatentWorldModel(run_config.algorithm, obs_keys=run_config.dataset.obs_keys)
+    model.bootstrap_from_checkpoint(str(saved_stage1_checkpoint), device="cpu")
+    optimizer = torch.optim.AdamW(
+        [param for param in model.parameters() if param.requires_grad],
+        lr=1e-3,
+    )
+    normalization_stats = {"image_range": [0.0, 1.0], "action_min": [0, 0, 0, 0], "action_max": [1, 1, 1, 1]}
+    save_checkpoint(
+        checkpoint_path,
+        model,
+        optimizer,
+        2,
+        run_config.to_dict(),
+        normalization_stats,
+    )
+    return checkpoint_path
+
+
+@pytest.fixture()
+def saved_checkpoint(saved_stage1_checkpoint: Path) -> Path:
+    """Preserve the legacy Stage-1 checkpoint fixture name for existing tests."""
+
+    return saved_stage1_checkpoint

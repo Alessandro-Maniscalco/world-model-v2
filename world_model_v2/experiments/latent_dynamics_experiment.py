@@ -1,4 +1,4 @@
-"""Plain PyTorch experiment runner for the upstream-shaped Stage-1 package."""
+"""Plain PyTorch experiment runner for the upstream-shaped three-stage package."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from world_model_v2.utils.visualization import build_side_by_side_grid, write_si
 
 
 class LatentDynamicsExperiment:
-    """Run Stage-1 training, checkpointing, and validation previews."""
+    """Run Stage 1, 2, and 3 training, checkpointing, and validation previews."""
 
     def __init__(self, cfg: RunConfig) -> None:
         """Build datasets, model, optimizer, and filesystem paths."""
@@ -35,6 +35,7 @@ class LatentDynamicsExperiment:
         self.metrics_path = self.run_dir / "metrics.jsonl"
         self.train_dataset = RealAlohaDataset(cfg.dataset)
         self.val_dataset = self.train_dataset.get_validation_dataset()
+        self._validate_stage_requirements()
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=cfg.experiment.batch_size,
@@ -49,12 +50,11 @@ class LatentDynamicsExperiment:
             shuffle=False,
             num_workers=0,
         )
+        self._validate_action_dim()
         self.model = LatentWorldModel(cfg.algorithm, cfg.dataset.obs_keys).to(self.device)
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=cfg.experiment.lr,
-            weight_decay=cfg.experiment.weight_decay,
-        )
+        if cfg.algorithm.load_ae:
+            self.model.bootstrap_from_checkpoint(cfg.algorithm.load_ae, self.device)
+        self.optimizer = self._build_optimizer()
         self.early_stop_window_losses: deque[float] = deque(
             maxlen=max(cfg.experiment.early_stop_window_size, 1)
         )
@@ -82,6 +82,37 @@ class LatentDynamicsExperiment:
                 "CUDA was requested but is not available to PyTorch. Install a torch wheel "
                 "compatible with the local NVIDIA driver or rerun with --device cpu."
             )
+
+    def _validate_stage_requirements(self) -> None:
+        """Fail early when the selected stage configuration is incomplete."""
+
+        if self.cfg.algorithm.training_stage == 2 and self.cfg.dataset.horizon < 2:
+            raise ValueError("Stage 2 training requires dataset horizon >= 2.")
+        if self.cfg.algorithm.training_stage in (2, 3) and not self.cfg.algorithm.load_ae:
+            raise ValueError("Stage 2 and 3 require cfg.algorithm.load_ae.")
+
+    def _validate_action_dim(self) -> None:
+        """Check that the configured action dimension matches the dataset."""
+
+        sample = self.train_dataset[0]
+        observed_action_dim = int(torch.as_tensor(sample["action"]).shape[-1])
+        if observed_action_dim != self.cfg.algorithm.action_dim:
+            raise ValueError(
+                f"Configured action_dim={self.cfg.algorithm.action_dim} does not match dataset "
+                f"action dim={observed_action_dim}."
+            )
+
+    def _build_optimizer(self) -> torch.optim.Optimizer:
+        """Build the optimizer over the currently trainable parameter set."""
+
+        parameters = [param for param in self.model.parameters() if param.requires_grad]
+        if not parameters:
+            raise ValueError("No trainable parameters were selected for the current stage.")
+        return torch.optim.AdamW(
+            parameters,
+            lr=self.cfg.experiment.lr,
+            weight_decay=self.cfg.experiment.weight_decay,
+        )
 
     def _default_run_name(self, task: str) -> str:
         """Generate a timestamped default run name."""
@@ -148,6 +179,18 @@ class LatentDynamicsExperiment:
                 "hidden_channels": self.cfg.algorithm.hidden_channels,
                 "timesteps": self.cfg.algorithm.timesteps,
                 "infer_steps": self.cfg.algorithm.infer_steps,
+                "dyn_infer_steps": self.cfg.algorithm.dyn_infer_steps,
+                "load_ae": self.cfg.algorithm.load_ae,
+                "action_dim": self.cfg.algorithm.action_dim,
+                "dynamics_hidden_channels": self.cfg.algorithm.dynamics_hidden_channels,
+                "action_emb_dim": self.cfg.algorithm.action_emb_dim,
+                "dynamics_attention_heads": self.cfg.algorithm.dynamics_attention_heads,
+                "mask_prev_action": self.cfg.algorithm.mask_prev_action,
+                "sampling_strategy": self.cfg.algorithm.sampling_strategy,
+                "prev_frame_noise_scale": self.cfg.algorithm.prev_frame_noise_scale,
+                "last_frame_loss_only": self.cfg.algorithm.last_frame_loss_only,
+                "loss_weighting": self.cfg.algorithm.loss_weighting,
+                "stage3_latent_noise_std": self.cfg.algorithm.stage3_latent_noise_std,
             },
             "experiment": {
                 "batch_size": self.cfg.experiment.batch_size,
@@ -281,6 +324,7 @@ class LatentDynamicsExperiment:
             batch,
             num_steps=max(4, self.cfg.algorithm.infer_steps),
             start_mode="noisy-input",
+            rollout_context_size=self.cfg.dataset.horizon,
         )
         output_dir = self.run_dir / "samples" / f"step_{step:06d}"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -299,6 +343,8 @@ class LatentDynamicsExperiment:
         stats = dict(preview["stats"])
         stats["checkpoint"] = str(self.checkpoints_dir / "last.pt")
         stats["exported_gif_frame_count"] = int(exported_frame_count)
+        if "predicted_frame_count" in stats and stats["input_frame_count"] != stats["predicted_frame_count"]:
+            raise RuntimeError(f"Predicted frame count mismatch: {stats}")
         if stats["input_frame_count"] != stats["decoded_frame_count"]:
             raise RuntimeError(f"Decoded frame count mismatch: {stats}")
         if stats["decoded_frame_count"] != stats["exported_gif_frame_count"]:
@@ -342,7 +388,7 @@ class LatentDynamicsExperiment:
         return int(checkpoint["step"])
 
     def run(self) -> None:
-        """Run the Stage-1 training loop and periodic validation previews."""
+        """Run the configured stage training loop and periodic validation previews."""
 
         step = self._load_resume()
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -372,9 +418,11 @@ class LatentDynamicsExperiment:
                     "elapsed_minutes": elapsed_seconds / 60.0,
                     "step_time_seconds": step_time_seconds,
                     "loss": float(loss_dict["loss"].detach().cpu()),
-                    "recon_loss": float(loss_dict["recon_loss"].cpu()),
-                    "clean_loss": float(loss_dict["clean_loss"].cpu()),
                 }
+                for key, value in loss_dict.items():
+                    if key == "loss" or not isinstance(value, torch.Tensor) or value.ndim != 0:
+                        continue
+                    metric_record[key] = float(value.detach().cpu())
                 append_jsonl(self.metrics_path, metric_record)
                 early_stop_record = self._record_loss_for_early_stop(
                     step,
