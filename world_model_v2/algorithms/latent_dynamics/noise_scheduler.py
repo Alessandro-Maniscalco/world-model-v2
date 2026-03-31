@@ -6,7 +6,7 @@ import torch
 
 
 class Stage1NoiseScheduler:
-    """Add Gaussian noise and sample timestep layouts for decoder and dynamics training."""
+    """Add Gaussian noise and expose lightweight consistency-style update helpers."""
 
     def __init__(
         self,
@@ -152,6 +152,41 @@ class Stage1NoiseScheduler:
         if weighting == "uniform":
             return torch.ones_like(sigma)
         raise ValueError(f"Unsupported loss weighting: {weighting}")
+
+    def ctm_ratio(
+        self,
+        timesteps: torch.Tensor,
+        stop_timesteps: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return the broadcastable interpolation ratio for a consistency update."""
+
+        safe_timesteps = timesteps.clamp_min(1).to(dtype=dtype)
+        ratio = stop_timesteps.to(dtype=dtype) / safe_timesteps
+        return torch.where(timesteps == stop_timesteps, torch.ones_like(ratio), ratio)
+
+    def ctm_calc_out(
+        self,
+        sample: torch.Tensor,
+        predicted_clean: torch.Tensor,
+        timesteps: torch.Tensor,
+        stop_timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Blend a model's clean prediction back toward the requested stop timestep."""
+
+        ratio = self.ctm_ratio(
+            timesteps,
+            stop_timesteps,
+            dtype=sample.dtype,
+        )
+        while ratio.ndim < sample.ndim:
+            ratio = ratio.unsqueeze(-1)
+        blended = sample * ratio + predicted_clean * (1.0 - ratio)
+        mask = timesteps == stop_timesteps
+        while mask.ndim < sample.ndim:
+            mask = mask.unsqueeze(-1)
+        return torch.where(mask, sample, blended)
 
     def make_sampling_schedule(
         self,

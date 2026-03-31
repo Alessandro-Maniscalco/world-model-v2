@@ -88,6 +88,20 @@ def test_uniform_loss_weighting_returns_ones() -> None:
     assert torch.equal(weights, torch.ones(3))
 
 
+def test_ctm_calc_out_preserves_equal_timesteps_and_blends_terminal_frame() -> None:
+    """The consistency merge should keep `t == s` slots untouched and denoise terminal slots."""
+
+    scheduler = Stage1NoiseScheduler(timesteps=10)
+    sample = torch.full((1, 3, 2, 2, 2), 0.8)
+    predicted_clean = torch.full_like(sample, 0.2)
+    t = torch.tensor([[2, 9, 0]])
+    s = torch.tensor([[2, 0, 0]])
+    merged = scheduler.ctm_calc_out(sample, predicted_clean, t, s)
+    assert torch.allclose(merged[:, 0], sample[:, 0])
+    assert torch.allclose(merged[:, 2], sample[:, 2])
+    assert torch.allclose(merged[:, 1], predicted_clean[:, 1])
+
+
 def test_make_sampling_schedule_reaches_zero() -> None:
     """Sampling schedules should descend to timestep zero."""
 

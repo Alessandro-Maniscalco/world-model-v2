@@ -29,9 +29,13 @@ def test_run_config_round_trip_preserves_nested_sections() -> None:
         experiment=ExperimentConfig(
             run_name="demo",
             device="cpu",
+            grad_clip_norm=1.0,
+            lr_scheduler="linear",
+            warmup_steps=1000,
             save_preview_initial_minutes=10.0,
             save_preview_late_minutes=30.0,
             save_preview_switch_minutes=60.0,
+            early_stop_metric="validation_dyn_loss",
             early_stop_window_size=100,
             early_stop_patience_windows=3,
             early_stop_min_delta=0.01,
@@ -55,9 +59,13 @@ def test_run_config_round_trip_preserves_nested_sections() -> None:
     assert restored.algorithm.loss_weighting == "uniform"
     assert restored.algorithm.stage3_latent_noise_std == 0.05
     assert restored.experiment.run_name == "demo"
+    assert restored.experiment.grad_clip_norm == 1.0
+    assert restored.experiment.lr_scheduler == "linear"
+    assert restored.experiment.warmup_steps == 1000
     assert restored.experiment.save_preview_initial_minutes == 10.0
     assert restored.experiment.save_preview_late_minutes == 30.0
     assert restored.experiment.save_preview_switch_minutes == 60.0
+    assert restored.experiment.early_stop_metric == "validation_dyn_loss"
     assert restored.experiment.early_stop_window_size == 100
     assert restored.experiment.early_stop_patience_windows == 3
     assert restored.experiment.early_stop_min_delta == 0.01
@@ -87,5 +95,28 @@ def test_upstream_stage2_config_matches_published_overlapping_sizes() -> None:
     assert cfg.timesteps == 1000
     assert cfg.infer_steps == 3
     assert cfg.dyn_infer_steps == 1
+    assert cfg.action_emb_dim == 512
     assert cfg.sampling_strategy == "terminal_only"
     assert cfg.loss_weighting == "uniform"
+
+
+def test_upstream_stage2_experiment_config_matches_published_runtime_defaults() -> None:
+    """The upstream Stage-2 runtime helper should mirror the local published defaults."""
+
+    cfg = ExperimentConfig.upstream_stage2()
+    assert cfg.output_dir == "outputs/stage2"
+    assert cfg.batch_size == 4
+    assert cfg.lr == 8e-5
+    assert cfg.grad_clip_norm == 1.0
+    assert cfg.lr_scheduler == "linear"
+    assert cfg.warmup_steps == 10000
+    assert cfg.max_steps == 200005
+    assert cfg.validation_interval == 30000
+    assert cfg.checkpoint_interval == 10000
+    assert cfg.early_stop_metric == "validation_dyn_loss"
+    assert cfg.early_stop_window_size == 1
+    assert cfg.early_stop_patience_windows == 3
+    assert cfg.early_stop_min_delta == 5e-4
+    assert cfg.early_stop_warmup_steps == 60000
+    assert cfg.log_interval == 10
+    assert cfg.num_workers == 4

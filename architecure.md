@@ -255,11 +255,14 @@ t_{1:T-1} = s_{1:T-1} \sim \text{low-noise}, \qquad
 t_T = \sigma_{\max}, \qquad s_T = 0.
 $$
 
-The dynamics model then predicts the lower-noise latent sequence with aligned
-action conditioning:
+The dynamics model first predicts a cleaner latent sequence, and a lightweight
+consistency-style scheduler merge maps that prediction to the requested stop
+noise level:
 
 $$
-\hat{z}_{\sigma_s} = F_\psi(z_{\sigma_t}; t_{1:T}, s_{1:T}, a_{1:T}).
+\hat{z}_0 = F_\psi(z_{\sigma_t}; t_{1:T}, s_{1:T}, a_{1:T}),
+\qquad
+\hat{z}_{\sigma_s} = G(\hat{z}_0, z_{\sigma_t}; t_{1:T}, s_{1:T}).
 $$
 
 The implemented Stage-2 loss is:
@@ -270,9 +273,11 @@ $$
 w(t)\lVert \hat{z}_{\sigma_s} - z_{\sigma_s} \rVert_2^2
 $$
 
-with the current Stage-2 default using uniform weighting. This is still
-teacher-forced training rather than full open-loop unrolling, but it now
-matches the upstream Stage-2 data flow much more closely:
+with the current Stage-2 default using uniform weighting. When
+`dyn_infer_steps > 1`, a second hop is also trained from $`z_{\sigma_s}`$ to
+the clean target $`z`$. This remains teacher-forced training rather than full
+open-loop unrolling, but it now matches the upstream Stage-2 data flow much
+more closely:
 
 - the whole training window is passed through the dynamics model at once
 - earlier context frames keep matched low noise with $`t = s`$
@@ -320,17 +325,17 @@ and is triggered by the experiment runner before optimizer creation.
 
 The scheduler in
 [world_model_v2/algorithms/latent_dynamics/noise_scheduler.py](/home/amaniscalco/world-model-v2/world_model_v2/algorithms/latent_dynamics/noise_scheduler.py)
-is still a lightweight linear sigma schedule, but it now works on both image
-batches and sequence-shaped latent tensors.
+is still a local linear sigma schedule, but it now supports the Stage-2
+consistency-style merge used by both training and rollout preview.
 
 It supports:
 
 - timestep-pair sampling for arbitrary leading shapes
 - Gaussian noise injection with broadcasting
-- inverse-variance loss weights
+- inverse-variance and uniform loss weights
+- shared-noise `add_noise_to_t_s(...)`
+- Stage-2 consistency merge `G(\hat{z}_0, z_{\sigma_t}; t, s)`
 - short descending schedules for iterative denoising
-
-It is intentionally much simpler than the upstream DDPM / CTM helper stack.
 
 ## Validation and inference
 
@@ -348,13 +353,18 @@ The Stage-1 CLI remains:
 
 ### Stage 2 and Stage 3 validation
 
-Stage 2 and Stage 3 validation use the rollout path:
+Stage 2 and Stage 3 validation now use an upstream-shaped open-loop rollout:
 
-1. encode the first observed frame into a seed latent
-2. autoregress one future latent at a time
-3. keep a sliding latent context capped by the configured train horizon
-4. initialize each new target slot with scheduler-scaled Gaussian noise
-5. decode predicted latents back into images from pure noise
+1. encode the full validation episode into ground-truth latents
+2. seed prediction from only the first ground-truth latent
+3. normalize actions with the checkpointed dataset min/max stats into `[-1, 1]`
+4. roll out future latents with one continuous sliding latent window
+5. keep prior window slots at a small nonzero stabilization timestep during rollout
+6. normalize the predicted latent sequence once after rollout finishes
+7. decode predicted latents back into images from pure noise
+8. measure validation `dyn_loss` against the encoded ground-truth rollout
+
+The exported preview now shows pure prediction-vs-ground-truth rollout frames without a highlighted context prefix.
 
 The dedicated rollout CLI is:
 
@@ -365,11 +375,37 @@ Validation and inference stats now track:
 - input frame count
 - predicted frame count for rollout stages
 - decoded frame count
-- `dyn_loss_teacher_forced` in training logs for the next-step denoising loss
-- `dyn_loss_rollout` as open-loop latent MSE on future frames
+- `dyn_loss` in Stage-2 training logs
+- `dyn_loss` in validation stats as open-loop latent MSE on future frames
 - latent shape
 - exported GIF frame count
-- rollout context size
+- `prediction_mode`
+- `seed_frames`
+- `rollout_window`
+
+## Stage 2 command
+
+The default Stage-2 CLI is now upstream-shaped, so starting from the Stage-1
+`7500` checkpoint only needs the bootstrap path and the desired run name:
+
+```bash
+source .venv/bin/activate
+
+python -m world_model_v2.run \
+  --training-stage 2 \
+  --data-root data/full \
+  --task single_grasp \
+  --split train \
+  --camera camera_1_color \
+  --resolution 128 \
+  --action-mode single_grasp \
+  --load-ae outputs/stage1/single_grasp_overnight_upstream_sized_plateau_resume_final/checkpoints/step_007500.pt \
+  --device cuda \
+  --run-name single_grasp_stage2_from_7500_upstream
+```
+
+Stage-2 runs now also stop automatically when validation rollout `dyn_loss`
+plateaus, using validation-based patience by default.
 
 ## Key config knobs
 
@@ -408,7 +444,7 @@ Intentionally simplified:
 
 - plain-PyTorch runner and config
 - smaller dynamics network
-- lightweight scheduler
+- local file-based previews instead of upstream logging/metrics infra
 - raw HDF5 loader only
 - one-camera default path
 

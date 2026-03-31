@@ -55,6 +55,15 @@ class DatasetConfig:
             action_mode=self.action_mode,
         )
 
+    @classmethod
+    def upstream_stage2(cls) -> "DatasetConfig":
+        """Return upstream-like Stage-2 dataset defaults."""
+
+        return cls(
+            horizon=10,
+            val_horizon=200,
+        )
+
 
 @dataclass
 class AlgorithmConfig:
@@ -121,7 +130,13 @@ class AlgorithmConfig:
             timesteps=1000,
             infer_steps=3,
             dyn_infer_steps=1,
+            dynamics_hidden_channels=64,
+            action_emb_dim=512,
+            dynamics_attention_heads=4,
+            mask_prev_action=False,
             sampling_strategy="terminal_only",
+            prev_frame_noise_scale=0.1,
+            last_frame_loss_only=False,
             loss_weighting="uniform",
         )
 
@@ -135,12 +150,16 @@ class ExperimentConfig:
     batch_size: int = 8
     lr: float = 2e-4
     weight_decay: float = 1e-4
+    grad_clip_norm: float = 0.0
+    lr_scheduler: str = "none"
+    warmup_steps: int = 0
     max_steps: int = 50
     validation_interval: int = 25
     checkpoint_interval: int = 25
     save_preview_initial_minutes: float = 0.0
     save_preview_late_minutes: float = 0.0
     save_preview_switch_minutes: float = 0.0
+    early_stop_metric: str = "training_loss"
     early_stop_window_size: int = 0
     early_stop_patience_windows: int = 0
     early_stop_min_delta: float = 0.0
@@ -161,6 +180,30 @@ class ExperimentConfig:
         """Build an experiment config from checkpoint JSON data."""
 
         return cls(**payload)
+
+    @classmethod
+    def upstream_stage2(cls) -> "ExperimentConfig":
+        """Return upstream-like Stage-2 runtime defaults."""
+
+        return cls(
+            output_dir="outputs/stage2",
+            batch_size=4,
+            lr=8e-5,
+            weight_decay=1e-4,
+            grad_clip_norm=1.0,
+            lr_scheduler="linear",
+            warmup_steps=10000,
+            max_steps=200005,
+            validation_interval=30000,
+            checkpoint_interval=10000,
+            early_stop_metric="validation_dyn_loss",
+            early_stop_window_size=1,
+            early_stop_patience_windows=3,
+            early_stop_min_delta=5e-4,
+            early_stop_warmup_steps=60000,
+            log_interval=10,
+            num_workers=4,
+        )
 
 
 @dataclass

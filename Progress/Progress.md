@@ -24,3 +24,11 @@ Implemented a clean-room Stage-1 autoencoder training pipeline for `single_grasp
 
 
 Step 2 & 3: Dynamics training & Inference
+
+
+
+Open validation leads to too much drift
+![alt text](image-2.png)
+
+teacher forcing with no renorm is much closer to gt
+![alt text](image-1.png)

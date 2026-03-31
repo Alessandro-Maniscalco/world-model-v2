@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera", default="camera_1_color")
     parser.add_argument("--episode", type=int, default=0)
     parser.add_argument("--resolution", type=int, default=128)
-    parser.add_argument("--context-size", type=int, default=1)
+    parser.add_argument("--context-size", type=int, default=0)
     parser.add_argument("--num-steps", type=int, default=2)
     parser.add_argument("--max-frames", type=int, default=16)
     parser.add_argument("--duration-ms", type=int, default=120)
@@ -79,6 +79,7 @@ def predict_rollout(
         ),
         device_obj,
     )
+    model.set_normalization_stats(checkpoint.get("normalization_stats"))
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
@@ -96,7 +97,7 @@ def predict_rollout(
         device_batch,
         num_steps=num_steps,
         start_mode="noise",
-        rollout_context_size=context_size,
+        rollout_context_size=context_size if context_size > 0 else run_config.dataset.horizon,
     )
 
     output_path = Path(output_dir)
@@ -105,13 +106,20 @@ def predict_rollout(
     gif_path = output_path / f"episode_{episode}.gif"
     stats_path = output_path / f"episode_{episode}_stats.json"
 
-    grid = build_side_by_side_grid(preview["original"], preview["reconstructed"], max_frames=max_frames)
+    context_frames = int(preview["stats"].get("context_frames", 0))
+    grid = build_side_by_side_grid(
+        preview["original"],
+        preview["reconstructed"],
+        max_frames=max_frames,
+        context_frames=context_frames,
+    )
     grid.save(grid_path)
     exported_frame_count = write_side_by_side_gif(
         preview["original"],
         preview["reconstructed"],
         gif_path,
         duration_ms=duration_ms,
+        context_frames=context_frames,
     )
 
     stats = dict(preview["stats"])

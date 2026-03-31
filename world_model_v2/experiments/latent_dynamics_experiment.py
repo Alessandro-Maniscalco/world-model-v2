@@ -10,6 +10,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.nn.utils import clip_grad_norm_
+from torch.optim.lr_scheduler import LinearLR
 from torch.utils.data import DataLoader
 
 from world_model_v2.algorithms.latent_dynamics.latent_world_model import LatentWorldModel
@@ -55,16 +57,19 @@ class LatentDynamicsExperiment:
         if cfg.algorithm.load_ae:
             self.model.bootstrap_from_checkpoint(cfg.algorithm.load_ae, self.device)
         self.optimizer = self._build_optimizer()
+        self.lr_scheduler = self._build_lr_scheduler()
         self.early_stop_window_losses: deque[float] = deque(
             maxlen=max(cfg.experiment.early_stop_window_size, 1)
         )
         self.best_window_loss: float | None = None
         self.non_improving_windows = 0
+        self.early_stop_observations = 0
         self.trainable_parameter_count = self._count_trainable_parameters()
         self.normalization_stats = {
             "image_range": [0.0, 1.0],
             **self.train_dataset.compute_action_stats(),
         }
+        self.model.set_normalization_stats(self.normalization_stats)
 
     def _set_seed(self, seed: int) -> None:
         """Seed Python, NumPy, and PyTorch RNGs."""
@@ -113,6 +118,20 @@ class LatentDynamicsExperiment:
             lr=self.cfg.experiment.lr,
             weight_decay=self.cfg.experiment.weight_decay,
         )
+
+    def _build_lr_scheduler(self) -> LinearLR | None:
+        """Build the configured learning-rate scheduler when requested."""
+
+        if self.cfg.experiment.lr_scheduler == "none":
+            return None
+        if self.cfg.experiment.lr_scheduler == "linear":
+            return LinearLR(
+                self.optimizer,
+                start_factor=1e-4,
+                end_factor=1.0,
+                total_iters=max(1, self.cfg.experiment.warmup_steps),
+            )
+        raise ValueError(f"Unsupported lr_scheduler={self.cfg.experiment.lr_scheduler}")
 
     def _default_run_name(self, task: str) -> str:
         """Generate a timestamped default run name."""
@@ -195,11 +214,15 @@ class LatentDynamicsExperiment:
             "experiment": {
                 "batch_size": self.cfg.experiment.batch_size,
                 "lr": self.cfg.experiment.lr,
+                "grad_clip_norm": self.cfg.experiment.grad_clip_norm,
+                "lr_scheduler": self.cfg.experiment.lr_scheduler,
+                "warmup_steps": self.cfg.experiment.warmup_steps,
                 "checkpoint_interval": self.cfg.experiment.checkpoint_interval,
                 "validation_interval": self.cfg.experiment.validation_interval,
                 "save_preview_initial_minutes": self.cfg.experiment.save_preview_initial_minutes,
                 "save_preview_late_minutes": self.cfg.experiment.save_preview_late_minutes,
                 "save_preview_switch_minutes": self.cfg.experiment.save_preview_switch_minutes,
+                "early_stop_metric": self.cfg.experiment.early_stop_metric,
                 "early_stop_window_size": self.cfg.experiment.early_stop_window_size,
                 "early_stop_patience_windows": self.cfg.experiment.early_stop_patience_windows,
                 "early_stop_min_delta": self.cfg.experiment.early_stop_min_delta,
@@ -215,19 +238,23 @@ class LatentDynamicsExperiment:
             and self.cfg.experiment.early_stop_patience_windows > 0
         )
 
-    def _record_loss_for_early_stop(
+    def _record_metric_for_early_stop(
         self,
         step: int,
-        loss_value: float,
+        metric_value: float,
+        metric_name: str,
     ) -> dict[str, object] | None:
-        """Update rolling-loss plateau state and return an evaluation record when due."""
+        """Update plateau state for one metric observation and return an evaluation record when due."""
 
         if not self._early_stop_enabled():
             return None
-        self.early_stop_window_losses.append(loss_value)
+        if metric_name != self.cfg.experiment.early_stop_metric:
+            return None
+        self.early_stop_observations += 1
+        self.early_stop_window_losses.append(metric_value)
         if len(self.early_stop_window_losses) < self.cfg.experiment.early_stop_window_size:
             return None
-        if step % self.cfg.experiment.early_stop_window_size != 0:
+        if self.early_stop_observations % self.cfg.experiment.early_stop_window_size != 0:
             return None
 
         window_loss = float(sum(self.early_stop_window_losses) / len(self.early_stop_window_losses))
@@ -251,6 +278,7 @@ class LatentDynamicsExperiment:
         )
         return {
             "step": step,
+            "metric": metric_name,
             "window_loss": window_loss,
             "best_window_loss": self.best_window_loss,
             "improved": improved,
@@ -272,15 +300,21 @@ class LatentDynamicsExperiment:
         self.early_stop_window_losses.clear()
         self.best_window_loss = None
         self.non_improving_windows = 0
+        self.early_stop_observations = 0
         with restore_path.open(encoding="utf-8") as handle:
             for line in handle:
                 record = json.loads(line)
-                if "loss" not in record:
-                    continue
-                record_step = int(record["step"])
+                record_step = int(record.get("step", 0))
                 if record_step > step:
                     break
-                self._record_loss_for_early_stop(record_step, float(record["loss"]))
+                metric_value = self._extract_early_stop_metric_value(record)
+                if metric_value is None:
+                    continue
+                self._record_metric_for_early_stop(
+                    record_step,
+                    metric_value,
+                    self.cfg.experiment.early_stop_metric,
+                )
 
     def _restore_metrics_path(self) -> Path | None:
         """Find the metric log that should seed plateau state for a resumed run."""
@@ -295,10 +329,20 @@ class LatentDynamicsExperiment:
             return self.metrics_path
         return None
 
-    def _next_validation_batch(self) -> dict[str, object]:
-        """Return the first validation batch for deterministic previews."""
+    def _extract_early_stop_metric_value(self, record: dict[str, object]) -> float | None:
+        """Extract the configured early-stop metric from one JSONL record."""
 
-        return next(iter(self.val_loader))
+        metric_name = self.cfg.experiment.early_stop_metric
+        if metric_name == "training_loss":
+            if "loss" not in record:
+                return None
+            return float(record["loss"])
+        if metric_name == "validation_dyn_loss":
+            validation = record.get("validation")
+            if not isinstance(validation, dict) or "dyn_loss" not in validation:
+                return None
+            return float(validation["dyn_loss"])
+        raise ValueError(f"Unsupported early_stop_metric={metric_name}")
 
     def _move_batch_to_device(self, batch: dict[str, object]) -> dict[str, object]:
         """Move tensor leaves in a nested batch to the configured device."""
@@ -319,28 +363,48 @@ class LatentDynamicsExperiment:
     def _write_validation_preview(self, step: int) -> dict[str, object]:
         """Run validation, export artifacts, and return stats."""
 
-        batch = self._move_batch_to_device(self._next_validation_batch())
-        preview = self.model.validation_step(
-            batch,
-            num_steps=max(4, self.cfg.algorithm.infer_steps),
-            start_mode="noisy-input",
-            rollout_context_size=self.cfg.dataset.horizon,
-        )
+        self.model.eval()
+        preview: dict[str, object] | None = None
+        dyn_losses: list[float] = []
+        for batch_idx, batch in enumerate(self.val_loader):
+            moved_batch = self._move_batch_to_device(batch)
+            current_preview = self.model.validation_step(
+                moved_batch,
+                num_steps=max(4, self.cfg.algorithm.infer_steps),
+                start_mode="noisy-input",
+                rollout_context_size=self.cfg.dataset.horizon,
+            )
+            if batch_idx == 0:
+                preview = current_preview
+            current_stats = current_preview["stats"]
+            if isinstance(current_stats, dict) and "dyn_loss" in current_stats:
+                dyn_losses.append(float(current_stats["dyn_loss"]))
+        if preview is None:
+            raise RuntimeError("Validation loader produced no batches.")
         output_dir = self.run_dir / "samples" / f"step_{step:06d}"
         output_dir.mkdir(parents=True, exist_ok=True)
         grid_path = output_dir / "episode_0_grid.png"
         gif_path = output_dir / "episode_0.gif"
         stats_path = output_dir / "episode_0_stats.json"
 
-        grid = build_side_by_side_grid(preview["original"], preview["reconstructed"], max_frames=12)
+        stats = dict(preview["stats"])
+        if dyn_losses:
+            stats["dyn_loss"] = float(sum(dyn_losses) / len(dyn_losses))
+        context_frames = int(stats.get("context_frames", 0))
+        grid = build_side_by_side_grid(
+            preview["original"],
+            preview["reconstructed"],
+            max_frames=12,
+            context_frames=context_frames,
+        )
         grid.save(grid_path)
         exported_frame_count = write_side_by_side_gif(
             preview["original"],
             preview["reconstructed"],
             gif_path,
             duration_ms=120,
+            context_frames=context_frames,
         )
-        stats = dict(preview["stats"])
         stats["checkpoint"] = str(self.checkpoints_dir / "last.pt")
         stats["exported_gif_frame_count"] = int(exported_frame_count)
         if "predicted_frame_count" in stats and stats["input_frame_count"] != stats["predicted_frame_count"]:
@@ -362,6 +426,7 @@ class LatentDynamicsExperiment:
             step_path,
             self.model,
             self.optimizer,
+            self.lr_scheduler,
             step,
             payload_config,
             self.normalization_stats,
@@ -370,6 +435,7 @@ class LatentDynamicsExperiment:
             last_path,
             self.model,
             self.optimizer,
+            self.lr_scheduler,
             step,
             payload_config,
             self.normalization_stats,
@@ -385,6 +451,8 @@ class LatentDynamicsExperiment:
         self.model.load_state_dict(checkpoint["model_state"])
         if checkpoint["optimizer_state"] is not None:
             self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        if self.lr_scheduler is not None and checkpoint.get("scheduler_state") is not None:
+            self.lr_scheduler.load_state_dict(checkpoint["scheduler_state"])
         return int(checkpoint["step"])
 
     def run(self) -> None:
@@ -408,7 +476,14 @@ class LatentDynamicsExperiment:
                 self.optimizer.zero_grad(set_to_none=True)
                 loss_dict = self.model.training_step(batch)
                 loss_dict["loss"].backward()
+                if self.cfg.experiment.grad_clip_norm > 0.0:
+                    clip_grad_norm_(
+                        [param for param in self.model.parameters() if param.requires_grad],
+                        self.cfg.experiment.grad_clip_norm,
+                    )
                 self.optimizer.step()
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
                 step += 1
                 elapsed_seconds = time.monotonic() - run_start_time
                 step_time_seconds = time.monotonic() - step_start_time
@@ -424,12 +499,15 @@ class LatentDynamicsExperiment:
                         continue
                     metric_record[key] = float(value.detach().cpu())
                 append_jsonl(self.metrics_path, metric_record)
-                early_stop_record = self._record_loss_for_early_stop(
-                    step,
-                    metric_record["loss"],
-                )
-                if early_stop_record is not None:
-                    append_jsonl(self.metrics_path, {"step": step, "early_stop": early_stop_record})
+                early_stop_record: dict[str, object] | None = None
+                if self.cfg.experiment.early_stop_metric == "training_loss":
+                    early_stop_record = self._record_metric_for_early_stop(
+                        step,
+                        metric_record["loss"],
+                        "training_loss",
+                    )
+                    if early_stop_record is not None:
+                        append_jsonl(self.metrics_path, {"step": step, "early_stop": early_stop_record})
 
                 if self._is_step_interval_due(step, self.cfg.experiment.log_interval) or step == 1:
                     print(json.dumps(metric_record, sort_keys=True))
@@ -442,26 +520,50 @@ class LatentDynamicsExperiment:
                     elapsed_seconds,
                     last_save_preview_seconds,
                 )
-                early_stop_due = bool(
-                    early_stop_record is not None and early_stop_record["should_stop"]
-                )
-                if (
+                checkpoint_due = (
                     self._is_step_interval_due(step, self.cfg.experiment.checkpoint_interval)
                     or time_save_preview_due
-                    or early_stop_due
                     or step == self.cfg.experiment.max_steps
-                ):
-                    self._save_checkpoint(step)
-
-                if (
+                )
+                validation_due = (
                     self._is_step_interval_due(step, self.cfg.experiment.validation_interval)
                     or time_save_preview_due
-                    or early_stop_due
                     or step == self.cfg.experiment.max_steps
+                )
+                if (
+                    early_stop_record is not None
+                    and early_stop_record["should_stop"]
+                    and self.cfg.experiment.early_stop_metric == "training_loss"
                 ):
+                    validation_due = True
+
+                if validation_due:
                     stats = self._write_validation_preview(step)
                     append_jsonl(self.metrics_path, {"step": step, "validation": stats})
                     print(json.dumps({"step": step, "validation": stats}, sort_keys=True))
+                    if self.cfg.experiment.early_stop_metric == "validation_dyn_loss":
+                        early_stop_record = self._record_metric_for_early_stop(
+                            step,
+                            float(stats["dyn_loss"]),
+                            "validation_dyn_loss",
+                        )
+                        if early_stop_record is not None:
+                            append_jsonl(
+                                self.metrics_path,
+                                {"step": step, "early_stop": early_stop_record},
+                            )
+                            if early_stop_record["improved"] or early_stop_record["should_stop"]:
+                                print(
+                                    json.dumps(
+                                        {"step": step, "early_stop": early_stop_record},
+                                        sort_keys=True,
+                                    )
+                                )
+                early_stop_due = bool(
+                    early_stop_record is not None and early_stop_record["should_stop"]
+                )
+                if checkpoint_due or early_stop_due:
+                    self._save_checkpoint(step)
                 if time_save_preview_due:
                     last_save_preview_seconds = time.monotonic() - run_start_time
 

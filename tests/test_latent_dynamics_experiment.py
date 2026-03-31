@@ -176,6 +176,7 @@ def test_experiment_restores_plateau_state_from_resume_run_metrics(
         checkpoint_path,
         model,
         optimizer,
+        None,
         3,
         cfg.to_dict(),
         {"image_range": [0.0, 1.0], "action_min": [0, 0, 0, 0], "action_max": [1, 1, 1, 1]},
@@ -263,11 +264,64 @@ def test_experiment_run_supports_stage2_training(
         json.loads(line)
         for line in (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    loss_records = [record for record in records if "dyn_loss_teacher_forced" in record]
+    loss_records = [record for record in records if "dyn_loss" in record]
     validation_records = [record for record in records if "validation" in record]
     assert loss_records
     assert validation_records
-    assert "dyn_loss_rollout" in validation_records[-1]["validation"]
+    assert "dyn_loss" in validation_records[-1]["validation"]
+
+
+def test_stage2_experiment_can_stop_early_on_validation_plateau(
+    fake_dataset_root: Path,
+    saved_stage1_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Stage 2 should support plateau stopping on validation rollout loss."""
+
+    cfg = RunConfig(
+        dataset=DatasetConfig(
+            data_root=str(fake_dataset_root),
+            resolution=32,
+            horizon=4,
+            val_horizon=6,
+        ),
+        algorithm=AlgorithmConfig(
+            training_stage=2,
+            latent_channels=4,
+            latent_dim=64,
+            hidden_channels=32,
+            timesteps=8,
+            infer_steps=2,
+            dyn_infer_steps=1,
+            load_ae=str(saved_stage1_checkpoint),
+            action_dim=4,
+            dynamics_hidden_channels=32,
+            action_emb_dim=64,
+            dynamics_attention_heads=4,
+        ),
+        experiment=ExperimentConfig(
+            run_name="stage2_validation_stop",
+            output_dir=str(tmp_path / "outputs"),
+            batch_size=1,
+            max_steps=20,
+            validation_interval=1,
+            checkpoint_interval=0,
+            early_stop_metric="validation_dyn_loss",
+            early_stop_window_size=1,
+            early_stop_patience_windows=1,
+            early_stop_min_delta=10.0,
+            early_stop_warmup_steps=0,
+            log_interval=1,
+            device="cpu",
+        ),
+    )
+    LatentDynamicsExperiment(cfg).run()
+    metrics_path = tmp_path / "outputs" / "stage2_validation_stop" / "metrics.jsonl"
+    records = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
+    stopped_records = [record for record in records if "stopped" in record]
+    assert stopped_records
+    assert stopped_records[-1]["stopped"]["reason"] == "plateau"
+    assert stopped_records[-1]["step"] < 20
 
 
 def test_experiment_run_supports_stage3_training(

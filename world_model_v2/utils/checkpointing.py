@@ -30,6 +30,7 @@ def save_checkpoint(
     path: str | Path,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer | None,
+    scheduler: Any,
     step: int,
     config: dict[str, Any],
     normalization_stats: dict[str, Any],
@@ -41,6 +42,7 @@ def save_checkpoint(
     payload = {
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
         "step": step,
         "config": config,
         "normalization_stats": normalization_stats,
@@ -52,4 +54,3 @@ def load_checkpoint(path: str | Path, device: torch.device | str) -> dict[str, A
     """Load a saved checkpoint onto a target device."""
 
     return torch.load(Path(path), map_location=device, weights_only=False)
-

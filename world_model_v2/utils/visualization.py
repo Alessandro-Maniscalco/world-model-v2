@@ -17,11 +17,16 @@ def tensor_to_uint8_images(images: torch.Tensor) -> np.ndarray:
     return array.permute(0, 2, 3, 1).numpy()
 
 
-def annotate_frame(frame: np.ndarray, label: str) -> Image.Image:
+def annotate_frame(
+    frame: np.ndarray,
+    label: str,
+    *,
+    border_color: tuple[int, int, int] = (255, 255, 255),
+) -> Image.Image:
     """Draw a small top-left label onto a frame."""
 
     image = Image.fromarray(frame)
-    image = ImageOps.expand(image, border=4, fill="white")
+    image = ImageOps.expand(image, border=4, fill=border_color)
     draw = ImageDraw.Draw(image)
     draw.rectangle((6, 6, min(240, image.width - 6), 32), fill=(0, 0, 0))
     draw.text((10, 10), label, fill=(255, 255, 255))
@@ -32,6 +37,7 @@ def build_side_by_side_grid(
     original: torch.Tensor,
     reconstructed: torch.Tensor,
     max_frames: int = 12,
+    context_frames: int = 0,
 ) -> Image.Image:
     """Create a two-column contact sheet of original and reconstructed frames."""
 
@@ -39,8 +45,9 @@ def build_side_by_side_grid(
     reconstructed_np = tensor_to_uint8_images(reconstructed[:max_frames])
     frames: list[Image.Image] = []
     for frame_idx, (orig_frame, recon_frame) in enumerate(zip(original_np, reconstructed_np, strict=False)):
-        frames.append(annotate_frame(orig_frame, f"gt {frame_idx}"))
-        frames.append(annotate_frame(recon_frame, f"recon {frame_idx}"))
+        border_color = (255, 0, 0) if frame_idx < context_frames else (255, 255, 255)
+        frames.append(annotate_frame(orig_frame, f"gt {frame_idx}", border_color=border_color))
+        frames.append(annotate_frame(recon_frame, f"recon {frame_idx}", border_color=border_color))
     width, height = frames[0].size
     canvas = Image.new("RGB", (width * 2, height * len(original_np)), "black")
     for row, frame in enumerate(frames):
@@ -55,6 +62,7 @@ def write_side_by_side_gif(
     reconstructed: torch.Tensor,
     output_path: str | Path,
     duration_ms: int = 120,
+    context_frames: int = 0,
 ) -> int:
     """Write a GIF with original and reconstructed frames next to each other."""
 
@@ -62,8 +70,9 @@ def write_side_by_side_gif(
     reconstructed_np = tensor_to_uint8_images(reconstructed)
     rendered_frames: list[np.ndarray] = []
     for frame_idx, (orig_frame, recon_frame) in enumerate(zip(original_np, reconstructed_np, strict=False)):
-        orig_img = annotate_frame(orig_frame, f"gt {frame_idx}")
-        recon_img = annotate_frame(recon_frame, f"recon {frame_idx}")
+        border_color = (255, 0, 0) if frame_idx < context_frames else (255, 255, 255)
+        orig_img = annotate_frame(orig_frame, f"gt {frame_idx}", border_color=border_color)
+        recon_img = annotate_frame(recon_frame, f"recon {frame_idx}", border_color=border_color)
         stacked = Image.new("RGB", (orig_img.width + recon_img.width, orig_img.height), "black")
         stacked.paste(orig_img, (0, 0))
         stacked.paste(recon_img, (orig_img.width, 0))

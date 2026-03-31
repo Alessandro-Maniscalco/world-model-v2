@@ -96,6 +96,7 @@ def reconstruct_episode(
         ),
         device_obj,
     )
+    model.set_normalization_stats(checkpoint.get("normalization_stats"))
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
@@ -121,13 +122,20 @@ def reconstruct_episode(
     gif_path = output_path / f"episode_{episode}.gif"
     stats_path = output_path / f"episode_{episode}_stats.json"
 
-    grid = build_side_by_side_grid(preview["original"], preview["reconstructed"], max_frames=max_frames)
+    context_frames = int(preview["stats"].get("context_frames", 0))
+    grid = build_side_by_side_grid(
+        preview["original"],
+        preview["reconstructed"],
+        max_frames=max_frames,
+        context_frames=context_frames,
+    )
     grid.save(grid_path)
     exported_frame_count = write_side_by_side_gif(
         preview["original"],
         preview["reconstructed"],
         gif_path,
         duration_ms=duration_ms,
+        context_frames=context_frames,
     )
 
     stats = dict(preview["stats"])

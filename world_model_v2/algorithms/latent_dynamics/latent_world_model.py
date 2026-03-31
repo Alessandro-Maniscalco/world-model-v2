@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
@@ -56,6 +56,9 @@ class LatentWorldModel(nn.Module):
             sigma_min=cfg.sigma_min,
             sigma_max=cfg.sigma_max,
         )
+        self.normalization_stats: dict[str, Any] | None = None
+        self._action_norm_scale: torch.Tensor | None = None
+        self._action_norm_offset: torch.Tensor | None = None
         self.configure_stage_trainability()
 
     def to(self, *args: object, **kwargs: object) -> "LatentWorldModel":
@@ -82,6 +85,7 @@ class LatentWorldModel(nn.Module):
         """Load encoder, decoder, and optional dynamics weights from a prior stage."""
 
         checkpoint = load_checkpoint(checkpoint_path, device)
+        self.set_normalization_stats(checkpoint.get("normalization_stats"))
         model_state = checkpoint["model_state"]
         self._load_submodule_state("encoder", self.encoder, model_state)
         self._load_submodule_state("decoder", self.decoder, model_state)
@@ -92,6 +96,39 @@ class LatentWorldModel(nn.Module):
             if dynamics_keys:
                 self._load_submodule_state("dynamics", self.dynamics, model_state)
         self.configure_stage_trainability()
+
+    def set_normalization_stats(self, normalization_stats: Mapping[str, object] | None) -> None:
+        """Cache checkpoint or dataset normalization stats for Stage-2 action conditioning."""
+
+        if normalization_stats is None:
+            self.normalization_stats = None
+            self._action_norm_scale = None
+            self._action_norm_offset = None
+            return
+
+        self.normalization_stats = dict(normalization_stats)
+        if "action_min" not in normalization_stats or "action_max" not in normalization_stats:
+            self._action_norm_scale = None
+            self._action_norm_offset = None
+            return
+
+        action_min = torch.as_tensor(normalization_stats["action_min"], dtype=torch.float32)
+        action_max = torch.as_tensor(normalization_stats["action_max"], dtype=torch.float32)
+        if action_min.shape != action_max.shape:
+            raise ValueError("Action normalization stats must have matching action_min/action_max shapes.")
+
+        action_range = action_max - action_min
+        constant_dims = action_range.abs() < 1e-6
+        safe_range = action_range.clone()
+        safe_range[constant_dims] = 2.0
+
+        scale = torch.full_like(action_min, 2.0) / safe_range
+        offset = -1.0 - scale * action_min
+        scale[constant_dims] = 1.0
+        offset[constant_dims] = -action_min[constant_dims]
+
+        self._action_norm_scale = scale
+        self._action_norm_offset = offset
 
     def _load_submodule_state(
         self,
@@ -168,7 +205,7 @@ class LatentWorldModel(nn.Module):
         return latents.reshape(batch_size, horizon, latents.shape[1], latents.shape[2], latents.shape[3])
 
     def _validate_actions(self, actions: torch.Tensor, expected_steps: int) -> torch.Tensor:
-        """Validate and normalize action tensors for dynamics usage."""
+        """Validate the shape of one raw action sequence tensor."""
 
         if actions.shape[-1] != self.cfg.action_dim:
             raise ValueError(
@@ -179,6 +216,31 @@ class LatentWorldModel(nn.Module):
                 f"Expected action horizon {expected_steps}, got {actions.shape[1]}"
             )
         return actions.float()
+
+    def _normalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """Normalize actions to the upstream-style `[-1, 1]` range using cached stats."""
+
+        if self.cfg.training_stage == 1:
+            return actions
+        if self._action_norm_scale is None or self._action_norm_offset is None:
+            raise RuntimeError(
+                "Stage 2 and 3 require action normalization stats. "
+                "Call set_normalization_stats with checkpoint or dataset stats first."
+            )
+        scale = self._action_norm_scale.to(device=actions.device, dtype=actions.dtype)
+        offset = self._action_norm_offset.to(device=actions.device, dtype=actions.dtype)
+        return actions * scale + offset
+
+    def _prepare_stage2_actions(
+        self,
+        actions: torch.Tensor,
+        expected_steps: int,
+    ) -> torch.Tensor:
+        """Validate, normalize, and mask one action sequence for Stage-2 dynamics."""
+
+        validated = self._validate_actions(actions, expected_steps)
+        normalized = self._normalize_actions(validated)
+        return self._prepare_dynamics_actions(normalized)
 
     def _prepare_dynamics_actions(self, actions: torch.Tensor) -> torch.Tensor:
         """Prepare action conditioning with the configured masking strategy."""
@@ -194,9 +256,9 @@ class LatentWorldModel(nn.Module):
         frame_start: int,
         frame_end_exclusive: int,
     ) -> torch.Tensor:
-        """Slice and normalize one action window using the rollout convention."""
+        """Slice one already-prepared rollout action window."""
 
-        return self._prepare_dynamics_actions(actions[:, frame_start:frame_end_exclusive].clone())
+        return actions[:, frame_start:frame_end_exclusive].clone()
 
     def _make_dynamics_noise_slot(
         self,
@@ -208,12 +270,83 @@ class LatentWorldModel(nn.Module):
         sigma = self.noise_scheduler.sigmas[start_timestep].to(reference.device).view(1, 1, 1, 1, 1)
         return torch.randn_like(reference) * sigma
 
+    def _stage2_forward(
+        self,
+        sample: torch.Tensor,
+        timesteps: torch.Tensor,
+        stop_timesteps: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the Stage-2 dynamics model through the scheduler-style consistency merge."""
+
+        if self.dynamics is None:
+            raise RuntimeError("Stage 2 requires an initialized dynamics model.")
+        predicted_clean = self.dynamics(sample, timesteps, stop_timesteps, actions)
+        return self.noise_scheduler.ctm_calc_out(
+            sample,
+            predicted_clean,
+            timesteps,
+            stop_timesteps,
+        )
+
+    def _expand_loss_weights(
+        self,
+        weights: torch.Tensor,
+        target_ndim: int,
+    ) -> torch.Tensor:
+        """Expand per-frame loss weights to match a latent or image tensor."""
+
+        expanded = weights
+        while expanded.ndim < target_ndim:
+            expanded = expanded.unsqueeze(-1)
+        return expanded
+
     def _resolve_stage2_loss_weighting(self) -> str:
         """Resolve the effective Stage-2 loss weighting strategy."""
 
         if self.cfg.loss_weighting == "auto":
             return "uniform"
         return self.cfg.loss_weighting
+
+    def _stage2_rollout_stabilization_timestep(self) -> int:
+        """Return the smallest nonzero timestep used for stabilized rollout context frames."""
+
+        if self.noise_scheduler.timesteps <= 1:
+            return 0
+        return 1
+
+    def _postprocess_rollout_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Normalize a completed predicted latent sequence once after rollout finishes."""
+
+        flat_latents = latents.reshape(-1, latents.shape[2], latents.shape[3], latents.shape[4])
+        normalized = self._normalize_latents(flat_latents)
+        return normalized.reshape_as(latents)
+
+    def _denoise_rollout_window(
+        self,
+        current: torch.Tensor,
+        actions: torch.Tensor,
+        schedule: list[tuple[torch.Tensor, torch.Tensor]],
+        stabilization_timestep: int,
+    ) -> torch.Tensor:
+        """Run the Stage-2 denoising schedule over one active rollout window."""
+
+        for start, end in schedule:
+            t = torch.full(
+                current.shape[:2],
+                stabilization_timestep,
+                device=current.device,
+                dtype=torch.long,
+            )
+            s = torch.full_like(t, stabilization_timestep)
+            t[:, -1] = start
+            s[:, -1] = end
+            predicted_sequence = self._stage2_forward(current, t, s, actions)
+            if self.cfg.last_frame_loss_only:
+                current[:, -1:] = predicted_sequence[:, -1:]
+            else:
+                current = predicted_sequence
+        return current
 
     def _sample_stage2_noise_levels(
         self,
@@ -279,8 +412,10 @@ class LatentWorldModel(nn.Module):
         obs, _ = self.concatenate_observations(batch["obs"])  # type: ignore[arg-type]
         if obs.shape[1] < 2:
             raise ValueError("Stage 2 training requires horizon >= 2.")
-        actions = self._validate_actions(torch.as_tensor(batch["action"], device=obs.device), obs.shape[1])
-        actions = self._prepare_dynamics_actions(actions)
+        actions = self._prepare_stage2_actions(
+            torch.as_tensor(batch["action"], device=obs.device),
+            obs.shape[1],
+        )
         with torch.no_grad():
             latents = self._encode_sequence(obs)
         t, s = self._sample_stage2_noise_levels(
@@ -288,25 +423,34 @@ class LatentWorldModel(nn.Module):
             horizon=latents.shape[1],
             device=obs.device,
         )
-        noisy_t, target_s = self.noise_scheduler.add_noise_to_t_s(latents, t, s)
-        pred_latents = self.dynamics(noisy_t, t, s, actions)
-        weights = self.noise_scheduler.get_weights(
+        noisy_t, noisy_s = self.noise_scheduler.add_noise_to_t_s(latents, t, s)
+        pred_s = self._stage2_forward(noisy_t, t, s, actions)
+        weights_t = self.noise_scheduler.get_weights(
             t,
             weighting=self._resolve_stage2_loss_weighting(),
         )
-        while weights.ndim < pred_latents.ndim:
-            weights = weights.unsqueeze(-1)
-        loss_pred = pred_latents
-        loss_target = target_s
-        loss_weights = weights
+        loss_s = F.mse_loss(pred_s, noisy_s.detach(), reduction="none")
+        loss_s = loss_s * self._expand_loss_weights(weights_t, loss_s.ndim)
+
+        loss = loss_s
+        pred_latents = pred_s
+        if self.cfg.dyn_infer_steps > 1:
+            u = torch.zeros_like(s)
+            pred_u = self._stage2_forward(noisy_s, s, u, actions)
+            weights_s = self.noise_scheduler.get_weights(
+                s,
+                weighting=self._resolve_stage2_loss_weighting(),
+            )
+            loss_u = F.mse_loss(pred_u, latents.detach(), reduction="none")
+            loss_u = loss_u * self._expand_loss_weights(weights_s, loss_u.ndim)
+            loss = loss + loss_u
+            pred_latents = pred_u
         if self.cfg.last_frame_loss_only:
-            loss_pred = loss_pred[:, -1:]
-            loss_target = loss_target[:, -1:]
-            loss_weights = loss_weights[:, -1:]
-        dyn_loss_teacher_forced = ((loss_pred - loss_target) ** 2 * loss_weights).mean()
+            loss = loss[:, -1:]
+        dyn_loss = loss.mean()
         return {
-            "loss": dyn_loss_teacher_forced,
-            "dyn_loss_teacher_forced": dyn_loss_teacher_forced.detach(),
+            "loss": dyn_loss,
+            "dyn_loss": dyn_loss.detach(),
             "pred_latents": pred_latents.detach(),
         }
 
@@ -399,43 +543,106 @@ class LatentWorldModel(nn.Module):
         actions: torch.Tensor,
         context_size: int,
     ) -> torch.Tensor:
-        """Autoregress future latents from the first observed latent frame."""
+        """Autoregress future latents with a continuous sliding latent-history window."""
 
         if self.dynamics is None:
             raise RuntimeError("Latent rollout requires a dynamics model.")
-        predictions = [initial_latents[:, 0]]
-        max_context = max(1, context_size)
-        future_steps = actions.shape[1] - 1
+        if actions.shape[1] < initial_latents.shape[1]:
+            raise ValueError(
+                f"Expected at least {initial_latents.shape[1]} action steps, got {actions.shape[1]}"
+            )
+
+        predictions = initial_latents.clone()
+        max_context = max(2, context_size)
+        future_steps = actions.shape[1] - predictions.shape[1]
         schedule = self.noise_scheduler.make_sampling_schedule(
             max(1, self.cfg.dyn_infer_steps),
             initial_latents.device,
         )
         first_start = schedule[0][0]
+        stabilization_timestep = self._stage2_rollout_stabilization_timestep()
         for future_idx in range(future_steps):
-            context = torch.stack(predictions[-max_context:], dim=1)
+            current_end = predictions.shape[1] + 1
+            current_start = max(0, current_end - max_context)
+            active_predictions = predictions[:, current_start:]
             current = torch.cat(
                 [
-                    context,
-                    self._make_dynamics_noise_slot(context[:, :1], first_start),
+                    active_predictions,
+                    self._make_dynamics_noise_slot(active_predictions[:, :1], first_start),
                 ],
                 dim=1,
             )
-            frame_start = max(0, future_idx + 1 - context.shape[1])
-            action_window = self._slice_dynamics_action_window(actions, frame_start, future_idx + 2)
-            for start, end in schedule:
-                t = torch.zeros(
-                    current.shape[:2],
-                    device=current.device,
-                    dtype=torch.long,
-                )
-                s = torch.zeros_like(t)
-                t[:, -1] = start
-                s[:, -1] = end
-                predicted_sequence = self.dynamics(current, t, s, action_window)
-                current[:, -1:] = predicted_sequence[:, -1:]
-            next_latent = self._normalize_latents(current[:, -1])
-            predictions.append(next_latent)
-        return torch.stack(predictions, dim=1)
+            action_window = self._slice_dynamics_action_window(actions, current_start, current_end)
+            current = self._denoise_rollout_window(
+                current,
+                action_window,
+                schedule,
+                stabilization_timestep,
+            )
+            if not self.cfg.last_frame_loss_only:
+                predictions[:, current_start:] = current[:, :-1]
+            predictions = torch.cat([predictions, current[:, -1:]], dim=1)
+        return self._postprocess_rollout_latents(predictions)
+
+    @torch.no_grad()
+    def _teacher_forced_rollout_latents(
+        self,
+        latents: torch.Tensor,
+        actions: torch.Tensor,
+        context_size: int,
+    ) -> torch.Tensor:
+        """Predict each next latent from ground-truth context for Stage-2 debugging and tests."""
+
+        prepared_actions = self._prepare_stage2_actions(actions, latents.shape[1])
+        schedule = self.noise_scheduler.make_sampling_schedule(
+            max(1, self.cfg.dyn_infer_steps),
+            latents.device,
+        )
+        first_start = schedule[0][0]
+        stabilization_timestep = self._stage2_rollout_stabilization_timestep()
+        predictions = [latents[:, :1]]
+        max_context = max(2, context_size)
+
+        for target_idx in range(1, latents.shape[1]):
+            current_end = target_idx + 1
+            current_start = max(0, current_end - max_context)
+            active_context = latents[:, current_start:target_idx]
+            current = torch.cat(
+                [
+                    active_context,
+                    self._make_dynamics_noise_slot(active_context[:, :1], first_start),
+                ],
+                dim=1,
+            )
+            action_window = self._slice_dynamics_action_window(
+                prepared_actions,
+                current_start,
+                current_end,
+            )
+            current = self._denoise_rollout_window(
+                current,
+                action_window,
+                schedule,
+                stabilization_timestep,
+            )
+            predictions.append(current[:, -1:])
+        return self._postprocess_rollout_latents(torch.cat(predictions, dim=1))
+
+    @torch.no_grad()
+    def rollout_validation_episode(
+        self,
+        latents: torch.Tensor,
+        actions: torch.Tensor,
+        context_size: int,
+    ) -> torch.Tensor:
+        """Roll out a full validation episode from the first latent with a sliding context window."""
+
+        if latents.shape[1] != actions.shape[1]:
+            raise ValueError(
+                f"Expected matching latent/action lengths, got {latents.shape[1]} and {actions.shape[1]}"
+            )
+        prepared_actions = self._prepare_stage2_actions(actions, latents.shape[1])
+        return self.rollout_latents(latents[:, :1], prepared_actions, context_size)
 
     @torch.no_grad()
     def validation_step(
@@ -477,21 +684,24 @@ class LatentWorldModel(nn.Module):
 
         actions = self._validate_actions(torch.as_tensor(batch["action"], device=obs.device), obs.shape[1])
         latents = self._encode_sequence(obs)
-        rolled_latents = self.rollout_latents(latents[:, :1], actions, rollout_context_size)
+        rollout_window = max(2, int(rollout_context_size))
+        rolled_latents = self.rollout_validation_episode(latents, actions, rollout_window)
         rendered = self.render_from_latents(rolled_latents, num_steps=max(1, num_steps))
-        dyn_loss_rollout = F.mse_loss(rolled_latents[:, 1:], latents[:, 1:]).item()
+        dyn_loss = F.mse_loss(rolled_latents[:, 1:], latents[:, 1:]).item()
         latent_shape = list(rolled_latents[:, :1].reshape(-1, *rolled_latents.shape[2:]).shape)
         stats = {
             "episode": int(torch.as_tensor(batch["episode_idx"]).reshape(-1)[0].item()),
             "input_frame_count": int(obs.shape[1]),
             "predicted_frame_count": int(rolled_latents.shape[1]),
             "decoded_frame_count": int(rendered.shape[1]),
-            "dyn_loss_rollout": dyn_loss_rollout,
+            "dyn_loss": dyn_loss,
             "latent_shape": latent_shape,
             "action_shape": list(actions.shape[-2:]),
-            "start_mode": "noise",
+            "prediction_mode": "open_loop_rollout",
+            "context_frames": 0,
+            "seed_frames": 1,
             "num_steps": num_steps,
-            "rollout_context_size": int(max(1, rollout_context_size)),
+            "rollout_window": rollout_window,
             "training_stage": self.cfg.training_stage,
         }
         return {
