@@ -11,6 +11,11 @@ import torch
 
 from world_model_v2.algorithms.latent_dynamics.latent_world_model import LatentWorldModel
 from world_model_v2.config import AlgorithmConfig, DatasetConfig, ExperimentConfig, RunConfig
+from world_model_v2.minimal.experiment import (
+    MinimalExperimentConfig,
+    save_minimal_checkpoint,
+)
+from world_model_v2.minimal.model import MinimalWorldModel
 from world_model_v2.utils.checkpointing import save_checkpoint
 
 
@@ -20,7 +25,7 @@ def write_episode(path: Path, frames: int = 6, height: int = 32, width: int = 32
     path.parent.mkdir(parents=True, exist_ok=True)
     image_stack = np.zeros((frames, height, width, 3), dtype=np.uint8)
     for frame_idx in range(frames):
-        image_stack[frame_idx, :, :, 0] = frame_idx * 20
+        image_stack[frame_idx, :, :, 0] = (frame_idx * 20) % 256
         image_stack[frame_idx, :, :, 1] = np.arange(width, dtype=np.uint8)[None, :]
         image_stack[frame_idx, :, :, 2] = np.arange(height, dtype=np.uint8)[:, None]
     actions = np.stack(
@@ -41,6 +46,16 @@ def fake_dataset_root(tmp_path: Path) -> Path:
     root = tmp_path / "data"
     write_episode(root / "single_grasp" / "train" / "episode_0.hdf5")
     write_episode(root / "single_grasp" / "val" / "episode_0.hdf5")
+    return root
+
+
+@pytest.fixture()
+def fake_long_dataset_root(tmp_path: Path) -> Path:
+    """Create a longer train/val dataset tree for the default `111:116` slice."""
+
+    root = tmp_path / "long_data"
+    write_episode(root / "single_grasp" / "train" / "episode_0.hdf5", frames=130)
+    write_episode(root / "single_grasp" / "val" / "episode_0.hdf5", frames=130)
     return root
 
 
@@ -145,3 +160,37 @@ def saved_checkpoint(saved_stage1_checkpoint: Path) -> Path:
     """Preserve the legacy Stage-1 checkpoint fixture name for existing tests."""
 
     return saved_stage1_checkpoint
+
+
+@pytest.fixture()
+def saved_minimal_joint_checkpoint(fake_long_dataset_root: Path, tmp_path: Path) -> Path:
+    """Create a deterministic minimal joint checkpoint for loading tests."""
+
+    checkpoint_path = tmp_path / "minimal_joint.pt"
+    model = MinimalWorldModel()
+    for parameter in model.encoder.parameters():
+        torch.nn.init.constant_(parameter, 0.25)
+    for parameter in model.decoder.parameters():
+        torch.nn.init.constant_(parameter, 0.5)
+    for parameter in model.dynamics.parameters():
+        torch.nn.init.constant_(parameter, 0.75)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    config = MinimalExperimentConfig(
+        mode="joint",
+        data_root=str(fake_long_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="fixture_joint",
+        device="cpu",
+    )
+    save_minimal_checkpoint(
+        path=checkpoint_path,
+        model=model,
+        optimizer=optimizer,
+        scheduler=None,
+        step=5,
+        config=config.to_dict(),
+        mode=config.mode,
+        clip_metadata=config.clip_metadata(),
+        best_metric=0.123,
+    )
+    return checkpoint_path
