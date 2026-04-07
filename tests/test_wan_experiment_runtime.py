@@ -17,6 +17,7 @@ from world_model_v2.minimal.experiment import (
 
 
 DEBUG_FRAME_KWARGS = {"frame_start": 111, "frame_end": 116}
+DYNAMICS_FIVE_FRAME_KWARGS = {"frame_start": 111, "frame_end": 115}
 
 
 def test_wan_ae_only_training_step_reports_kl_terms(
@@ -42,16 +43,43 @@ def test_wan_ae_only_training_step_reports_kl_terms(
     assert torch.isclose(metrics["loss"], metrics["ae_loss"])
 
 
+def test_wan_dynamics_only_training_step_reports_rf_terms(
+    fake_long_dataset_root: Path,
+    saved_minimal_wan_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Dynamics-only steps should expose RF loss terms for the target latent frame."""
+
+    experiment = MinimalExperiment(
+        MinimalExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="dynamics_metrics",
+            **DYNAMICS_FIVE_FRAME_KWARGS,
+            load_encoder_decoder=str(saved_minimal_wan_ae_checkpoint),
+            device="cpu",
+        )
+    )
+    batch = experiment._move_batch_to_device(next(iter(experiment.train_loader)))
+    metrics = experiment._dynamics_only_training_step(batch)
+    assert set(metrics) == {"loss", "latent_rf_mse", "target_sigma"}
+    assert torch.isclose(metrics["loss"], metrics["latent_rf_mse"])
+    assert float(metrics["target_sigma"]) > 0.0
+
+
 @pytest.mark.parametrize(
-    ("mode", "expected_stat_key"),
+    ("mode", "expected_stat_key", "frame_kwargs", "expected_predicted_count"),
     [
-        ("ae_only", "ae_loss"),
-        ("dynamics_only", "rollout_mse"),
+        ("ae_only", "ae_loss", DEBUG_FRAME_KWARGS, 6),
+        ("dynamics_only", "next_frame_mse", DYNAMICS_FIVE_FRAME_KWARGS, 5),
     ],
 )
 def test_wan_experiment_run_writes_artifacts_for_each_mode(
     mode: str,
     expected_stat_key: str,
+    frame_kwargs: dict[str, int],
+    expected_predicted_count: int,
     fake_long_dataset_root: Path,
     saved_minimal_wan_ae_checkpoint: Path,
     tmp_path: Path,
@@ -63,7 +91,7 @@ def test_wan_experiment_run_writes_artifacts_for_each_mode(
         data_root=str(fake_long_dataset_root),
         output_dir=str(tmp_path / "outputs"),
         run_name=f"smoke_{mode}",
-        **DEBUG_FRAME_KWARGS,
+        **frame_kwargs,
         max_steps=1,
         validation_interval=1,
         checkpoint_interval=1,
@@ -88,7 +116,13 @@ def test_wan_experiment_run_writes_artifacts_for_each_mode(
     if mode == "ae_only":
         assert '"kl_loss"' in payload
     else:
-        assert '"predicted_frame_count": 6' in payload
+        assert saved_stats["predicted_frame_count"] == expected_predicted_count
+        assert '"predicted_frame_count": 5' in payload
+        assert '"next_latent_mse"' in payload
+        assert saved_stats["seed_frames"] == 3
+        assert saved_stats["loss_frames"] == 2
+        assert saved_stats["validation_style"] == "teacher_forced_three_context_two_target"
+        assert stats["dynamics_backend"] == "rf_dit"
 
 
 def test_wan_experiment_auto_batch_size_cleans_up_and_retries_after_oom(

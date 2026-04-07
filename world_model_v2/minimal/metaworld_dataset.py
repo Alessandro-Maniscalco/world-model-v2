@@ -21,6 +21,8 @@ METAWORLD_DATASET_ID = "lerobot/metaworld_mt50"
 METAWORLD_TASKS_PATH = "meta/tasks.parquet"
 METAWORLD_EPISODES_PATH = "meta/episodes/chunk-000/file-000.parquet"
 METAWORLD_IMAGE_COLUMN = "observation.image"
+METAWORLD_ACTION_COLUMN_CANDIDATES = ("action", "actions")
+METAWORLD_ACTION_DIM = 4
 
 
 @dataclass(frozen=True)
@@ -225,6 +227,31 @@ class MetaWorldRepository:
             columns=[METAWORLD_IMAGE_COLUMN],
         )
 
+    @lru_cache(maxsize=8)
+    def action_column_name(self, chunk_index: int, file_index: int) -> str:
+        """Return the parquet action column name for one shard."""
+
+        schema_names = pq.read_schema(
+            self.resolve_file(self._data_file_relative_path(chunk_index, file_index))
+        ).names
+        for column_name in METAWORLD_ACTION_COLUMN_CANDIDATES:
+            if column_name in schema_names:
+                return column_name
+        raise KeyError(
+            "MetaWorld parquet shard is missing an action column. "
+            f"Checked {METAWORLD_ACTION_COLUMN_CANDIDATES}."
+        )
+
+    @lru_cache(maxsize=2)
+    def action_table(self, chunk_index: int, file_index: int) -> Any:
+        """Load and cache one parquet shard's action column."""
+
+        column_name = self.action_column_name(chunk_index, file_index)
+        return pq.read_table(
+            self.resolve_file(self._data_file_relative_path(chunk_index, file_index)),
+            columns=[column_name],
+        )
+
     def frame_row_index_in_file(
         self,
         record: MetaWorldEpisodeRecord,
@@ -267,6 +294,21 @@ class MetaWorldRepository:
             width=resolved_width,
         )
 
+    def load_action_tensor(self, frame: MetaWorldFrameRecord) -> torch.Tensor:
+        """Load one action vector from the backing parquet shard."""
+
+        column_name = self.action_column_name(frame.data_chunk_index, frame.data_file_index)
+        value = self.action_table(frame.data_chunk_index, frame.data_file_index)[column_name][
+            frame.row_index_in_file
+        ].as_py()
+        action = torch.as_tensor(value, dtype=torch.float32)
+        if action.ndim != 1 or action.shape[0] != METAWORLD_ACTION_DIM:
+            raise ValueError(
+                f"Expected MetaWorld action shape ({METAWORLD_ACTION_DIM},), "
+                f"received {tuple(action.shape)}."
+            )
+        return action
+
     def load_clip(
         self,
         record: MetaWorldEpisodeRecord,
@@ -275,6 +317,7 @@ class MetaWorldRepository:
         resolution: int,
         height: int | None,
         width: int | None,
+        load_actions: bool = False,
         clamp_frame_end: bool = False,
     ) -> dict[str, Any]:
         """Load one resized frame slice from a specific MT50 episode."""
@@ -300,6 +343,7 @@ class MetaWorldRepository:
 
         resolved_height, resolved_width = resolve_resize_shape(resolution, height, width)
         frames: list[torch.Tensor] = []
+        actions: list[torch.Tensor] = []
         for local_frame_index in range(resolved_frame_start, effective_frame_end + 1):
             frame_record = MetaWorldFrameRecord(
                 episode_index=record.episode_index,
@@ -316,7 +360,9 @@ class MetaWorldRepository:
                     width=resolved_width,
                 )
             )
-        return {
+            if load_actions and local_frame_index < effective_frame_end:
+                actions.append(self.load_action_tensor(frame_record))
+        clip = {
             "frames": torch.stack(frames, dim=0),
             "frame_idx": torch.arange(
                 resolved_frame_start,
@@ -327,6 +373,13 @@ class MetaWorldRepository:
             "task_idx": torch.tensor(record.task_index, dtype=torch.long),
             "task_name": record.task_name,
         }
+        if load_actions:
+            clip["actions"] = (
+                torch.stack(actions, dim=0)
+                if actions
+                else torch.zeros((0, METAWORLD_ACTION_DIM), dtype=torch.float32)
+            )
+        return clip
 
 
 def load_metaworld_clip(
@@ -341,6 +394,7 @@ def load_metaworld_clip(
     frame_end: int | None = None,
     repo_id: str = METAWORLD_DATASET_ID,
     cache_dir: str | Path | None = None,
+    load_actions: bool = False,
     clamp_frame_end: bool = False,
 ) -> dict[str, Any]:
     """Load one resized frame slice from the MT50 dataset."""
@@ -355,6 +409,7 @@ def load_metaworld_clip(
         resolution=resolution,
         height=height,
         width=width,
+        load_actions=load_actions,
         clamp_frame_end=clamp_frame_end,
     )
 
@@ -503,7 +558,7 @@ class MetaWorldFrameDataset(Dataset[dict[str, Any]]):
 
 
 class MetaWorldTransitionDataset(Dataset[dict[str, Any]]):
-    """Expose one MT50 episode as consecutive frame-transition samples."""
+    """Expose one MT50 episode as sliding three-context two-target windows."""
 
     def __init__(
         self,
@@ -519,7 +574,7 @@ class MetaWorldTransitionDataset(Dataset[dict[str, Any]]):
         repo_id: str = METAWORLD_DATASET_ID,
         cache_dir: str | Path | None = None,
     ) -> None:
-        """Cache one MT50 clip for one-step dynamics training."""
+        """Cache one MT50 clip for five-frame dynamics training windows."""
 
         self.clip = load_metaworld_clip(
             data_root=data_root,
@@ -533,21 +588,23 @@ class MetaWorldTransitionDataset(Dataset[dict[str, Any]]):
             frame_end=frame_end,
             repo_id=repo_id,
             cache_dir=cache_dir,
+            load_actions=True,
         )
 
     def __len__(self) -> int:
-        """Return the number of consecutive frame pairs."""
+        """Return the number of available three-context two-target windows."""
 
-        return max(int(self.clip["frames"].shape[0]) - 1, 0)
+        return max(int(self.clip["frames"].shape[0]) - 4, 0)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        """Return one `(current, next)` MT50 transition sample."""
+        """Return one `(context[0:3], target[0:2])` MT50 training sample."""
 
         return {
-            "current_frame": self.clip["frames"][index],
-            "next_frame": self.clip["frames"][index + 1],
-            "current_frame_idx": self.clip["frame_idx"][index],
-            "next_frame_idx": self.clip["frame_idx"][index + 1],
+            "context_frames": self.clip["frames"][index : index + 3],
+            "target_frames": self.clip["frames"][index + 3 : index + 5],
+            "actions": self.clip["actions"][index : index + 4],
+            "context_frame_idx": self.clip["frame_idx"][index : index + 3],
+            "target_frame_idx": self.clip["frame_idx"][index + 3 : index + 5],
             "episode_idx": self.clip["episode_idx"],
         }
 
@@ -583,6 +640,7 @@ class MetaWorldValidationClipDataset(Dataset[dict[str, Any]]):
             frame_end=frame_end,
             repo_id=repo_id,
             cache_dir=cache_dir,
+            load_actions=True,
         )
 
     def __len__(self) -> int:
@@ -597,6 +655,7 @@ class MetaWorldValidationClipDataset(Dataset[dict[str, Any]]):
             raise IndexError("MetaWorldValidationClipDataset only contains one clip.")
         return {
             "frames": self.clip["frames"],
+            "actions": self.clip["actions"],
             "frame_idx": self.clip["frame_idx"],
             "episode_idx": self.clip["episode_idx"],
         }

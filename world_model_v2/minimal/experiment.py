@@ -63,6 +63,9 @@ class MinimalExperimentConfig:
     latent_channels: int = 16
     hidden_channels: int = 64
     ae_backend: str = "wan"
+    dynamics_infer_steps: int = 16
+    dynamics_train_timesteps: int = 1000
+    dynamics_rf_shift: float = 5.0
     kl_beta: float = 1e-4
     recon_mse_weight: float = 1.0
     recon_l1_weight: float = 0.0
@@ -211,6 +214,8 @@ def save_minimal_checkpoint(
         "best_metric": best_metric,
         "ae_backend": model.ae_backend,
         "autoencoder": model.autoencoder_config(),
+        "dynamics_backend": model.dynamics_backend,
+        "dynamics": model.dynamics_config(),
     }
     torch.save(payload, output_path)
 
@@ -239,6 +244,18 @@ def checkpoint_ae_backend(checkpoint: dict[str, Any]) -> str:
     raise ValueError("Checkpoint is missing autoencoder backend metadata.")
 
 
+def checkpoint_dynamics_backend(checkpoint: dict[str, Any]) -> str:
+    """Return the checkpoint's recorded dynamics backend."""
+
+    backend = checkpoint.get("dynamics_backend")
+    if isinstance(backend, str):
+        return backend
+    dynamics = checkpoint.get("dynamics")
+    if isinstance(dynamics, dict) and isinstance(dynamics.get("backend"), str):
+        return str(dynamics["backend"])
+    return "legacy_conv"
+
+
 class MinimalExperiment:
     """Train and validate the minimal world model in AE-only or dynamics-only mode."""
 
@@ -261,10 +278,14 @@ class MinimalExperiment:
             resolution=cfg.resolution,
             height=cfg.height,
             width=cfg.width,
+            dynamics_infer_steps=cfg.dynamics_infer_steps,
+            dynamics_train_timesteps=cfg.dynamics_train_timesteps,
+            dynamics_rf_shift=cfg.dynamics_rf_shift,
         ).to(self.device)
         self._load_requested_pretrained_weights()
         self.model.configure_trainability(cfg.mode)
         self.train_dataset = self._build_train_dataset()
+        self._validate_train_dataset()
         self.cfg.batch_size = self._resolve_train_batch_size(self.train_dataset)
         self.train_loader = self._build_train_loader(self.train_dataset)
         self.val_loader = self._build_val_loader()
@@ -307,6 +328,12 @@ class MinimalExperiment:
                 f"Unsupported autoencoder backend: {self.cfg.ae_backend}. "
                 "The minimal path now only supports the Wan VAE."
             )
+        if self.cfg.dynamics_infer_steps < 1:
+            raise ValueError("dynamics_infer_steps must be positive.")
+        if self.cfg.dynamics_train_timesteps < 2:
+            raise ValueError("dynamics_train_timesteps must be at least 2.")
+        if self.cfg.dynamics_rf_shift <= 0.0:
+            raise ValueError("dynamics_rf_shift must be positive.")
         if (
             self.cfg.frame_start is not None
             and self.cfg.frame_end is not None
@@ -336,6 +363,15 @@ class MinimalExperiment:
                 )
             if self.cfg.metaworld_task_index is not None and self.cfg.metaworld_task_index < 0:
                 raise ValueError("metaworld_task_index must be greater than or equal to zero.")
+
+    def _validate_train_dataset(self) -> None:
+        """Reject dynamics-only runs that do not contain any valid 5-frame windows."""
+
+        if self.cfg.mode == "dynamics_only" and len(self.train_dataset) < 1:
+            raise ValueError(
+                "dynamics_only requires at least five frames in the selected clip so one "
+                "three-context two-target window exists."
+            )
 
     def _default_run_name(self, mode: str) -> str:
         """Return a timestamped default run name."""
@@ -589,6 +625,49 @@ class MinimalExperiment:
                 f"backend {self.cfg.ae_backend}."
             )
 
+    def _assert_checkpoint_dynamics_backend(
+        self,
+        checkpoint: dict[str, Any],
+        path: str | Path,
+    ) -> None:
+        """Ensure the checkpoint dynamics backend matches the RF DiT architecture."""
+
+        backend = checkpoint_dynamics_backend(checkpoint)
+        if backend != self.model.dynamics_backend:
+            raise ValueError(
+                f"Checkpoint dynamics backend {backend} from {path} does not match requested "
+                f"backend {self.model.dynamics_backend}. Old conv-dynamics checkpoints are not "
+                "compatible with the new minimal RF DiT."
+            )
+        checkpoint_dynamics = checkpoint.get("dynamics")
+        if not isinstance(checkpoint_dynamics, dict):
+            return
+        checkpoint_config = checkpoint_dynamics.get("config")
+        if not isinstance(checkpoint_config, dict):
+            return
+        checkpoint_max_frames = checkpoint_config.get("max_frames")
+        if checkpoint_max_frames != self.model.dynamics.cfg.max_frames:
+            raise ValueError(
+                f"Checkpoint dynamics config max_frames={checkpoint_max_frames} from {path} "
+                f"does not match the requested minimal RF DiT max_frames="
+                f"{self.model.dynamics.cfg.max_frames}. This run expects three context frames "
+                "plus two target frames."
+            )
+        checkpoint_action_steps = checkpoint_config.get("num_action_per_chunk")
+        if checkpoint_action_steps != self.model.dynamics.cfg.num_action_per_chunk:
+            raise ValueError(
+                f"Checkpoint dynamics config num_action_per_chunk={checkpoint_action_steps} from {path} "
+                "does not match the active DreamDojo-style action-conditioned RF DiT. "
+                "Older stub-action checkpoints are not load-compatible; start a fresh dynamics run "
+                "or skip loading dynamics weights."
+            )
+        checkpoint_action_dim = checkpoint_config.get("action_dim")
+        if checkpoint_action_dim != self.model.dynamics.cfg.action_dim:
+            raise ValueError(
+                f"Checkpoint dynamics config action_dim={checkpoint_action_dim} from {path} "
+                f"does not match the requested action_dim={self.model.dynamics.cfg.action_dim}."
+            )
+
     def _load_requested_pretrained_weights(self) -> None:
         """Load any optional encoder/decoder or dynamics checkpoint weights."""
 
@@ -600,6 +679,7 @@ class MinimalExperiment:
         if self.cfg.load_dynamics:
             checkpoint = load_minimal_checkpoint(self.cfg.load_dynamics, self.device)
             self._assert_checkpoint_backend(checkpoint, self.cfg.load_dynamics)
+            self._assert_checkpoint_dynamics_backend(checkpoint, self.cfg.load_dynamics)
             self._load_submodule_state("dynamics", self.model.dynamics, checkpoint["model_state"])
 
     def _load_submodule_state(
@@ -625,7 +705,12 @@ class MinimalExperiment:
 
         checkpoint = load_minimal_checkpoint(self.cfg.resume, self.device)
         self._assert_checkpoint_backend(checkpoint, self.cfg.resume)
-        self.model.load_state_dict(checkpoint["model_state"], strict=True)
+        if self.cfg.mode == "ae_only":
+            self._load_submodule_state("encoder", self.model.encoder, checkpoint["model_state"])
+            self._load_submodule_state("decoder", self.model.decoder, checkpoint["model_state"])
+        else:
+            self._assert_checkpoint_dynamics_backend(checkpoint, self.cfg.resume)
+            self.model.load_state_dict(checkpoint["model_state"], strict=True)
         if checkpoint["optimizer_state"] is not None:
             self.optimizer.load_state_dict(checkpoint["optimizer_state"])
         self.best_metric = checkpoint.get("best_metric")
@@ -741,7 +826,7 @@ class MinimalExperiment:
 
         if self.cfg.mode == "ae_only":
             return "ae_loss"
-        return "rollout_mse"
+        return "next_frame_mse"
 
     def _train_step(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         """Dispatch to the mode-specific training objective."""
@@ -774,16 +859,30 @@ class MinimalExperiment:
         }
 
     def _dynamics_only_training_step(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """Run one frozen-autoencoder latent dynamics step."""
+        """Run one frozen-autoencoder three-context two-target RF dynamics step."""
 
-        current_frame = batch["current_frame"]
-        next_frame = batch["next_frame"]
+        context_frames = batch["context_frames"]
+        target_frames = batch["target_frames"]
+        actions = batch["actions"]
         with torch.no_grad():
-            current_latent = self.model.encode(current_frame, deterministic=True)
-            target_latent = self.model.encode(next_frame, deterministic=True)
-        predicted_latent = self.model.predict_next_latent(current_latent)
-        latent_mse = F.mse_loss(predicted_latent, target_latent)
-        return {"loss": latent_mse, "latent_mse": latent_mse.detach()}
+            context_latent_video = self.model.encode_context_frames(context_frames, deterministic=True)
+            target_latent_video = self.model.encode_frame_sequence(target_frames, deterministic=True)
+        clean_latent_video = torch.cat([context_latent_video, target_latent_video], dim=2)
+        dynamics_inputs = self.model.dynamics.prepare_training_inputs(clean_latent_video, actions=actions)
+        predicted_velocity = self.model.dynamics(
+            noisy_latent_video=dynamics_inputs.noisy_latent_video,
+            timesteps=dynamics_inputs.timesteps,
+            condition_mask=dynamics_inputs.condition_mask,
+            actions=dynamics_inputs.actions,
+            conditioning_latent_video=dynamics_inputs.conditioning_latent_video,
+            target_velocity=dynamics_inputs.target_velocity,
+        )
+        latent_rf_mse = F.mse_loss(predicted_velocity, dynamics_inputs.target_velocity)
+        return {
+            "loss": latent_rf_mse,
+            "latent_rf_mse": latent_rf_mse.detach(),
+            "target_sigma": dynamics_inputs.target_sigmas.mean().detach(),
+        }
 
     @torch.no_grad()
     def _validate_ae_only_frames(
@@ -828,6 +927,85 @@ class MinimalExperiment:
         return reconstructed, recon_loss, recon_mse, recon_l1, edge_l1, kl_loss, ae_loss
 
     @torch.no_grad()
+    def _validate_dynamics_one_step(
+        self,
+        frames: torch.Tensor,
+        actions: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Validate dynamics with teacher-forced three-context two-target predictions."""
+
+        context_frames = self.model.dynamics.cfg.context_frames
+        target_frames = self.model.dynamics.cfg.target_frames
+        if frames.shape[0] < self.model.dynamics.cfg.max_frames:
+            raise ValueError(
+                f"Dynamics validation requires at least {self.model.dynamics.cfg.max_frames} frames."
+            )
+        predicted_frames = [frames[:context_frames].detach().cpu()]
+        total_frame_squared_error = 0.0
+        total_frame_values = 0
+        total_latent_squared_error = 0.0
+        total_latent_values = 0
+        for target_start in range(context_frames, int(frames.shape[0]), target_frames):
+            current_frames = frames[target_start - context_frames : target_start].unsqueeze(0)
+            target_stop = min(target_start + target_frames, int(frames.shape[0]))
+            target_chunk = frames[target_start:target_stop]
+            padded_target_chunk = target_chunk
+            if target_chunk.shape[0] < target_frames:
+                pad_frame = target_chunk[-1:].expand(target_frames - target_chunk.shape[0], -1, -1, -1)
+                padded_target_chunk = torch.cat([target_chunk, pad_frame], dim=0)
+            current_latent = self.model.encode_context_frames(current_frames, deterministic=True)
+            target_latent = self.model.encode_frame_sequence(
+                padded_target_chunk.unsqueeze(0),
+                deterministic=True,
+            )
+            action_window = None
+            if actions is not None:
+                action_start = target_start - context_frames
+                action_stop = action_start + self.model.dynamics.cfg.num_action_per_chunk
+                action_window = actions[action_start:min(action_stop, int(actions.shape[0]))]
+                if action_window.shape[0] < self.model.dynamics.cfg.num_action_per_chunk:
+                    pad_actions = torch.zeros(
+                        self.model.dynamics.cfg.num_action_per_chunk - action_window.shape[0],
+                        self.model.dynamics.cfg.action_dim,
+                        device=actions.device,
+                        dtype=actions.dtype,
+                    )
+                    action_window = torch.cat([action_window, pad_actions], dim=0)
+                action_window = action_window.unsqueeze(0)
+            generator = torch.Generator(device=current_latent.device.type)
+            generator.manual_seed(target_start)
+            predicted_latent = self.model.predict_next_latent(
+                current_latent,
+                actions=action_window,
+                generator=generator,
+            )
+            predicted_frame = self.model.decode_frame_sequence(predicted_latent)[0, : target_chunk.shape[0]]
+            predicted_frames.append(predicted_frame.detach().cpu())
+            total_frame_squared_error += float(
+                F.mse_loss(predicted_frame, target_chunk, reduction="sum").item()
+            )
+            total_frame_values += int(target_chunk.numel())
+            total_latent_squared_error += float(
+                F.mse_loss(
+                    predicted_latent[:, :, : target_chunk.shape[0]],
+                    target_latent[:, :, : target_chunk.shape[0]],
+                    reduction="sum",
+                ).item()
+            )
+            total_latent_values += int(target_latent[:, :, : target_chunk.shape[0]].numel())
+        preview_frames = torch.cat(predicted_frames, dim=0)
+        return preview_frames, {
+            "input_frame_count": int(frames.shape[0]),
+            "decoded_frame_count": int(preview_frames.shape[0]),
+            "predicted_frame_count": int(preview_frames.shape[0]),
+            "seed_frames": int(context_frames),
+            "loss_frames": int(frames.shape[0] - context_frames),
+            "next_frame_mse": total_frame_squared_error / max(total_frame_values, 1),
+            "next_latent_mse": total_latent_squared_error / max(total_latent_values, 1),
+            "validation_style": "teacher_forced_three_context_two_target",
+        }
+
+    @torch.no_grad()
     def _validate(self, step: int) -> dict[str, Any]:
         """Run validation, export artifacts, and update the best checkpoint."""
 
@@ -848,25 +1026,24 @@ class MinimalExperiment:
                 "ae_loss": ae_loss,
                 "mode": self.cfg.mode,
                 "ae_backend": self.cfg.ae_backend,
+                "dynamics_backend": self.model.dynamics_backend,
             }
             preview_frames = reconstructed
             context_frames = 0
         else:
-            rollout = self.model.rollout(frames[:1], steps=frames.shape[0] - 1)[0]
-            rollout_mse = F.mse_loss(rollout[1:], frames[1:]).item()
+            clip_actions = batch.get("actions")
+            preview_frames, dynamics_stats = self._validate_dynamics_one_step(
+                frames,
+                actions=None if clip_actions is None else clip_actions[0],
+            )
             stats = {
                 "episode": int(batch["episode_idx"].reshape(-1)[0].item()),
-                "input_frame_count": int(frames.shape[0]),
-                "decoded_frame_count": int(rollout.shape[0]),
-                "predicted_frame_count": int(rollout.shape[0]),
-                "rollout_mse": float(rollout_mse),
-                "seed_frames": 1,
-                "loss_frames": int(frames.shape[0] - 1),
+                **dynamics_stats,
                 "mode": self.cfg.mode,
                 "ae_backend": self.cfg.ae_backend,
+                "dynamics_backend": self.model.dynamics_backend,
             }
-            preview_frames = rollout
-            context_frames = 1
+            context_frames = self.model.dynamics.cfg.context_frames
 
         output_dir = self.run_dir / "samples" / f"step_{step:06d}"
         output_dir.mkdir(parents=True, exist_ok=True)

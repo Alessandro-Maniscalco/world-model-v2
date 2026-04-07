@@ -80,6 +80,7 @@ def load_minimal_clip(
     resolution: int = 128,
     height: int | None = None,
     width: int | None = None,
+    load_actions: bool = False,
     clamp_frame_end: bool = False,
 ) -> dict[str, Any]:
     """Load one resized frame slice from a single episode."""
@@ -95,6 +96,11 @@ def load_minimal_clip(
         if camera not in images_group:
             raise KeyError(f"Camera {camera} not found in {episode_path}")
         frames = np.asarray(images_group[camera])
+        action_values = None
+        if load_actions:
+            if "action" not in handle:
+                raise KeyError(f"Episode is missing action dataset: {episode_path}")
+            action_values = np.asarray(handle["action"], dtype=np.float32)
 
     resolved_frame_start = 0 if frame_start is None else frame_start
     resolved_frame_end = int(frames.shape[0]) - 1 if frame_end is None else frame_end
@@ -123,13 +129,25 @@ def load_minimal_clip(
         dim=0,
     )
     frame_idx = torch.arange(resolved_frame_start, effective_frame_end + 1, dtype=torch.long)
-    return {
+    clip = {
         "frames": clip_tensor,
         "frame_idx": frame_idx,
         "episode_idx": torch.tensor(episode, dtype=torch.long),
         "camera": camera,
         "episode_path": episode_path,
     }
+    if action_values is not None:
+        required_action_stop = effective_frame_end
+        if required_action_stop > int(action_values.shape[0]):
+            raise ValueError(
+                f"Requested frames {resolved_frame_start}:{resolved_frame_end} require action rows through "
+                f"{required_action_stop - 1}, but episode only has {action_values.shape[0]} action rows."
+            )
+        clip["actions"] = torch.as_tensor(
+            action_values[resolved_frame_start:required_action_stop],
+            dtype=torch.float32,
+        )
+    return clip
 
 
 class MinimalFrameDataset(Dataset[dict[str, Any]]):
@@ -224,7 +242,7 @@ class MinimalFrameDataset(Dataset[dict[str, Any]]):
 
 
 class MinimalTransitionDataset(Dataset[dict[str, Any]]):
-    """Expose one clip as consecutive frame transitions."""
+    """Expose one clip as sliding three-context two-target training windows."""
 
     def __init__(
         self,
@@ -239,7 +257,7 @@ class MinimalTransitionDataset(Dataset[dict[str, Any]]):
         height: int | None = None,
         width: int | None = None,
     ) -> None:
-        """Cache the requested clip for one-step transition training."""
+        """Cache the requested clip for five-frame dynamics training windows."""
 
         self.clip = load_minimal_clip(
             data_root=data_root,
@@ -252,21 +270,23 @@ class MinimalTransitionDataset(Dataset[dict[str, Any]]):
             resolution=resolution,
             height=height,
             width=width,
+            load_actions=True,
         )
 
     def __len__(self) -> int:
-        """Return the number of consecutive frame pairs."""
+        """Return the number of available three-context two-target windows."""
 
-        return max(int(self.clip["frames"].shape[0]) - 1, 0)
+        return max(int(self.clip["frames"].shape[0]) - 4, 0)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        """Return one `(current, next)` transition sample."""
+        """Return one `(context[0:3], target[0:2])` training sample."""
 
         return {
-            "current_frame": self.clip["frames"][index],
-            "next_frame": self.clip["frames"][index + 1],
-            "current_frame_idx": self.clip["frame_idx"][index],
-            "next_frame_idx": self.clip["frame_idx"][index + 1],
+            "context_frames": self.clip["frames"][index : index + 3],
+            "target_frames": self.clip["frames"][index + 3 : index + 5],
+            "actions": self.clip["actions"][index : index + 4],
+            "context_frame_idx": self.clip["frame_idx"][index : index + 3],
+            "target_frame_idx": self.clip["frame_idx"][index + 3 : index + 5],
             "episode_idx": self.clip["episode_idx"],
         }
 
@@ -300,6 +320,7 @@ class MinimalValidationClipDataset(Dataset[dict[str, Any]]):
             resolution=resolution,
             height=height,
             width=width,
+            load_actions=True,
         )
 
     def __len__(self) -> int:
@@ -314,6 +335,7 @@ class MinimalValidationClipDataset(Dataset[dict[str, Any]]):
             raise IndexError("MinimalValidationClipDataset only contains one clip.")
         return {
             "frames": self.clip["frames"],
+            "actions": self.clip["actions"],
             "frame_idx": self.clip["frame_idx"],
             "episode_idx": self.clip["episode_idx"],
         }

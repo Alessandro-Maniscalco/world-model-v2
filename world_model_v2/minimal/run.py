@@ -39,6 +39,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--latent-channels", type=int, default=16)
     parser.add_argument("--hidden-channels", type=int, default=64)
+    parser.add_argument("--dynamics-infer-steps", type=int, default=16)
+    parser.add_argument("--dynamics-train-timesteps", type=int, default=1000)
+    parser.add_argument("--dynamics-rf-shift", type=float, default=5.0)
     parser.add_argument("--kl-beta", type=float, default=1e-4)
     parser.add_argument("--recon-mse-weight", type=float, default=1.0)
     parser.add_argument("--recon-l1-weight", type=float, default=0.0)
@@ -89,6 +92,9 @@ def build_config(args: argparse.Namespace) -> MinimalExperimentConfig:
         latent_channels=args.latent_channels,
         hidden_channels=args.hidden_channels,
         ae_backend="wan",
+        dynamics_infer_steps=args.dynamics_infer_steps,
+        dynamics_train_timesteps=args.dynamics_train_timesteps,
+        dynamics_rf_shift=args.dynamics_rf_shift,
         kl_beta=args.kl_beta,
         recon_mse_weight=args.recon_mse_weight,
         recon_l1_weight=args.recon_l1_weight,

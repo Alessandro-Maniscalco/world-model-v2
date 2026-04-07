@@ -1,5 +1,7 @@
 h5py
 numpy
+einops
+diffusers
 pyarrow
 huggingface_hub
 matplotlib

@@ -27,6 +27,9 @@ def test_minimal_run_parse_args_uses_expected_defaults() -> None:
     assert config.latent_channels == 16
     assert config.hidden_channels == 64
     assert config.ae_backend == "wan"
+    assert config.dynamics_infer_steps == 16
+    assert config.dynamics_train_timesteps == 1000
+    assert config.dynamics_rf_shift == 5.0
     assert config.kl_beta == 1e-4
     assert config.recon_mse_weight == 1.0
     assert config.recon_l1_weight == 0.0
@@ -57,6 +60,25 @@ def test_minimal_run_build_config_preserves_load_flags() -> None:
     assert config.mode == "dynamics_only"
     assert config.load_encoder_decoder == "encoder_decoder.pt"
     assert config.load_dynamics == "dynamics.pt"
+
+
+def test_minimal_run_build_config_preserves_rf_dynamics_flags() -> None:
+    """The config builder should keep the requested RF dynamics settings."""
+
+    args = parse_args(
+        [
+            "--dynamics-infer-steps",
+            "8",
+            "--dynamics-train-timesteps",
+            "256",
+            "--dynamics-rf-shift",
+            "3.5",
+        ]
+    )
+    config = build_config(args)
+    assert config.dynamics_infer_steps == 8
+    assert config.dynamics_train_timesteps == 256
+    assert config.dynamics_rf_shift == 3.5
 
 
 def test_minimal_run_build_config_preserves_kl_flag() -> None:

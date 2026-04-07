@@ -69,8 +69,15 @@ def write_metaworld_data_file(path: Path, frame_values: list[int]) -> None:
         ],
         names=["bytes", "path"],
     )
+    action_array = pa.array(
+        [
+            [float(frame_value), float(frame_value + 1), float(frame_value + 2), float(frame_value + 3)]
+            for frame_value in frame_values
+        ],
+        type=pa.list_(pa.float32()),
+    )
     pq.write_table(
-        pa.table({ "observation.image": image_array }),
+        pa.table({"observation.image": image_array, "action": action_array}),
         path,
     )
 
@@ -95,9 +102,9 @@ def write_metaworld_metadata(path: Path) -> None:
             "episode_index": pa.array([0, 1, 2], type=pa.int64()),
             "data/chunk_index": pa.array([0, 0, 0], type=pa.int64()),
             "data/file_index": pa.array([0, 0, 1], type=pa.int64()),
-            "dataset_from_index": pa.array([0, 4, 7], type=pa.int64()),
-            "dataset_to_index": pa.array([4, 7, 9], type=pa.int64()),
-            "length": pa.array([4, 3, 2], type=pa.int64()),
+            "dataset_from_index": pa.array([0, 5, 8], type=pa.int64()),
+            "dataset_to_index": pa.array([5, 8, 10], type=pa.int64()),
+            "length": pa.array([5, 3, 2], type=pa.int64()),
             "stats/task_index/min": pa.array([[0], [0], [1]], type=pa.list_(pa.int64())),
         }
     )
@@ -149,8 +156,8 @@ def fake_metaworld_dataset_root(tmp_path: Path) -> Path:
     root = tmp_path / "metaworld_mt50"
     write_metaworld_info(root / "meta" / "info.json")
     write_metaworld_metadata(root / "meta" / "episodes" / "chunk-000" / "file-000.parquet")
-    write_metaworld_data_file(root / "data" / "chunk-000" / "file-000.parquet", [10, 20, 30, 40, 50, 60, 70])
-    write_metaworld_data_file(root / "data" / "chunk-000" / "file-001.parquet", [80, 90])
+    write_metaworld_data_file(root / "data" / "chunk-000" / "file-000.parquet", [10, 20, 30, 40, 50, 60, 70, 80])
+    write_metaworld_data_file(root / "data" / "chunk-000" / "file-001.parquet", [90, 100])
     return root
 
 

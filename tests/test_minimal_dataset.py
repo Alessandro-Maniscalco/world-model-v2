@@ -29,18 +29,31 @@ def test_minimal_frame_dataset_defaults_to_full_episode(fake_long_dataset_root: 
 def test_minimal_transition_dataset_defaults_to_full_episode_pairs(
     fake_long_dataset_root: Path,
 ) -> None:
-    """The transition dataset should default to all consecutive episode pairs."""
+    """The transition dataset should default to all 5-frame training windows."""
 
     dataset = MinimalTransitionDataset(data_root=str(fake_long_dataset_root))
-    assert len(dataset) == 129
+    assert len(dataset) == 126
     first = dataset[0]
-    last = dataset[128]
-    assert first["current_frame"].shape == (3, 128, 128)
-    assert first["next_frame"].shape == (3, 128, 128)
-    assert first["current_frame_idx"].item() == 0
-    assert first["next_frame_idx"].item() == 1
-    assert last["current_frame_idx"].item() == 128
-    assert last["next_frame_idx"].item() == 129
+    last = dataset[125]
+    assert first["context_frames"].shape == (3, 3, 128, 128)
+    assert first["target_frames"].shape == (2, 3, 128, 128)
+    assert first["actions"].shape == (4, 4)
+    assert torch.equal(
+        first["actions"],
+        torch.tensor(
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [1.0, 2.0, 3.0, 4.0],
+                [2.0, 3.0, 4.0, 5.0],
+                [3.0, 4.0, 5.0, 6.0],
+            ]
+        ),
+    )
+    assert torch.equal(first["context_frame_idx"], torch.tensor([0, 1, 2], dtype=torch.long))
+    assert torch.equal(first["target_frame_idx"], torch.tensor([3, 4], dtype=torch.long))
+    assert last["actions"].shape == (4, 4)
+    assert torch.equal(last["context_frame_idx"], torch.tensor([125, 126, 127], dtype=torch.long))
+    assert torch.equal(last["target_frame_idx"], torch.tensor([128, 129], dtype=torch.long))
 
 
 def test_minimal_validation_clip_defaults_to_full_episode(fake_long_dataset_root: Path) -> None:
@@ -49,6 +62,7 @@ def test_minimal_validation_clip_defaults_to_full_episode(fake_long_dataset_root
     dataset = MinimalValidationClipDataset(data_root=str(fake_long_dataset_root))
     sample = dataset[0]
     assert sample["frames"].shape == (130, 3, 128, 128)
+    assert sample["actions"].shape == (129, 4)
     assert torch.equal(sample["frame_idx"], torch.arange(130))
 
 
@@ -72,7 +86,19 @@ def test_minimal_datasets_preserve_explicit_frame_slice(fake_long_dataset_root: 
     )
 
     assert len(frame_dataset) == 6
-    assert len(transition_dataset) == 5
+    assert len(transition_dataset) == 2
+    assert torch.equal(
+        transition_dataset[0]["actions"],
+        torch.tensor(
+            [
+                [111.0, 112.0, 113.0, 114.0],
+                [112.0, 113.0, 114.0, 115.0],
+                [113.0, 114.0, 115.0, 116.0],
+                [114.0, 115.0, 116.0, 117.0],
+            ]
+        ),
+    )
+    assert validation_dataset[0]["actions"].shape == (5, 4)
     assert torch.equal(validation_dataset[0]["frame_idx"], torch.arange(111, 117))
 
 

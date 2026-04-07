@@ -1,13 +1,15 @@
-"""Minimal world model with a fixed Wan VAE and latent dynamics."""
+"""Minimal world model with a fixed Wan VAE and rectified-flow DiT dynamics."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
+from einops import rearrange
 import torch
 import torch.nn as nn
 
+from world_model_v2.minimal.dynamics_dit import MinimalRFDiTConfig, MinimalRectifiedFlowDynamics
 from world_model_v2.minimal.wan_vae import (
     WanVAEConfig,
     WanVAEDecoder,
@@ -28,52 +30,8 @@ class MinimalAutoencoderOutput:
     kl_loss: torch.Tensor
 
 
-class ResidualConvBlock(nn.Module):
-    """Apply a small residual convolutional refinement."""
-
-    def __init__(self, channels: int) -> None:
-        """Build a same-shape residual block."""
-
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return a residual update of the input activation map."""
-
-        return x + self.block(x)
-
-
-class MinimalDynamics(nn.Module):
-    """Predict the next latent map from the current latent map."""
-
-    def __init__(self, latent_channels: int, hidden_channels: int) -> None:
-        """Create the small latent transition network."""
-
-        super().__init__()
-        self.input_proj = nn.Conv2d(latent_channels, hidden_channels, kernel_size=3, padding=1)
-        self.residual_stack = nn.Sequential(
-            nn.SiLU(),
-            ResidualConvBlock(hidden_channels),
-            nn.SiLU(),
-            ResidualConvBlock(hidden_channels),
-            nn.SiLU(),
-        )
-        self.output_proj = nn.Conv2d(hidden_channels, latent_channels, kernel_size=3, padding=1)
-
-    def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        """Predict the next latent map with a residual update."""
-
-        hidden = self.input_proj(latents)
-        delta = self.output_proj(self.residual_stack(hidden))
-        return latents + delta
-
-
 class MinimalWorldModel(nn.Module):
-    """Bundle the fixed Wan VAE with the minimal latent dynamics model."""
+    """Bundle the fixed Wan VAE with the minimal rectified-flow dynamics model."""
 
     def __init__(
         self,
@@ -83,6 +41,9 @@ class MinimalWorldModel(nn.Module):
         resolution: int = 128,
         height: int | None = None,
         width: int | None = None,
+        dynamics_infer_steps: int = 16,
+        dynamics_train_timesteps: int = 1000,
+        dynamics_rf_shift: float = 5.0,
     ) -> None:
         """Create the minimal model around the Wan autoencoder path."""
 
@@ -110,9 +71,45 @@ class MinimalWorldModel(nn.Module):
                 f"Image width {self.image_width} is incompatible with backend {self.ae_backend} "
                 f"and downsample factor {self.spatial_downsample_factor}."
             )
-        self.dynamics = MinimalDynamics(
-            latent_channels=latent_channels,
-            hidden_channels=hidden_channels,
+        latent_height = self.image_height // self.spatial_downsample_factor
+        latent_width = self.image_width // self.spatial_downsample_factor
+        dynamics_patch_spatial = (
+            2
+            if latent_height >= 2
+            and latent_width >= 2
+            and latent_height % 2 == 0
+            and latent_width % 2 == 0
+            else 1
+        )
+        self.dynamics_backend = "rf_dit"
+        self.dynamics = MinimalRectifiedFlowDynamics(
+            MinimalRFDiTConfig(
+                max_img_h=latent_height,
+                max_img_w=latent_width,
+                max_frames=5,
+                in_channels=latent_channels,
+                out_channels=latent_channels,
+                patch_spatial=dynamics_patch_spatial,
+                patch_temporal=1,
+                model_channels=256,
+                num_blocks=4,
+                num_heads=4,
+                concat_padding_mask=False,
+                pos_emb_cls="rope3d",
+                pos_emb_learnable=False,
+                pos_emb_interpolation="crop",
+                use_adaln_lora=False,
+                adaln_lora_dim=64,
+                atten_backend="torch",
+                extra_per_block_abs_pos_emb=False,
+                rope_h_extrapolation_ratio=1.0,
+                rope_w_extrapolation_ratio=1.0,
+                rope_t_extrapolation_ratio=1.0,
+                action_dim=4,
+                dynamics_infer_steps=dynamics_infer_steps,
+                dynamics_train_timesteps=dynamics_train_timesteps,
+                dynamics_rf_shift=dynamics_rf_shift,
+            )
         )
 
     def _validate_autoencoder_backend(self, ae_backend: str) -> None:
@@ -134,6 +131,11 @@ class MinimalWorldModel(nn.Module):
         """Return the serializable autoencoder backend metadata."""
 
         return {"backend": self.ae_backend, "config": self.backend_config}
+
+    def dynamics_config(self) -> dict[str, Any]:
+        """Return the serializable dynamics backend metadata."""
+
+        return {"backend": self.dynamics_backend, "config": self.dynamics.to_dict()}
 
     def configure_trainability(self, mode: str) -> None:
         """Freeze or unfreeze submodules for the requested training mode."""
@@ -192,26 +194,156 @@ class MinimalWorldModel(nn.Module):
 
         return self.decode(self.encode(images, deterministic=deterministic))
 
-    def predict_next_latent(self, latents: torch.Tensor) -> torch.Tensor:
-        """Predict the next latent map from the current latent map."""
+    def encode_frame_sequence(
+        self,
+        images: torch.Tensor,
+        deterministic: bool = True,
+    ) -> torch.Tensor:
+        """Encode an image sequence into a latent-video tensor."""
 
-        return self.dynamics(latents)
+        if images.ndim != 5:
+            raise ValueError(
+                f"Expected image sequences with shape (B, T, C, H, W), received {tuple(images.shape)}."
+            )
+        batch_size, frames = images.shape[:2]
+        flat_images = rearrange(images, "b t c h w -> (b t) c h w")
+        flat_latents = self.encode(flat_images, deterministic=deterministic)
+        return rearrange(
+            flat_latents,
+            "(b t) c h w -> b c t h w",
+            b=batch_size,
+            t=frames,
+            c=flat_latents.shape[1],
+            h=flat_latents.shape[2],
+            w=flat_latents.shape[3],
+        )
 
-    def predict_next_frame(self, images: torch.Tensor) -> torch.Tensor:
-        """Predict the next frame from the current frame."""
+    def decode_frame_sequence(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode a latent-video tensor into an image sequence."""
 
-        current_latents = self.encode(images, deterministic=True)
-        next_latents = self.predict_next_latent(current_latents)
-        return self.decode(next_latents)
+        if latents.ndim != 5:
+            raise ValueError(
+                f"Expected latent sequences with shape (B, C, T, H, W), received {tuple(latents.shape)}."
+            )
+        batch_size, _, frames, _, _ = latents.shape
+        flat_latents = rearrange(latents, "b c t h w -> (b t) c h w")
+        flat_images = self.decode(flat_latents)
+        return rearrange(
+            flat_images,
+            "(b t) c h w -> b t c h w",
+            b=batch_size,
+            t=frames,
+            c=flat_images.shape[1],
+            h=flat_images.shape[2],
+            w=flat_images.shape[3],
+        )
 
-    def rollout(self, seed_frame: torch.Tensor, steps: int) -> torch.Tensor:
-        """Autoregressively predict future frames from a single seed frame."""
+    def encode_context_frames(
+        self,
+        images: torch.Tensor,
+        deterministic: bool = True,
+    ) -> torch.Tensor:
+        """Encode a three-frame image context into a latent video tensor."""
+
+        if images.ndim != 5:
+            raise ValueError(
+                f"Expected context images with shape (B, T, C, H, W), received {tuple(images.shape)}."
+            )
+        if images.shape[1] != self.dynamics.cfg.context_frames:
+            raise ValueError(
+                f"Expected {self.dynamics.cfg.context_frames} context image frames, "
+                f"received {images.shape[1]}."
+            )
+        return self.encode_frame_sequence(images, deterministic=deterministic)
+
+    def predict_next_latent(
+        self,
+        latents: torch.Tensor,
+        actions: torch.Tensor | None = None,
+        infer_steps: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Predict the next latent chunk from a clean context using full-clip RF sampling."""
+
+        return self.dynamics.sample_next_latent(
+            context_latent=latents,
+            actions=actions,
+            infer_steps=infer_steps,
+            generator=generator,
+        )
+
+    def predict_next_frame(
+        self,
+        images: torch.Tensor,
+        actions: torch.Tensor | None = None,
+        infer_steps: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Predict the next two frames from a clean three-frame image context."""
+
+        current_latents = self.encode_context_frames(images, deterministic=True)
+        next_latents = self.predict_next_latent(
+            current_latents,
+            actions=actions,
+            infer_steps=infer_steps,
+            generator=generator,
+        )
+        return self.decode_frame_sequence(next_latents)
+
+    def rollout(self, seed_frames: torch.Tensor, steps: int, actions: torch.Tensor | None = None) -> torch.Tensor:
+        """Autoregressively predict future frames with repeated full-clip RF sampling."""
 
         if steps < 0:
             raise ValueError("steps must be non-negative.")
-        predicted_frames = [seed_frame]
-        current_latents = self.encode(seed_frame, deterministic=True)
-        for _ in range(steps):
-            current_latents = self.predict_next_latent(current_latents)
-            predicted_frames.append(self.decode(current_latents))
+        if seed_frames.ndim != 5:
+            raise ValueError(
+                f"Expected seed frames with shape (B, T, C, H, W), received {tuple(seed_frames.shape)}."
+            )
+        if seed_frames.shape[1] != self.dynamics.cfg.context_frames:
+            raise ValueError(
+                f"Expected {self.dynamics.cfg.context_frames} seed frames, "
+                f"received {seed_frames.shape[1]}."
+            )
+        if actions is not None:
+            expected_action_steps = max(
+                self.dynamics.cfg.context_frames - 1 + steps * self.dynamics.cfg.target_frames,
+                0,
+            )
+            if actions.ndim != 3:
+                raise ValueError(
+                    "Expected rollout actions with shape "
+                    f"(B, {expected_action_steps}, {self.dynamics.cfg.action_dim}), "
+                    f"received {tuple(actions.shape)}."
+                )
+            if actions.shape[0] != seed_frames.shape[0]:
+                raise ValueError(
+                    f"Expected rollout action batch size {seed_frames.shape[0]}, received {actions.shape[0]}."
+                )
+            if actions.shape[1] != expected_action_steps:
+                raise ValueError(
+                    f"Expected {expected_action_steps} rollout action steps, received {actions.shape[1]}."
+                )
+            if actions.shape[2] != self.dynamics.cfg.action_dim:
+                raise ValueError(
+                    f"Expected rollout action dim {self.dynamics.cfg.action_dim}, received {actions.shape[2]}."
+                )
+        predicted_frames = [seed_frames[:, frame_index] for frame_index in range(seed_frames.shape[1])]
+        current_latents = self.encode_context_frames(seed_frames, deterministic=True)
+        generator = torch.Generator(device=current_latents.device.type)
+        generator.manual_seed(0)
+        for step_index in range(steps):
+            action_window = None
+            if actions is not None:
+                action_start = step_index * self.dynamics.cfg.target_frames
+                action_stop = action_start + self.dynamics.cfg.num_action_per_chunk
+                action_window = actions[:, action_start:action_stop]
+            next_latents = self.predict_next_latent(
+                current_latents,
+                actions=action_window,
+                generator=generator,
+            )
+            next_frames = self.decode_frame_sequence(next_latents)
+            for frame_index in range(next_frames.shape[1]):
+                predicted_frames.append(next_frames[:, frame_index])
+            current_latents = torch.cat([current_latents, next_latents], dim=2)[:, :, -self.dynamics.cfg.context_frames :]
         return torch.stack(predicted_frames, dim=1)

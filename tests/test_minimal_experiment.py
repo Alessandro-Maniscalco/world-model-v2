@@ -12,6 +12,7 @@ from world_model_v2.minimal.experiment import (
     MinimalExperiment,
     MinimalExperimentConfig,
     checkpoint_ae_backend,
+    checkpoint_dynamics_backend,
     load_minimal_checkpoint,
     reconstruction_loss_terms,
     save_minimal_checkpoint,
@@ -104,6 +105,28 @@ def test_minimal_experiment_dynamics_only_requires_encoder_decoder_checkpoint(
         )
 
 
+def test_minimal_experiment_dynamics_only_requires_at_least_five_frames(
+    fake_long_dataset_root: Path,
+    saved_minimal_wan_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Dynamics-only mode should reject a four-frame clip with no valid 5-frame window."""
+
+    with pytest.raises(ValueError, match="at least five frames"):
+        MinimalExperiment(
+            MinimalExperimentConfig(
+                mode="dynamics_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="single_frame_dyn",
+                frame_start=111,
+                frame_end=114,
+                load_encoder_decoder=str(saved_minimal_wan_ae_checkpoint),
+                device="cpu",
+            )
+        )
+
+
 def test_minimal_experiment_rejects_validation_plateau_without_validation_interval(
     fake_long_dataset_root: Path,
     tmp_path: Path,
@@ -174,12 +197,12 @@ def test_minimal_experiment_supports_metaworld_ae_training(
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 7
+    assert len(experiment.train_dataset) == 8
     train_batch = next(iter(experiment.train_loader))
     validation_batch = next(iter(experiment.val_loader))
     assert train_batch["frame"].shape == (2, 3, 8, 8)
     assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
-    assert validation_batch["frames"].shape[1:] == (4, 3, 8, 8)
+    assert validation_batch["frames"].shape[1:] == (5, 3, 8, 8)
 
 
 def test_minimal_experiment_auto_batch_size_uses_full_clip_on_cpu(
@@ -212,8 +235,8 @@ def test_minimal_experiment_auto_batch_size_uses_full_clip_on_cpu(
     )
     assert ae_experiment.cfg.batch_size == 130
     assert ae_experiment.train_loader.batch_size == 130
-    assert dyn_experiment.cfg.batch_size == 129
-    assert dyn_experiment.train_loader.batch_size == 129
+    assert dyn_experiment.cfg.batch_size == 126
+    assert dyn_experiment.train_loader.batch_size == 126
 
 
 def test_minimal_checkpoint_round_trip(tmp_path: Path, fake_long_dataset_root: Path) -> None:
@@ -245,12 +268,19 @@ def test_minimal_checkpoint_round_trip(tmp_path: Path, fake_long_dataset_root: P
     assert checkpoint["mode"] == "ae_only"
     assert checkpoint["clip_metadata"]["frame_start"] is None
     assert checkpoint_ae_backend(checkpoint) == "wan"
+    assert checkpoint_dynamics_backend(checkpoint) == "rf_dit"
 
 
 def test_minimal_checkpoint_backend_falls_back_to_autoencoder_metadata() -> None:
     """Checkpoint backend detection should read the serialized autoencoder metadata."""
 
     assert checkpoint_ae_backend({"autoencoder": {"backend": "wan"}}) == "wan"
+
+
+def test_minimal_checkpoint_dynamics_backend_falls_back_to_legacy_conv_label() -> None:
+    """Missing dynamics metadata should be treated as the removed legacy backend."""
+
+    assert checkpoint_dynamics_backend({}) == "legacy_conv"
 
 
 def test_reconstruction_loss_terms_capture_edge_changes() -> None:
@@ -324,6 +354,61 @@ def test_minimal_experiment_can_partial_load_dynamics(
     assert torch.allclose(encoder_weight, torch.full_like(encoder_weight, 0.25))
 
 
+def test_minimal_experiment_rejects_legacy_conv_dynamics_checkpoint(
+    fake_long_dataset_root: Path,
+    saved_minimal_wan_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Loading old conv-dynamics checkpoints should fail with a clear backend error."""
+
+    legacy_path = tmp_path / "legacy_conv_checkpoint.pt"
+    checkpoint = load_minimal_checkpoint(saved_minimal_wan_ae_checkpoint, device="cpu")
+    checkpoint.pop("dynamics_backend", None)
+    checkpoint.pop("dynamics", None)
+    torch.save(checkpoint, legacy_path)
+
+    with pytest.raises(ValueError, match="legacy"):
+        MinimalExperiment(
+            MinimalExperimentConfig(
+                mode="dynamics_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="legacy_dynamics",
+                **DEBUG_FRAME_KWARGS,
+                load_encoder_decoder=str(saved_minimal_wan_ae_checkpoint),
+                load_dynamics=str(legacy_path),
+                device="cpu",
+            )
+        )
+
+
+def test_minimal_experiment_rejects_stub_action_dynamics_checkpoint(
+    fake_long_dataset_root: Path,
+    saved_minimal_wan_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Loading a pre-action dynamics checkpoint should fail with a clear compatibility error."""
+
+    incompatible_path = tmp_path / "stub_action_checkpoint.pt"
+    checkpoint = load_minimal_checkpoint(saved_minimal_wan_ae_checkpoint, device="cpu")
+    checkpoint["dynamics"]["config"]["num_action_per_chunk"] = 5
+    torch.save(checkpoint, incompatible_path)
+
+    with pytest.raises(ValueError, match="stub-action|Older stub-action checkpoints"):
+        MinimalExperiment(
+            MinimalExperimentConfig(
+                mode="dynamics_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="stub_action_dynamics",
+                **DEBUG_FRAME_KWARGS,
+                load_encoder_decoder=str(saved_minimal_wan_ae_checkpoint),
+                load_dynamics=str(incompatible_path),
+                device="cpu",
+            )
+        )
+
+
 def test_minimal_experiment_rejects_removed_backend_config(
     fake_long_dataset_root: Path,
     tmp_path: Path,
@@ -383,7 +468,7 @@ def test_minimal_experiment_can_stop_early_on_dynamics_validation_plateau(
     saved_minimal_wan_ae_checkpoint: Path,
     tmp_path: Path,
 ) -> None:
-    """Dynamics-only mode should stop early once rollout validation stops improving."""
+    """Dynamics-only mode should stop early once one-step validation stops improving."""
 
     config = MinimalExperimentConfig(
         mode="dynamics_only",
@@ -403,8 +488,8 @@ def test_minimal_experiment_can_stop_early_on_dynamics_validation_plateau(
         device="cpu",
     )
     experiment = MinimalExperiment(config)
-    assert not experiment._handle_validation_early_stop(1, {"rollout_mse": 0.5})
-    assert experiment._handle_validation_early_stop(2, {"rollout_mse": 0.5})
+    assert not experiment._handle_validation_early_stop(1, {"next_frame_mse": 0.5})
+    assert experiment._handle_validation_early_stop(2, {"next_frame_mse": 0.5})
     metrics_path = tmp_path / "outputs" / "dynamics_plateau" / "metrics.jsonl"
     records = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
     stopped_records = [record for record in records if "stopped" in record]

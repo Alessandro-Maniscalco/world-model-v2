@@ -12,12 +12,26 @@ def test_wan_world_model_preserves_expected_shapes() -> None:
 
     model = MinimalWorldModel(resolution=128)
     images = torch.rand(2, 3, 128, 128)
+    context_images = torch.rand(2, 3, 3, 128, 128)
     latents = model.encode(images, deterministic=True)
+    context_latents = model.encode_context_frames(context_images, deterministic=True)
     reconstructed = model.decode(latents)
-    next_latents = model.predict_next_latent(latents)
+    next_latents = model.predict_next_latent(context_latents)
     assert latents.shape == (2, 16, 16, 16)
+    assert context_latents.shape == (2, 16, 3, 16, 16)
     assert reconstructed.shape == (2, 3, 128, 128)
-    assert next_latents.shape == latents.shape
+    assert next_latents.shape == (2, 16, 2, 16, 16)
+
+
+def test_wan_world_model_accepts_explicit_action_chunks() -> None:
+    """The Wan model should accept DreamDojo-style four-step action chunks."""
+
+    model = MinimalWorldModel(resolution=128)
+    context_images = torch.rand(1, 3, 3, 128, 128)
+    context_latents = model.encode_context_frames(context_images, deterministic=True)
+    actions = torch.zeros(1, 4, 4)
+    next_latents = model.predict_next_latent(context_latents, actions=actions)
+    assert next_latents.shape == (1, 16, 2, 16, 16)
 
 
 def test_wan_world_model_derives_latent_size_from_resolution() -> None:
@@ -55,9 +69,9 @@ def test_wan_world_model_autoencode_reports_kl_statistics() -> None:
 
 
 def test_wan_world_model_rollout_includes_seed_frame() -> None:
-    """Autoregressive rollout should return the seed plus the requested predictions."""
+    """Autoregressive rollout should return the seed context plus predictions."""
 
     model = MinimalWorldModel(resolution=128)
-    seed = torch.rand(1, 3, 128, 128)
-    rollout = model.rollout(seed, steps=5)
-    assert rollout.shape == (1, 6, 3, 128, 128)
+    seed = torch.rand(1, 3, 3, 128, 128)
+    rollout = model.rollout(seed, steps=2)
+    assert rollout.shape == (1, 7, 3, 128, 128)

@@ -28,8 +28,11 @@ def test_load_metaworld_clip_returns_requested_slice(
         frame_start=1,
         frame_end=2,
         resolution=8,
+        load_actions=True,
     )
     assert clip["frames"].shape == (2, 3, 8, 8)
+    assert clip["actions"].shape == (1, 4)
+    assert torch.equal(clip["actions"][0], torch.tensor([20.0, 21.0, 22.0, 23.0]))
     assert torch.equal(clip["frame_idx"], torch.tensor([1, 2], dtype=torch.long))
     assert clip["episode_idx"].item() == 0
 
@@ -46,9 +49,9 @@ def test_metaworld_frame_dataset_flattens_all_task_episodes(
         resolution=8,
         all_episodes=True,
     )
-    assert len(dataset) == 7
+    assert len(dataset) == 8
     first = dataset[0]
-    last = dataset[6]
+    last = dataset[7]
     assert first["episode_idx"].item() == 0
     assert first["frame_idx"].item() == 0
     assert last["episode_idx"].item() == 1
@@ -61,22 +64,24 @@ def test_metaworld_frame_dataset_flattens_all_task_episodes(
 def test_metaworld_transition_dataset_returns_consecutive_pairs(
     fake_metaworld_dataset_root: Path,
 ) -> None:
-    """The MT50 transition dataset should expose adjacent frame pairs."""
+    """The MT50 transition dataset should expose sliding 5-frame windows."""
 
     dataset = MetaWorldTransitionDataset(
         data_root=str(fake_metaworld_dataset_root),
         split="train",
-        task_index=1,
+        task_index=0,
         episode=0,
         resolution=8,
     )
     sample = dataset[0]
     assert len(dataset) == 1
-    assert sample["current_frame"].shape == (3, 8, 8)
-    assert sample["next_frame"].shape == (3, 8, 8)
-    assert sample["current_frame_idx"].item() == 0
-    assert sample["next_frame_idx"].item() == 1
-    assert sample["episode_idx"].item() == 2
+    assert sample["context_frames"].shape == (3, 3, 8, 8)
+    assert sample["target_frames"].shape == (2, 3, 8, 8)
+    assert sample["actions"].shape == (4, 4)
+    assert torch.equal(sample["actions"][0], torch.tensor([10.0, 11.0, 12.0, 13.0]))
+    assert torch.equal(sample["context_frame_idx"], torch.tensor([0, 1, 2], dtype=torch.long))
+    assert torch.equal(sample["target_frame_idx"], torch.tensor([3, 4], dtype=torch.long))
+    assert sample["episode_idx"].item() == 0
 
 
 def test_metaworld_validation_dataset_returns_one_clip(
@@ -94,6 +99,8 @@ def test_metaworld_validation_dataset_returns_one_clip(
     sample = dataset[0]
     assert len(dataset) == 1
     assert sample["frames"].shape == (2, 3, 8, 8)
+    assert sample["actions"].shape == (1, 4)
+    assert torch.equal(sample["actions"][0], torch.tensor([90.0, 91.0, 92.0, 93.0]))
     assert torch.equal(sample["frame_idx"], torch.tensor([0, 1], dtype=torch.long))
 
 
