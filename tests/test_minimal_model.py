@@ -2,28 +2,13 @@
 
 from __future__ import annotations
 
-import torch
+import pytest
 
 from world_model_v2.minimal.model import MinimalWorldModel
 
 
-def test_minimal_world_model_preserves_expected_shapes() -> None:
-    """The encoder, decoder, and dynamics should use the requested tensor shapes."""
+def test_minimal_world_model_rejects_removed_conv_backend() -> None:
+    """The minimal model should reject the removed conv fallback backend."""
 
-    model = MinimalWorldModel()
-    images = torch.rand(2, 3, 128, 128)
-    latents = model.encode(images)
-    reconstructed = model.decode(latents)
-    next_latents = model.predict_next_latent(latents)
-    assert latents.shape == (2, 4, 32, 32)
-    assert reconstructed.shape == (2, 3, 128, 128)
-    assert next_latents.shape == latents.shape
-
-
-def test_minimal_world_model_rollout_includes_seed_frame() -> None:
-    """Autoregressive rollout should return the seed plus the requested predictions."""
-
-    model = MinimalWorldModel()
-    seed = torch.rand(1, 3, 128, 128)
-    rollout = model.rollout(seed, steps=5)
-    assert rollout.shape == (1, 6, 3, 128, 128)
+    with pytest.raises(ValueError, match="only supports the Wan VAE"):
+        MinimalWorldModel(ae_backend="conv", resolution=128)

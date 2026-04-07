@@ -13,7 +13,7 @@ from world_model_v2.algorithms.latent_dynamics.latent_world_model import LatentW
 from world_model_v2.config import DatasetConfig, RunConfig
 from world_model_v2.datasets.latent_dynamics.real_aloha_dataset import RealAlohaDataset
 from world_model_v2.utils.checkpointing import load_checkpoint, save_json
-from world_model_v2.utils.visualization import build_side_by_side_grid, write_side_by_side_gif
+from world_model_v2.utils.visualization import build_side_by_side_grid, write_side_by_side_mp4
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,7 +119,7 @@ def reconstruct_episode(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     grid_path = output_path / f"episode_{episode}_grid.png"
-    gif_path = output_path / f"episode_{episode}.gif"
+    video_path = output_path / f"episode_{episode}.mp4"
     stats_path = output_path / f"episode_{episode}_stats.json"
 
     context_frames = int(preview["stats"].get("context_frames", 0))
@@ -130,25 +130,25 @@ def reconstruct_episode(
         context_frames=context_frames,
     )
     grid.save(grid_path)
-    exported_frame_count = write_side_by_side_gif(
+    exported_frame_count = write_side_by_side_mp4(
         preview["original"],
         preview["reconstructed"],
-        gif_path,
+        video_path,
         duration_ms=duration_ms,
         context_frames=context_frames,
     )
 
     stats = dict(preview["stats"])
     stats["checkpoint"] = str(checkpoint_path)
-    stats["exported_gif_frame_count"] = int(exported_frame_count)
+    stats["exported_video_frame_count"] = int(exported_frame_count)
     if stats["input_frame_count"] != stats["decoded_frame_count"]:
         raise RuntimeError(f"Decoded frame count mismatch: {stats}")
-    if stats["decoded_frame_count"] != stats["exported_gif_frame_count"]:
-        raise RuntimeError(f"Exported GIF frame count mismatch: {stats}")
+    if stats["decoded_frame_count"] != stats["exported_video_frame_count"]:
+        raise RuntimeError(f"Exported video frame count mismatch: {stats}")
     save_json(stats_path, stats)
     return {
         "grid_path": str(grid_path),
-        "gif_path": str(gif_path),
+        "video_path": str(video_path),
         "stats_path": str(stats_path),
         "stats": stats,
     }
@@ -175,7 +175,7 @@ def main() -> None:
     )
     print(json.dumps(result["stats"], indent=2, sort_keys=True))
     print(f"Wrote grid to {result['grid_path']}")
-    print(f"Wrote gif to {result['gif_path']}")
+    print(f"Wrote mp4 to {result['video_path']}")
 
 
 if __name__ == "__main__":

@@ -10,10 +10,11 @@ import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+from huggingface_hub import hf_hub_download, list_repo_files
 import numpy as np
 import pyarrow.parquet as pq
-from huggingface_hub import hf_hub_download
 
 
 DATASET_ID = "lerobot/metaworld_mt50"
@@ -52,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--output",
-        default="actions_explorations.md",
+        default="metaworld_mt50_structure.md",
         help="Path to the markdown report to write.",
     )
     return parser.parse_args()
@@ -279,6 +280,41 @@ def top_tasks_by_action_scale(task_summaries: list[dict]) -> list[dict]:
     )[:5]
 
 
+def classify_gripper_channel(summary: dict) -> str:
+    """Return a short description of how task-specific action channel 3 behaves."""
+
+    minimum = float(summary["action_min"][3])
+    maximum = float(summary["action_max"][3])
+    if np.isclose(minimum, -1.0) and np.isclose(maximum, -1.0):
+        return "fixed -1.0"
+    if np.isclose(minimum, 1.0) and np.isclose(maximum, 1.0):
+        return "fixed 1.0"
+    if np.isclose(minimum, maximum):
+        return f"fixed {minimum:.3f}"
+    return "variable"
+
+
+def summarize_repository_layout() -> dict[str, Any]:
+    """Return a compact summary of the files published in the dataset repo."""
+
+    repo_files = list_repo_files(DATASET_ID, repo_type="dataset")
+    data_files = [path for path in repo_files if path.startswith("data/") and path.endswith(".parquet")]
+    video_files = [path for path in repo_files if path.startswith("videos/") and path.endswith(".mp4")]
+    meta_episode_files = [
+        path
+        for path in repo_files
+        if path.startswith("meta/episodes/") and path.endswith(".parquet")
+    ]
+    return {
+        "data_file_count": len(data_files),
+        "video_file_count": len(video_files),
+        "meta_episode_file_count": len(meta_episode_files),
+        "first_data_files": data_files[:3],
+        "first_video_files": video_files[:3],
+        "has_readme": "README.md" in repo_files,
+    }
+
+
 def format_vector(vector: np.ndarray, decimals: int = 3) -> str:
     """Format a vector for markdown."""
 
@@ -308,6 +344,7 @@ def build_report(
     global_stats: dict,
     task_summaries: list[dict],
     sample_blocks: dict[int, dict],
+    repository_layout: dict[str, Any],
 ) -> str:
     """Render the dataset analysis as markdown."""
 
@@ -358,6 +395,46 @@ def build_report(
     lines.append(
         "- Important consistency check: `tasks.parquet` contains 49 task rows indexed"
         f" `0..48`, so the dataset is internally consistent on task count."
+    )
+    lines.append("")
+    lines.append("## Repository layout")
+    lines.append(f"- Published parquet data shards: {repository_layout['data_file_count']}")
+    lines.append(f"- Published episode-metadata parquet files: {repository_layout['meta_episode_file_count']}")
+    lines.append(f"- Published MP4 video files: {repository_layout['video_file_count']}")
+    lines.append(f"- Dataset split declaration: `{info['splits']}`")
+    lines.append(f"- Data path pattern: `{info['data_path']}`")
+    lines.append(f"- Video path pattern: `{info['video_path']}`")
+    lines.append(
+        "- Example data shards: "
+        + ", ".join(f"`{path}`" for path in repository_layout["first_data_files"])
+    )
+    lines.append(
+        "- Example video files: "
+        + (
+            ", ".join(f"`{path}`" for path in repository_layout["first_video_files"])
+            if repository_layout["first_video_files"]
+            else "none published; the image bytes live directly in the parquet rows"
+        )
+    )
+    lines.append("")
+    lines.append("## Row and metadata structure")
+    lines.append(
+        "- `data/chunk-*/file-*.parquet` stores frame rows. Each row contains"
+        " `observation.image` as a struct with embedded encoded image bytes plus a source path,"
+        " along with `observation.state`, `observation.environment_state`, `action`, reward,"
+        " success, timestamps, and episode/frame indices."
+    )
+    lines.append(
+        "- `meta/tasks.parquet` maps each `task_index` to its natural-language task name."
+    )
+    lines.append(
+        "- `meta/episodes/chunk-000/file-000.parquet` maps every episode to the data shard that"
+        " stores it and records exact row spans via `dataset_from_index` and `dataset_to_index`."
+    )
+    lines.append(
+        "- The per-episode metadata also includes exact aggregated statistics for action, state,"
+        " reward, success, image channels, timestamps, and indices, so the dataset can be audited"
+        " without scanning all frame rows."
     )
     lines.append("")
     lines.append("## High-level findings")
@@ -531,6 +608,15 @@ def build_report(
             f" {format_vector(span)}"
         )
     lines.append("")
+    lines.append("## Full task inventory")
+    lines.append("| Task | Episodes | Mean length | Gripper channel | Name |")
+    lines.append("| --- | ---: | ---: | --- | --- |")
+    for summary in task_summaries:
+        lines.append(
+            f"| {summary['task_index']} | {summary['episodes']} | {summary['length_mean']:.2f} |"
+            f" {classify_gripper_channel(summary)} | {summary['task_name']} |"
+        )
+    lines.append("")
     lines.append("## What this means for later training")
     lines.append(
         f"- If the goal is to stay close to `{TARGET_REPO_URL}`, the cleanest later setup is"
@@ -551,6 +637,32 @@ def build_report(
         "- Because the average episode is short and the dataset runs at 80 FPS, later training"
         " should consider temporal downsampling or larger action chunks to avoid wasting model"
         " capacity on nearly redundant adjacent frames."
+    )
+    lines.append("")
+    lines.append("## Training hook in this repo")
+    lines.append(
+        "- The minimal Wan VAE path in this repo can now read MT50 directly through"
+        " `world_model_v2/minimal/run.py` with `--dataset-format lerobot_metaworld`."
+    )
+    lines.append("```bash")
+    lines.append("source .venv/bin/activate")
+    lines.append("python -m world_model_v2.minimal.run \\")
+    lines.append("  --mode ae_only \\")
+    lines.append("  --dataset-format lerobot_metaworld \\")
+    lines.append("  --metaworld-task-index 0 \\")
+    lines.append("  --split train \\")
+    lines.append("  --train-all-episodes \\")
+    lines.append("  --validation-split val \\")
+    lines.append("  --validation-episode 0 \\")
+    lines.append("  --resolution 128 \\")
+    lines.append("  --batch-size 32 \\")
+    lines.append("  --max-steps 3000 \\")
+    lines.append("  --run-name metaworld_mt50_task0_wan_ae")
+    lines.append("```")
+    lines.append(
+        "- Important local behavior: MT50 only publishes a train split, so this repo treats both"
+        " `train` and `val` requests as aliases for the same upstream split and uses"
+        " `validation_episode` only to pick which train episode to preview."
     )
     lines.append("")
     lines.append("## Recommended first tasks if the aim is understanding")
@@ -600,11 +712,13 @@ def main() -> None:
         for task_index in sorted(task_groups)
     ]
     sample_blocks = build_sample_blocks({s["task_index"]: s for s in task_summaries})
+    repository_layout = summarize_repository_layout()
     report = build_report(
         info=info,
         global_stats=global_stats,
         task_summaries=task_summaries,
         sample_blocks=sample_blocks,
+        repository_layout=repository_layout,
     )
     output_path = Path(args.output)
     output_path.write_text(report + "\n")

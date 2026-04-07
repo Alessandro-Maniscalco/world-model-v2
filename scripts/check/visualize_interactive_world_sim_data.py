@@ -1,4 +1,4 @@
-"""Visualize downloaded Interactive World Sim HDF5 episodes as grids, GIFs, or task sheets.
+"""Visualize downloaded Interactive World Sim HDF5 episodes as grids, MP4s, or task sheets.
 
 source .venv/bin/activate
 python scripts/check/visualize_interactive_world_sim_data.py episode-grid \
@@ -13,7 +13,7 @@ python scripts/check/visualize_interactive_world_sim_data.py episode-grid \
 source .venv/bin/activate
 python scripts/check/visualize_interactive_world_sim_data.py first-video \
   --data-root data/full \
-  --output /tmp/interactive_world_sim_first_video.gif
+  --output /tmp/interactive_world_sim_first_video.mp4
 
 
 """
@@ -24,6 +24,7 @@ import argparse
 from pathlib import Path
 
 import h5py
+import imageio.v2 as imageio
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 
@@ -45,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     list_parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
 
     first_parser = subparsers.add_parser(
-        "first-video", help="Create a GIF for the default starter training task and camera."
+        "first-video", help="Create an MP4 for the default starter training task and camera."
     )
     first_parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
     first_parser.add_argument("--task", default=DEFAULT_TRAIN_TASK)
@@ -55,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     first_parser.add_argument("--frames", type=int, default=24)
     first_parser.add_argument("--duration-ms", type=int, default=120)
     first_parser.add_argument(
-        "--output", default="/tmp/interactive_world_sim_first_video.gif"
+        "--output", default="/tmp/interactive_world_sim_first_video.mp4"
     )
 
     grid_parser = subparsers.add_parser("episode-grid", help="Create a grid of frames from one episode.")
@@ -64,12 +65,12 @@ def parse_args() -> argparse.Namespace:
     grid_parser.add_argument("--frames", type=int, default=12)
     grid_parser.add_argument("--output", required=True)
 
-    gif_parser = subparsers.add_parser("episode-gif", help="Create a GIF from one episode.")
-    add_common_episode_args(gif_parser)
-    gif_parser.add_argument("--camera", required=True)
-    gif_parser.add_argument("--frames", type=int, default=24)
-    gif_parser.add_argument("--duration-ms", type=int, default=120)
-    gif_parser.add_argument("--output", required=True)
+    video_parser = subparsers.add_parser("episode-video", help="Create an MP4 from one episode.")
+    add_common_episode_args(video_parser)
+    video_parser.add_argument("--camera", required=True)
+    video_parser.add_argument("--frames", type=int, default=24)
+    video_parser.add_argument("--duration-ms", type=int, default=120)
+    video_parser.add_argument("--output", required=True)
 
     sheet_parser = subparsers.add_parser(
         "task-sheet", help="Create a contact sheet for the same frame index across many episodes."
@@ -165,6 +166,43 @@ def annotate(image: Image.Image, text: str) -> Image.Image:
     return bordered
 
 
+def duration_ms_to_fps(duration_ms: int) -> float:
+    """Convert a fixed frame duration in milliseconds into frames per second."""
+
+    if duration_ms <= 0:
+        raise ValueError("duration_ms must be positive.")
+    return 1000.0 / float(duration_ms)
+
+
+def pad_even_frame(image_array: np.ndarray) -> np.ndarray:
+    """Pad one RGB frame to even width and height for MP4 export."""
+
+    pad_height = image_array.shape[0] % 2
+    pad_width = image_array.shape[1] % 2
+    if pad_height == 0 and pad_width == 0:
+        return image_array
+    return np.pad(image_array, ((0, pad_height), (0, pad_width), (0, 0)), mode="edge")
+
+
+def write_mp4(images: list[Image.Image], output: Path, duration_ms: int) -> None:
+    """Write a list of PIL frames to an MP4 file."""
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with imageio.get_writer(
+        output,
+        format="FFMPEG",
+        mode="I",
+        fps=duration_ms_to_fps(duration_ms),
+        codec="libx264",
+        pixelformat="yuv444p",
+        macro_block_size=1,
+        ffmpeg_log_level="error",
+        ffmpeg_params=["-crf", "12", "-preset", "medium", "-movflags", "+faststart"],
+    ) as writer:
+        for image in images:
+            writer.append_data(pad_even_frame(np.asarray(image)))
+
+
 def make_grid(images: list[Image.Image], columns: int | None = None) -> Image.Image:
     """Arrange images into a rectangular grid."""
 
@@ -216,7 +254,7 @@ def command_first_video(
     duration_ms: int,
     output: Path,
 ) -> None:
-    """Write a GIF for the default starter training episode."""
+    """Write an MP4 for the default starter training episode."""
 
     episode_file = episode_path(data_root, task, split, episode)
     if not episode_file.exists():
@@ -225,7 +263,7 @@ def command_first_video(
         cameras = list_cameras(handle)
     if camera not in cameras:
         raise ValueError(f"Camera {camera} not found in {episode_file}. Available: {cameras}")
-    command_episode_gif(
+    command_episode_video(
         data_root=data_root,
         task=task,
         split=split,
@@ -258,7 +296,7 @@ def command_episode_grid(
     print(f"Wrote grid to {output}")
 
 
-def command_episode_gif(
+def command_episode_video(
     data_root: Path,
     task: str,
     split: str,
@@ -268,7 +306,7 @@ def command_episode_gif(
     duration_ms: int,
     output: Path,
 ) -> None:
-    """Write a GIF from one episode."""
+    """Write an MP4 from one episode."""
 
     ep_path = episode_path(data_root, task, split, episode)
     frame_array = load_camera_frames(ep_path, camera)
@@ -281,14 +319,8 @@ def command_episode_gif(
         )
         for idx in indices
     ]
-    images[0].save(
-        output,
-        save_all=True,
-        append_images=images[1:],
-        duration=duration_ms,
-        loop=0,
-    )
-    print(f"Wrote GIF to {output}")
+    write_mp4(images, output, duration_ms)
+    print(f"Wrote MP4 to {output}")
 
 
 def command_task_sheet(
@@ -348,8 +380,8 @@ def main() -> None:
             frames=args.frames,
             output=Path(args.output),
         )
-    elif args.command == "episode-gif":
-        command_episode_gif(
+    elif args.command == "episode-video":
+        command_episode_video(
             data_root=data_root,
             task=args.task,
             split=args.split,

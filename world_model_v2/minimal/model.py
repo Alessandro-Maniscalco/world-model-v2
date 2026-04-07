@@ -1,9 +1,31 @@
-"""Minimal deterministic world model with encoder, dynamics, and decoder blocks."""
+"""Minimal world model with a fixed Wan VAE and latent dynamics."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 import torch
 import torch.nn as nn
+
+from world_model_v2.minimal.wan_vae import (
+    WanVAEConfig,
+    WanVAEDecoder,
+    WanVAEEncoder,
+    kl_divergence_from_moments,
+    sample_posterior as sample_posterior_latent,
+)
+
+
+@dataclass
+class MinimalAutoencoderOutput:
+    """Bundle reconstructions and posterior statistics for one AE pass."""
+
+    reconstructed: torch.Tensor
+    latent: torch.Tensor
+    mu: torch.Tensor
+    log_var: torch.Tensor
+    kl_loss: torch.Tensor
 
 
 class ResidualConvBlock(nn.Module):
@@ -23,30 +45,6 @@ class ResidualConvBlock(nn.Module):
         """Return a residual update of the input activation map."""
 
         return x + self.block(x)
-
-
-class MinimalEncoder(nn.Module):
-    """Encode an image into a `32x32` latent map."""
-
-    def __init__(self, latent_channels: int, hidden_channels: int) -> None:
-        """Create the small downsampling encoder."""
-
-        super().__init__()
-        self.model = nn.Sequential(
-            nn.Conv2d(3, hidden_channels, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(hidden_channels, latent_channels, kernel_size=4, stride=2, padding=1),
-            nn.SiLU(),
-        )
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        """Encode images into latent feature maps."""
-
-        return self.model(images)
 
 
 class MinimalDynamics(nn.Module):
@@ -74,50 +72,77 @@ class MinimalDynamics(nn.Module):
         return latents + delta
 
 
-class MinimalDecoder(nn.Module):
-    """Decode a `32x32` latent map back into a `128x128` image."""
+class MinimalWorldModel(nn.Module):
+    """Bundle the fixed Wan VAE with the minimal latent dynamics model."""
 
-    def __init__(self, latent_channels: int, hidden_channels: int) -> None:
-        """Create the small upsampling decoder."""
+    def __init__(
+        self,
+        latent_channels: int = 16,
+        hidden_channels: int = 64,
+        ae_backend: str = "wan",
+        resolution: int = 128,
+        height: int | None = None,
+        width: int | None = None,
+    ) -> None:
+        """Create the minimal model around the Wan autoencoder path."""
 
         super().__init__()
-        self.model = nn.Sequential(
-            nn.Conv2d(latent_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.ConvTranspose2d(hidden_channels, hidden_channels, kernel_size=4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.ConvTranspose2d(hidden_channels, hidden_channels, kernel_size=4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(hidden_channels, 3, kernel_size=3, padding=1),
+        self._validate_autoencoder_backend(ae_backend)
+        self.latent_channels = latent_channels
+        self.hidden_channels = hidden_channels
+        self.ae_backend = "wan"
+        self.resolution = resolution
+        self.height = height
+        self.width = width
+        self.image_height = resolution if height is None else height
+        self.image_width = resolution if width is None else width
+        self.wan_cfg = WanVAEConfig(z_dim=latent_channels)
+        self.encoder = WanVAEEncoder(self.wan_cfg)
+        self.decoder = WanVAEDecoder(self.wan_cfg)
+        self.backend_config = self.wan_cfg.to_dict()
+        if self.image_height % self.spatial_downsample_factor != 0:
+            raise ValueError(
+                f"Image height {self.image_height} is incompatible with backend {self.ae_backend} "
+                f"and downsample factor {self.spatial_downsample_factor}."
+            )
+        if self.image_width % self.spatial_downsample_factor != 0:
+            raise ValueError(
+                f"Image width {self.image_width} is incompatible with backend {self.ae_backend} "
+                f"and downsample factor {self.spatial_downsample_factor}."
+            )
+        self.dynamics = MinimalDynamics(
+            latent_channels=latent_channels,
+            hidden_channels=hidden_channels,
         )
 
-    def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        """Decode latent feature maps into bounded RGB images."""
+    def _validate_autoencoder_backend(self, ae_backend: str) -> None:
+        """Reject removed autoencoder backends with a clear migration hint."""
 
-        return torch.sigmoid(self.model(latents))
+        if ae_backend != "wan":
+            raise ValueError(
+                f"Unsupported autoencoder backend: {ae_backend}. "
+                "The minimal path now only supports the Wan VAE."
+            )
 
+    @property
+    def spatial_downsample_factor(self) -> int:
+        """Return the Wan VAE spatial compression factor."""
 
-class MinimalWorldModel(nn.Module):
-    """Bundle encoder, dynamics, and decoder into one minimal model."""
+        return self.wan_cfg.spatial_downsample_factor()
 
-    def __init__(self, latent_channels: int = 4, hidden_channels: int = 64) -> None:
-        """Create the minimal model with shared defaults."""
+    def autoencoder_config(self) -> dict[str, Any]:
+        """Return the serializable autoencoder backend metadata."""
 
-        super().__init__()
-        self.encoder = MinimalEncoder(latent_channels=latent_channels, hidden_channels=hidden_channels)
-        self.dynamics = MinimalDynamics(latent_channels=latent_channels, hidden_channels=hidden_channels)
-        self.decoder = MinimalDecoder(latent_channels=latent_channels, hidden_channels=hidden_channels)
+        return {"backend": self.ae_backend, "config": self.backend_config}
 
     def configure_trainability(self, mode: str) -> None:
         """Freeze or unfreeze submodules for the requested training mode."""
 
-        if mode not in {"joint", "ae_only", "dynamics_only"}:
+        if mode not in {"ae_only", "dynamics_only"}:
             raise ValueError(f"Unsupported mode: {mode}")
-        self._set_module_trainable(self.encoder, mode in {"joint", "ae_only"})
-        self._set_module_trainable(self.decoder, mode in {"joint", "ae_only"})
-        self._set_module_trainable(self.dynamics, mode in {"joint", "dynamics_only"})
+        self._set_module_trainable(self.encoder, mode == "ae_only")
+        self._set_module_trainable(self.decoder, mode == "ae_only")
+        self._set_module_trainable(self.dynamics, mode == "dynamics_only")
 
     def _set_module_trainable(self, module: nn.Module, trainable: bool) -> None:
         """Toggle gradient tracking for one submodule."""
@@ -125,20 +150,47 @@ class MinimalWorldModel(nn.Module):
         for parameter in module.parameters():
             parameter.requires_grad = trainable
 
-    def encode(self, images: torch.Tensor) -> torch.Tensor:
-        """Encode images into latent maps."""
+    def encode_posterior(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return posterior moments from the Wan encoder."""
 
         return self.encoder(images)
+
+    def encode(self, images: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+        """Encode images into latent maps using mean or sampled latents."""
+
+        mu, log_var = self.encode_posterior(images)
+        if deterministic:
+            return mu
+        return sample_posterior_latent(mu, log_var)
 
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
         """Decode latent maps into RGB images."""
 
         return self.decoder(latents)
 
-    def reconstruct(self, images: torch.Tensor) -> torch.Tensor:
-        """Reconstruct a batch of images through the autoencoder."""
+    def autoencode(
+        self,
+        images: torch.Tensor,
+        sample_posterior: bool,
+    ) -> MinimalAutoencoderOutput:
+        """Run one AE pass and return reconstructions plus posterior statistics."""
 
-        return self.decode(self.encode(images))
+        mu, log_var = self.encode_posterior(images)
+        latent = mu if not sample_posterior else sample_posterior_latent(mu, log_var)
+        reconstructed = self.decode(latent)
+        kl_loss = kl_divergence_from_moments(mu, log_var)
+        return MinimalAutoencoderOutput(
+            reconstructed=reconstructed,
+            latent=latent,
+            mu=mu,
+            log_var=log_var,
+            kl_loss=kl_loss,
+        )
+
+    def reconstruct(self, images: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+        """Reconstruct a batch of images through the active autoencoder."""
+
+        return self.decode(self.encode(images, deterministic=deterministic))
 
     def predict_next_latent(self, latents: torch.Tensor) -> torch.Tensor:
         """Predict the next latent map from the current latent map."""
@@ -148,7 +200,7 @@ class MinimalWorldModel(nn.Module):
     def predict_next_frame(self, images: torch.Tensor) -> torch.Tensor:
         """Predict the next frame from the current frame."""
 
-        current_latents = self.encode(images)
+        current_latents = self.encode(images, deterministic=True)
         next_latents = self.predict_next_latent(current_latents)
         return self.decode(next_latents)
 
@@ -158,7 +210,7 @@ class MinimalWorldModel(nn.Module):
         if steps < 0:
             raise ValueError("steps must be non-negative.")
         predicted_frames = [seed_frame]
-        current_latents = self.encode(seed_frame)
+        current_latents = self.encode(seed_frame, deterministic=True)
         for _ in range(steps):
             current_latents = self.predict_next_latent(current_latents)
             predicted_frames.append(self.decode(current_latents))

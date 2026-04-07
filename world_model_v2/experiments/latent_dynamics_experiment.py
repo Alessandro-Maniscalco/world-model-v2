@@ -18,7 +18,7 @@ from world_model_v2.algorithms.latent_dynamics.latent_world_model import LatentW
 from world_model_v2.config import RunConfig
 from world_model_v2.datasets.latent_dynamics.real_aloha_dataset import RealAlohaDataset
 from world_model_v2.utils.checkpointing import append_jsonl, load_checkpoint, save_checkpoint, save_json
-from world_model_v2.utils.visualization import build_side_by_side_grid, write_side_by_side_gif
+from world_model_v2.utils.visualization import build_side_by_side_grid, write_side_by_side_mp4
 
 
 class LatentDynamicsExperiment:
@@ -384,7 +384,7 @@ class LatentDynamicsExperiment:
         output_dir = self.run_dir / "samples" / f"step_{step:06d}"
         output_dir.mkdir(parents=True, exist_ok=True)
         grid_path = output_dir / "episode_0_grid.png"
-        gif_path = output_dir / "episode_0.gif"
+        video_path = output_dir / "episode_0.mp4"
         stats_path = output_dir / "episode_0_stats.json"
 
         stats = dict(preview["stats"])
@@ -398,21 +398,21 @@ class LatentDynamicsExperiment:
             context_frames=context_frames,
         )
         grid.save(grid_path)
-        exported_frame_count = write_side_by_side_gif(
+        exported_frame_count = write_side_by_side_mp4(
             preview["original"],
             preview["reconstructed"],
-            gif_path,
+            video_path,
             duration_ms=120,
             context_frames=context_frames,
         )
         stats["checkpoint"] = str(self.checkpoints_dir / "last.pt")
-        stats["exported_gif_frame_count"] = int(exported_frame_count)
+        stats["exported_video_frame_count"] = int(exported_frame_count)
         if "predicted_frame_count" in stats and stats["input_frame_count"] != stats["predicted_frame_count"]:
             raise RuntimeError(f"Predicted frame count mismatch: {stats}")
         if stats["input_frame_count"] != stats["decoded_frame_count"]:
             raise RuntimeError(f"Decoded frame count mismatch: {stats}")
-        if stats["decoded_frame_count"] != stats["exported_gif_frame_count"]:
-            raise RuntimeError(f"Exported GIF frame count mismatch: {stats}")
+        if stats["decoded_frame_count"] != stats["exported_video_frame_count"]:
+            raise RuntimeError(f"Exported video frame count mismatch: {stats}")
         save_json(stats_path, stats)
         return stats
 

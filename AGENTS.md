@@ -9,6 +9,7 @@
 - Use `pytest` for testing.
 - If the logic depends on external models or heavy resources (like VAEs), use mocks to keep tests fast and deterministic.
 - When it makes sense, run the command you are telling me to run, check whether if it runs correctly for the amount of time you feel reasonable, fix it if it fails, and repeat until there is no error.
+- If I tell you to fix something, run the command, check if it works, fix it if it fails, and repeat until there is no error.
 - For bugs visible only in generated artifacts or end-to-end outputs, do not stop at code inspection or unit tests. Reproduce the exact failing artifact with the real command or closest local reproduction, trace the full pipeline stage by stage, and verify the repaired artifact after the fix.
 - For video or temporal-model bugs, explicitly check all relevant boundaries that can silently change frame counts or alignment, including raw input frames, latent-time shapes, decoded frame counts, and exported video frame counts.
 ## Environment

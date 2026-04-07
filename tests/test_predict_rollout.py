@@ -13,7 +13,7 @@ def test_predict_rollout_writes_outputs(
     saved_stage2_checkpoint: Path,
     tmp_path: Path,
 ) -> None:
-    """Rollout prediction should save a grid, a GIF, and matching frame-count stats."""
+    """Rollout prediction should save a grid, an MP4, and matching frame-count stats."""
 
     output_dir = tmp_path / "rollout"
     result = predict_rollout(
@@ -33,7 +33,7 @@ def test_predict_rollout_writes_outputs(
     )
     stats = json.loads((output_dir / "episode_0_stats.json").read_text())
     assert Path(result["grid_path"]).exists()
-    assert Path(result["gif_path"]).exists()
+    assert Path(result["video_path"]).exists()
     assert stats["predicted_frame_count"] == 6
     assert stats["decoded_frame_count"] == 6
-    assert stats["exported_gif_frame_count"] == 6
+    assert stats["exported_video_frame_count"] == 6

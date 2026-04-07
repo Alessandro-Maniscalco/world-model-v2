@@ -5,21 +5,22 @@
 This document describes the implemented minimal world-model path in
 `world_model_v2/minimal/` as it exists in this repo now.
 
-The purpose of this path is not broad generalization. It is a small, explicit,
-debuggable setup that can overfit one short clip and let you inspect
-reconstructions, rollouts, checkpoints, and plateau stopping without the
-complexity of the larger staged world-model code.
+The purpose of this path is still a small, explicit, debuggable setup that can
+overfit one short clip and let you inspect reconstructions, rollouts,
+checkpoints, and plateau stopping without the complexity of the larger staged
+world-model code.
 
 Major design choices:
 
 - one fixed clip instead of the full dataset
-- one small deterministic `encoder + dynamics + decoder` model
-- three modes that share the same submodules
+- one Wan-style VAE autoencoder backend
+- one separate latent dynamics module
 - no actions
-- no diffusion, no scheduler, no upstream-style multi-stage stack
+- no joint AE+dynamics training mode
+- KL-regularized VAE training in `ae_only`
+- deterministic inference with posterior mean latents
 - periodic validation with GIF/grid outputs
 - validation-based plateau stopping by default
-- image-space losses use MSE, which is the averaged squared L2 error
 
 ## Fixed data setup
 
@@ -49,7 +50,7 @@ There are no actions in this minimal path.
 The shared model is:
 
 $$
-z_t = E_\phi(x_t)
+q_\phi(z_t \mid x_t)
 $$
 
 $$
@@ -62,245 +63,132 @@ $$
 
 where:
 
-- $E_\phi$ is the encoder
+- $q_\phi$ is the encoder posterior
 - $F_\psi$ is the latent dynamics module
 - $D_\theta$ is the decoder
 
-### Default dimensions
+### Wan-style VAE config
 
-- input image shape: `B x 3 x 128 x 128`
-- latent shape: `B x 4 x 32 x 32`
-- output image shape: `B x 3 x 128 x 128`
-- hidden channel width: `64`
+The Wan-style backend uses these internal defaults:
 
-Important note:
+```python
+cfg = dict(
+    dim=64,
+    z_dim=4,
+    dim_mult=[1, 2, 4],
+    num_res_blocks=1,
+    attn_scales=[],
+    temperal_downsample=[False, False],
+    dropout=0.0,
+)
+```
 
-- “latent is `32x32`” means latent spatial resolution, not `32` latent channels
-- the default latent channel count is `4`
+Important notes:
 
-### Parameter counts at default size
+- the Wan backend is adapted into this repo; it is not a verbatim copy of the
+  upstream file
+- the minimal implementation drops streaming/cache logic and pretrained latent
+  normalization constants
+- images are processed internally as single-frame videos with `T=1`
 
-- encoder: `108,420`
-- dynamics: `152,388`
-- decoder: `172,227`
-- total: `433,035`
+### Latent shape
 
-## Block structures
+The latent spatial shape is derived from the Wan config, not hard-coded.
 
-### Encoder
+For the default Wan config:
 
-The encoder is:
+- spatial downsample factor = `2^(len(dim_mult)-1) = 4`
+- `128x128 -> 32x32`
+- latent shape = `B x 4 x 32 x 32`
 
-1. `Conv2d(3, 64, kernel_size=3, stride=1, padding=1)`
-2. `SiLU`
-3. `Conv2d(64, 64, kernel_size=4, stride=2, padding=1)`
-4. `SiLU`
-5. `Conv2d(64, 64, kernel_size=3, stride=1, padding=1)`
-6. `SiLU`
-7. `Conv2d(64, 4, kernel_size=4, stride=2, padding=1)`
-8. `SiLU`
-
-Shape flow:
-
-- `128x128 -> 128x128`
-- `128x128 -> 64x64`
-- `64x64 -> 64x64`
-- `64x64 -> 32x32`
-
-So:
+In general:
 
 $$
-E_\phi : \mathbb{R}^{B \times 3 \times 128 \times 128}
-\to \mathbb{R}^{B \times 4 \times 32 \times 32}
-$$
-
-### Dynamics
-
-The dynamics module is a residual latent predictor:
-
-1. `input_proj = Conv2d(4, 64, kernel_size=3, padding=1)`
-2. `SiLU`
-3. residual block 1
-4. `SiLU`
-5. residual block 2
-6. `SiLU`
-7. `output_proj = Conv2d(64, 4, kernel_size=3, padding=1)`
-8. residual update back to the input latent
-
-Each residual block is:
-
-1. `Conv2d(64, 64, kernel_size=3, padding=1)`
-2. `SiLU`
-3. `Conv2d(64, 64, kernel_size=3, padding=1)`
-4. add skip connection
-
-Compactly:
-
-$$
-h_t = \operatorname{Conv}_{3\times3}(z_t)
+\text{latent height} = \frac{\text{resolution}}{\text{spatial downsample factor}}
 $$
 
 $$
-\Delta z_t = \operatorname{OutProj}(\operatorname{ResStack}(h_t))
+\text{latent width} = \frac{\text{resolution}}{\text{spatial downsample factor}}
 $$
 
-$$
-\hat{z}_{t+1} = z_t + \Delta z_t
-$$
-
-So:
-
-$$
-F_\psi : \mathbb{R}^{B \times 4 \times 32 \times 32}
-\to \mathbb{R}^{B \times 4 \times 32 \times 32}
-$$
-
-### Decoder
-
-The decoder mirrors the encoder:
-
-1. `Conv2d(4, 64, kernel_size=3, stride=1, padding=1)`
-2. `SiLU`
-3. `ConvTranspose2d(64, 64, kernel_size=4, stride=2, padding=1)`
-4. `SiLU`
-5. `Conv2d(64, 64, kernel_size=3, stride=1, padding=1)`
-6. `SiLU`
-7. `ConvTranspose2d(64, 64, kernel_size=4, stride=2, padding=1)`
-8. `SiLU`
-9. `Conv2d(64, 3, kernel_size=3, stride=1, padding=1)`
-10. `sigmoid`
-
-Shape flow:
-
-- `32x32 -> 32x32`
-- `32x32 -> 64x64`
-- `64x64 -> 64x64`
-- `64x64 -> 128x128`
-- `128x128 -> 128x128`
-
-So:
-
-$$
-D_\theta : \mathbb{R}^{B \times 4 \times 32 \times 32}
-\to \mathbb{R}^{B \times 3 \times 128 \times 128}
-$$
-
-The sigmoid bounds outputs to `[0, 1]`.
+The code validates that `resolution` is divisible by the Wan downsample
+factor.
 
 ## Modes
 
-The same model is used in all modes. Only trainability and loss change.
+The minimal path now supports only:
+
+- `ae_only`
+- `dynamics_only`
+
+`joint` has been removed.
 
 ### `ae_only`
 
 Trainable:
 
 - encoder: trainable
-- dynamics: frozen
 - decoder: trainable
+- dynamics: frozen
 
 Dataset:
 
 - all 6 frames independently
 
-Forward pass:
+Training behavior:
 
-$$
-z_t = E_\phi(x_t)
-$$
-
-$$
-\hat{x}_t = D_\theta(z_t)
-$$
+1. encode `x_t` into posterior moments `mu_t, log_var_t`
+2. sample `z_t` with reparameterization
+3. decode `z_t`
+4. optimize reconstruction plus KL
 
 Training loss:
 
 $$
 \mathcal{L}_{ae}
 =
-\lVert \hat{x}_t - x_t \rVert_2^2
+\lVert D_\theta(z_t) - x_t \rVert_2^2
++ \beta \, \mathrm{KL}\left(q_\phi(z_t \mid x_t) \,\|\, \mathcal{N}(0, I)\right)
 $$
 
-This is implemented as image-space MSE.
+Implemented as:
 
-Validation:
+- `recon_mse = MSE(reconstructed, frame)`
+- `kl_loss = KL(mu, log_var)`
+- `ae_loss = recon_mse + kl_beta * kl_loss`
 
-- not open rollout
-- each of the 6 frames is reconstructed independently
-- metric of record is `recon_mse`
+Default:
 
-Validation formula:
+- `kl_beta = 1e-4`
 
-$$
-\mathcal{L}_{val,ae}
-=
-\frac{1}{6}\sum_{t=111}^{116}\lVert D_\theta(E_\phi(x_t)) - x_t \rVert_2^2
-$$
+Validation behavior:
+
+- validation is deterministic
+- encode with posterior mean `mu`
+- decode `mu` directly
+- metric of record is `ae_loss`
+
+Saved validation stats include:
+
+- `recon_mse`
+- `kl_loss`
+- `ae_loss`
+- `input_frame_count = 6`
+- `decoded_frame_count = 6`
 
 Interpretation:
 
-- this tells you how good the encoder/decoder pair is at reconstructing frames
-- if outputs are blurry here, the autoencoder itself is blurry
-
-### `joint`
-
-Trainable:
-
-- encoder: trainable
-- dynamics: trainable
-- decoder: trainable
-
-Dataset:
-
-- the 5 transitions `(x_t, x_{t+1})`
-
-Forward pass:
-
-$$
-z_t = E_\phi(x_t)
-$$
-
-$$
-\hat{x}_t = D_\theta(z_t)
-$$
-
-$$
-\hat{z}_{t+1} = F_\psi(z_t)
-$$
-
-$$
-\hat{x}_{t+1} = D_\theta(\hat{z}_{t+1})
-$$
-
-Training loss:
-
-$$
-\mathcal{L}_{joint}
-=
-\lVert \hat{x}_{t+1} - x_{t+1} \rVert_2^2
-+ 0.25 \, \lVert \hat{x}_t - x_t \rVert_2^2
-$$
-
-This is implemented as:
-
-- `pred_mse = MSE(predicted_next, next_frame)`
-- `recon_mse = MSE(reconstructed, current_frame)`
-- `loss = pred_mse + 0.25 * recon_mse`
-
-Validation:
-
-- open rollout from frame 111
-- frame 111 is the seed
-- frames 112..116 are predicted autoregressively
-- metric of record is `rollout_mse`
+- if `recon_mse` stays high, the autoencoder itself is not reconstructing well
+- if `kl_loss` dominates, the KL pressure is too strong for this tiny overfit
+  setup
 
 ### `dynamics_only`
 
 Trainable:
 
 - encoder: frozen
-- dynamics: trainable
 - decoder: frozen
+- dynamics: trainable
 
 Required checkpoint loading:
 
@@ -311,101 +199,35 @@ Dataset:
 
 - the 5 transitions `(x_t, x_{t+1})`
 
-Training forward pass:
+Training behavior:
 
-$$
-z_t = E_\phi(x_t)
-$$
-
-$$
-z_{t+1} = E_\phi(x_{t+1})
-$$
-
-$$
-\hat{z}_{t+1} = F_\psi(z_t)
-$$
-
-Both encoder calls are done under `torch.no_grad()` because the encoder is
-frozen.
+- encode current and next frames with deterministic posterior mean `mu`
+- keep both encoder and decoder frozen
+- train only the latent dynamics model
 
 Training loss:
 
 $$
 \mathcal{L}_{dyn}
 =
-\lVert \hat{z}_{t+1} - z_{t+1} \rVert_2^2
+\lVert F_\psi(\mu_t) - \mu_{t+1} \rVert_2^2
 $$
 
 This is implemented as latent-space MSE.
 
 Validation rollout:
 
-First encode the seed frame:
-
-$$
-z_{111} = E_\phi(x_{111})
-$$
-
-Then roll out latents autoregressively:
-
-$$
-\hat{z}_{112} = F_\psi(z_{111})
-$$
-
-$$
-\hat{z}_{113} = F_\psi(\hat{z}_{112})
-$$
-
-$$
-\cdots
-$$
-
-$$
-\hat{z}_{116} = F_\psi(\hat{z}_{115})
-$$
-
-Then decode each predicted latent with the frozen decoder:
-
-$$
-\hat{x}_{t} = D_\theta(\hat{z}_{t})
-\qquad \text{for } t \in \{112,113,114,115,116\}
-$$
+1. encode the seed frame `x_111` into deterministic latent `mu_111`
+2. roll out latents autoregressively with the dynamics module
+3. decode each predicted latent with the frozen decoder
+4. compare predicted frames against frames `112..116`
 
 Validation metric of record:
 
-$$
-\mathcal{L}_{rollout,MSE}
-=
-\frac{1}{5}\sum_{t=112}^{116}\lVert \hat{x}_t - x_t \rVert_2^2
-$$
+- `rollout_mse`
 
-Interpretation:
+Saved validation stats include:
 
-- training is latent-only
-- validation is image-space open rollout
-- if latent MSE looks fine but rollout images drift or blur, the problem is in
-  the learned latent transition behavior, not the frozen encoder/decoder alone
-
-## Validation behavior
-
-### `ae_only`
-
-Validation output is reconstruction, not rollout.
-
-The saved stats include:
-
-- `mode = "ae_only"`
-- `recon_mse`
-- `input_frame_count = 6`
-- `decoded_frame_count = 6`
-
-### `joint` and `dynamics_only`
-
-Validation output is open rollout.
-
-The saved stats include:
-
-- `mode = "joint"` or `mode = "dynamics_only"`
 - `rollout_mse`
 - `input_frame_count = 6`
 - `predicted_frame_count = 6`
@@ -413,58 +235,18 @@ The saved stats include:
 - `seed_frames = 1`
 - `loss_frames = 5`
 
-The saved GIF and grid show:
-
-- frame 111 as the ground-truth seed
-- frames 112..116 as predictions
-
-## Data loaders by mode
-
-### `ae_only`
-
-Training loader sample:
-
-```python
-{
-  "frame": Tensor[3, 128, 128],
-  "frame_idx": Tensor[],
-  "episode_idx": Tensor[],
-}
-```
-
-### `joint` and `dynamics_only`
-
-Training loader sample:
-
-```python
-{
-  "current_frame": Tensor[3, 128, 128],
-  "next_frame": Tensor[3, 128, 128],
-  "current_frame_idx": Tensor[],
-  "next_frame_idx": Tensor[],
-  "episode_idx": Tensor[],
-}
-```
-
-### all modes
-
-Validation loader sample:
-
-```python
-{
-  "frames": Tensor[6, 3, 128, 128],
-  "frame_idx": Tensor[6],
-  "episode_idx": Tensor[],
-}
-```
-
 ## Checkpoints
 
-Minimal checkpoints are separate from the older staged world-model checkpoints.
+Minimal checkpoints are versioned separately from the older staged world-model
+checkpoints.
 
-Checkpoint payload contains:
+Current checkpoint kind:
 
-- `kind = "world_model_v2_minimal_v1"`
+- `kind = "world_model_v2_minimal_v2"`
+
+Payload contains:
+
+- `kind`
 - `model_state`
 - `optimizer_state`
 - `scheduler_state`
@@ -473,6 +255,13 @@ Checkpoint payload contains:
 - `mode`
 - `clip_metadata`
 - `best_metric`
+- `ae_backend`
+- `autoencoder`
+
+For current checkpoints:
+
+- `ae_backend = "wan"`
+- `autoencoder["backend"] = "wan"`
 
 Saved checkpoints:
 
@@ -481,20 +270,14 @@ Saved checkpoints:
 
 Best metric selection:
 
-- `ae_only` -> best `recon_mse`
-- `joint` -> best `rollout_mse`
+- `ae_only` -> best `ae_loss`
 - `dynamics_only` -> best `rollout_mse`
 
-Partial loading:
+Checkpoint compatibility:
 
-- `--load-encoder-decoder`
-- `--load-dynamics`
-
-Behavior:
-
-- `joint`: can load either or both
-- `ae_only`: can load encoder/decoder, cannot load dynamics
-- `dynamics_only`: must load encoder/decoder unless resuming
+- Wan backend metadata is checked during partial loading and resume
+- incompatible checkpoint metadata still fails fast instead of relying on shape
+  errors
 
 ## Training loop and plateau stopping
 
@@ -515,27 +298,8 @@ Default early-stop settings:
 
 Early-stop metric:
 
-- `ae_only` -> `recon_mse`
-- `joint` -> `rollout_mse`
+- `ae_only` -> `ae_loss`
 - `dynamics_only` -> `rollout_mse`
-
-Plateau logic:
-
-1. compute the validation metric every validation step
-2. average over the configured validation window
-3. compare to the best previous window
-4. if the metric does not improve by at least `min_delta`, count one
-   non-improving window
-5. stop once non-improving windows reaches `early_stop_patience_windows`
-
-Disabling early stop:
-
-- set `early_stop_window_size = 0`, or
-- set `early_stop_patience_windows = 0`
-
-Important:
-
-- validation-based early stopping requires `validation_interval > 0`
 
 ## CLI defaults
 
@@ -547,7 +311,8 @@ python -m world_model_v2.minimal.run
 
 Important defaults:
 
-- `--mode joint`
+- `--mode ae_only`
+- `--kl-beta 1e-4`
 - `--data-root data/full`
 - `--task single_grasp`
 - `--split val`
@@ -559,80 +324,53 @@ Important defaults:
 - `--latent-channels 4`
 - `--hidden-channels 64`
 - `--batch-size 32`
-- `--lr 1e-3`
+- `--auto-batch-size` disabled by default
+- `--lr 1e-4`
 - `--max-steps 3000`
 - `--validation-interval 100`
 - `--checkpoint-interval 100`
 
-## What to look at when debugging
-
-### If `ae_only` is blurry
-
-The encoder/decoder itself is not reconstructing sharply enough. That is an
-autoencoder problem, not a rollout problem.
-
-Look at:
-
-- `recon_mse`
-- reconstruction GIFs from `ae_only`
-- whether `128x128` is too hard for the current latent width or hidden width
-
-### If `ae_only` is sharp but `joint` or `dynamics_only` drifts
-
-The problem is likely in latent transition learning, not the decoder alone.
-
-Look at:
-
-- `rollout_mse`
-- whether one-step training is enough for stable open-loop rollout
-- whether the dynamics block is too small
-- whether the latent space learned by `ae_only` is easy or hard to predict
-
-### If `dynamics_only` does badly immediately
-
-Check:
-
-- was `--load-encoder-decoder` taken from a good `ae_only` checkpoint
-- are the encoder and decoder actually frozen
-- do the validation GIFs match the latent MSE trend
-
 ## Practical commands
 
-### Train encoder/decoder only
+### Train the Wan-style VAE only
 
 ```bash
 python -m world_model_v2.minimal.run \
   --mode ae_only \
+  --auto-batch-size \
   --run-name ae_only_single_grasp_ep0_f111_116 \
   --output-dir outputs/minimal \
   --device cuda
 ```
 
-### Train joint model
-
-```bash
-python -m world_model_v2.minimal.run \
-  --mode joint \
-  --run-name joint_single_grasp_ep0_f111_116 \
-  --output-dir outputs/minimal \
-  --device cuda
-```
-
-### Train dynamics only on a pretrained autoencoder
+### Train dynamics on a pretrained minimal AE
 
 ```bash
 python -m world_model_v2.minimal.run \
   --mode dynamics_only \
+  --auto-batch-size \
   --load-encoder-decoder outputs/minimal/ae_only_single_grasp_ep0_f111_116/checkpoints/best.pt \
   --run-name dynamics_only_single_grasp_ep0_f111_116 \
   --output-dir outputs/minimal \
   --device cuda
 ```
 
-## Bottom line
+## Auto batch sizing
 
-If you want to know whether the image model itself is blurry, run `ae_only`.
+The minimal runner can optionally probe for the largest training batch size
+that fits before training starts:
 
-If you want to know whether the latent dynamics can roll forward from one seed
-frame, run `dynamics_only` or `joint` and inspect the rollout GIFs and
-`rollout_mse`.
+```bash
+--auto-batch-size
+```
+
+Behavior:
+
+- on CUDA, the runner probes batch sizes and keeps the largest size that fits a
+  full forward/backward/optimizer-step dry run
+- on CPU, the runner uses the full cached clip size because this minimal path
+  only trains on one tiny clip
+- the probe restores RNG state afterward so enabling auto batch sizing does not
+  change the training randomness for the same seed
+- if a real CUDA OOM still happens during training, the runner halves the batch
+  size, rebuilds the train loader, and continues instead of crashing immediately
