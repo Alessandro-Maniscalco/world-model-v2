@@ -71,7 +71,11 @@ def test_wan_dynamics_only_training_step_reports_rf_terms(
         "target_sigma",
         "conditioning_frames_mean",
         "use_video_condition_mean",
+        "active_self_forcing_loss_weight",
+        "active_rollout_self_forcing_loss_weight",
     }
+    assert float(metrics["active_self_forcing_loss_weight"]) == 0.0
+    assert float(metrics["active_rollout_self_forcing_loss_weight"]) == 0.0
     assert torch.isclose(metrics["loss"], metrics["latent_rf_mse"])
     assert float(metrics["target_sigma"]) > 0.0
     assert (
@@ -225,6 +229,7 @@ def test_dynamics_run_supports_one_context_layouts(
         dynamics_conditioning_frame_probabilities=(1.0,),
         dynamics_validation_conditioning_frame_choices=(1,),
         dynamics_open_rollout_context_frames=1,
+        dynamics_open_rollout_stride_frames=1,
     )
     experiment = Experiment(config)
     experiment.run()
@@ -248,6 +253,7 @@ def test_dynamics_run_supports_one_context_layouts(
     assert saved_stats["conditioning_frame_choices"] == [1]
     assert saved_stats["validation_conditioning_frame_choices"] == [1]
     assert saved_stats["open_rollout_context_frames"] == 1
+    assert saved_stats["open_rollout_stride_frames"] == 1
 
 
 def test_resume_rebuilds_best_metric_for_changed_dynamics_validation_metric(

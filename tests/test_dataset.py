@@ -161,6 +161,36 @@ def test_transition_dataset_supports_custom_frame_layout(
     assert torch.equal(sample["target_frame_idx"], torch.tensor([112]))
 
 
+def test_transition_dataset_exposes_future_rollout_targets_when_requested(
+    fake_long_dataset_root: Path,
+) -> None:
+    """TransitionDataset should expose extra rollout targets and actions for same-context self-forcing."""
+
+    dataset = TransitionDataset(
+        data_root=str(fake_long_dataset_root),
+        frame_start=111,
+        frame_end=115,
+        frame_layout=DynamicsFrameLayout(context_frames=1, target_frames=2),
+        rollout_context_frames=1,
+        rollout_chunks=1,
+    )
+
+    assert len(dataset) == 1
+    sample = dataset[0]
+    assert sample["future_target_frames"].shape == (2, 3, 128, 128)
+    assert sample["future_actions"].shape == (2, 4)
+    assert torch.equal(sample["future_target_frame_idx"], torch.tensor([114, 115]))
+    assert torch.equal(
+        sample["future_actions"],
+        torch.tensor(
+            [
+                [113.0, 114.0, 115.0, 116.0],
+                [114.0, 115.0, 116.0, 117.0],
+            ]
+        ),
+    )
+
+
 def test_list_episode_indices_returns_sorted_episode_numbers(
     fake_multi_episode_dataset_root: Path,
 ) -> None:

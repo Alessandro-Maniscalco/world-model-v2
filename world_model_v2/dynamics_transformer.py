@@ -135,6 +135,7 @@ class DynamicsTransformerConfig:
     conditioning_frame_probabilities: tuple[float, ...] | None = None
     validation_conditioning_frame_choices: tuple[int, ...] | None = None
     open_rollout_context_frames: int | None = None
+    open_rollout_stride_frames: int | None = None
     in_channels: int = 16
     out_channels: int = 16
     patch_spatial: int = 2
@@ -153,11 +154,13 @@ class DynamicsTransformerConfig:
     rope_h_extrapolation_ratio: float = 1.0
     rope_w_extrapolation_ratio: float = 1.0
     rope_t_extrapolation_ratio: float = 1.0
+    use_learned_temporal_embedding: bool = False
     action_dim: int = 4
     action_conditioning_mode: str = "chunk_per_frame"
     zero_init_action_embedder: bool = False
     timestep_scale: float = 1.0
     conditional_frame_timestep: float = -1.0
+    conditional_frame_sigma: float = 0.0
     dynamics_infer_steps: int = 16
     dynamics_train_timesteps: int = 1000
     dynamics_rf_shift: float = 5.0
@@ -213,6 +216,8 @@ class DynamicsTransformerConfig:
             raise ValueError("timestep_scale must be positive.")
         if self.conditional_frame_timestep < -1.0:
             raise ValueError("conditional_frame_timestep must be -1 or a non-negative value.")
+        if not 0.0 <= self.conditional_frame_sigma <= 1.0:
+            raise ValueError("conditional_frame_sigma must be between 0 and 1.")
         if not 0.0 <= self.dynamics_video_condition_dropout <= 1.0:
             raise ValueError("dynamics_video_condition_dropout must be between 0 and 1.")
         if self.dynamics_guidance_scale < 0.0:
@@ -243,6 +248,19 @@ class DynamicsTransformerConfig:
                 f"{resolved_conditioning_frame_choices}, received "
                 f"{resolved_open_rollout_context_frames}."
             )
+        resolved_open_rollout_stride_frames = (
+            None
+            if self.open_rollout_stride_frames is None
+            else int(self.open_rollout_stride_frames)
+        )
+        if (
+            resolved_open_rollout_stride_frames is not None
+            and (
+                resolved_open_rollout_stride_frames < 1
+                or resolved_open_rollout_stride_frames >= self.max_frames
+            )
+        ):
+            raise ValueError("open_rollout_stride_frames must stay within [1, max_frames - 1].")
         object.__setattr__(
             self,
             "conditioning_frame_choices",
@@ -262,6 +280,11 @@ class DynamicsTransformerConfig:
             self,
             "open_rollout_context_frames",
             resolved_open_rollout_context_frames,
+        )
+        object.__setattr__(
+            self,
+            "open_rollout_stride_frames",
+            resolved_open_rollout_stride_frames,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -858,6 +881,19 @@ class ActionConditionedDynamicsTransformer(nn.Module):
             in_channels=cfg.in_channels + 1,
             out_channels=cfg.model_channels,
         )
+        self.temporal_pos_embed = (
+            nn.Parameter(
+                torch.zeros(
+                    1,
+                    cfg.max_frames // cfg.patch_temporal,
+                    1,
+                    1,
+                    cfg.model_channels,
+                )
+            )
+            if cfg.use_learned_temporal_embedding
+            else None
+        )
         self.pos_embedder = VideoRopePosition3DEmb(
             head_dim=cfg.model_channels // cfg.num_heads,
             len_h=cfg.max_img_h // cfg.patch_spatial,
@@ -989,6 +1025,8 @@ class ActionConditionedDynamicsTransformer(nn.Module):
             dim=1,
         )
         tokens = self.x_embedder(model_input)
+        if self.temporal_pos_embed is not None:
+            tokens = tokens + self.temporal_pos_embed[:, : tokens.shape[1]].to(dtype=tokens.dtype)
         _, token_frames, token_height, token_width, _ = tokens.shape
         cos, sin = self.pos_embedder(
             token_frames,
@@ -1213,6 +1251,59 @@ class RectifiedFlowDynamics(nn.Module):
         ).view(-1, 1, 1, 1, 1)
         return conditioning_latent_video * video_condition_scale
 
+    def _apply_conditional_frame_sigma(
+        self,
+        conditioning_latent_video: torch.Tensor,
+        condition_mask: torch.Tensor,
+        *,
+        target_velocity: torch.Tensor | None = None,
+        reference_noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Add optional DreamDojo-style tiny noise to the conditioned latent prefix."""
+
+        conditioning_sigma = self.cfg.conditional_frame_sigma
+        if conditioning_sigma <= 0.0:
+            return conditioning_latent_video
+        if target_velocity is None and reference_noise is None:
+            return conditioning_latent_video
+        if target_velocity is not None and reference_noise is not None:
+            raise ValueError("Provide either target_velocity or reference_noise, not both.")
+        if target_velocity is None:
+            target_velocity = reference_noise - conditioning_latent_video
+        condition_video_mask = self._expand_condition_mask_to_channels(
+            condition_mask,
+            conditioning_latent_video.shape[1],
+        ).to(dtype=conditioning_latent_video.dtype)
+        return conditioning_latent_video + conditioning_sigma * target_velocity * condition_video_mask
+
+    def _prepare_conditioning_state(
+        self,
+        conditioning_latent_video: torch.Tensor,
+        condition_mask: torch.Tensor,
+        *,
+        target_velocity: torch.Tensor | None = None,
+        reference_noise: torch.Tensor | None = None,
+        use_video_condition: bool | torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the repinned conditioning state with optional tiny sigma and dropout."""
+
+        conditioning_state = self._apply_conditional_frame_sigma(
+            conditioning_latent_video,
+            condition_mask,
+            target_velocity=target_velocity,
+            reference_noise=reference_noise,
+        )
+        conditioning_flags = self._normalize_use_video_condition(
+            True if use_video_condition is None else use_video_condition,
+            batch_size=conditioning_latent_video.shape[0],
+            device=conditioning_latent_video.device,
+        )
+        conditioning_state = self._apply_video_condition_dropout(
+            conditioning_state,
+            conditioning_flags,
+        )
+        return conditioning_state, conditioning_flags
+
     def _apply_conditional_frame_timestep(
         self,
         timesteps: torch.Tensor,
@@ -1381,9 +1472,15 @@ class RectifiedFlowDynamics(nn.Module):
             conditioning_latent_video,
             num_conditional_frames=conditioning_counts,
         )
+        conditioning_state_in, _ = self._prepare_conditioning_state(
+            conditioning_latent_video,
+            condition_mask,
+            reference_noise=reference_noise,
+            use_video_condition=True,
+        )
         latent_video = self._repin_conditioned_frames(
             noisy_latent_video=reference_noise.clone(),
-            conditioning_latent_video=conditioning_latent_video,
+            conditioning_latent_video=conditioning_state_in,
             condition_mask=condition_mask,
         )
         prepared_actions = self._prepare_actions(
@@ -1400,7 +1497,7 @@ class RectifiedFlowDynamics(nn.Module):
         for index, timestep in enumerate(timesteps):
             latent_video = self._repin_conditioned_frames(
                 noisy_latent_video=latent_video,
-                conditioning_latent_video=conditioning_latent_video,
+                conditioning_latent_video=conditioning_state_in,
                 condition_mask=condition_mask,
             )
             full_timesteps = torch.full(
@@ -1467,14 +1564,12 @@ class RectifiedFlowDynamics(nn.Module):
             device=noisy_latent_video.device,
             dtype=noisy_latent_video.dtype,
         )
-        conditioning_flags = self._normalize_use_video_condition(
-            True if use_video_condition is None else use_video_condition,
-            batch_size=noisy_latent_video.shape[0],
-            device=noisy_latent_video.device,
-        )
-        conditioning_state_in = self._apply_video_condition_dropout(
+        conditioning_state_in, conditioning_flags = self._prepare_conditioning_state(
             conditioning_latent_video,
-            conditioning_flags,
+            condition_mask,
+            target_velocity=target_velocity,
+            reference_noise=reference_noise,
+            use_video_condition=use_video_condition,
         )
         repinned_latent_video = self._repin_conditioned_frames(
             noisy_latent_video,

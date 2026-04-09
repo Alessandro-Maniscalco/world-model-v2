@@ -105,3 +105,21 @@ def test_wan_world_model_rollout_includes_seed_frame() -> None:
         128,
         128,
     )
+
+
+def test_wan_world_model_rollout_accepts_overlap_stride() -> None:
+    """Runtime rollout should allow appending one frame at a time from a wider chunk head."""
+
+    model = WorldModel(
+        resolution=128,
+        dynamics_context_frames=1,
+        dynamics_target_frames=2,
+        dynamics_conditioning_frame_choices=(1,),
+        dynamics_conditioning_frame_probabilities=(1.0,),
+        dynamics_validation_conditioning_frame_choices=(1,),
+        dynamics_open_rollout_context_frames=1,
+        dynamics_open_rollout_stride_frames=1,
+    )
+    seed = torch.rand(1, 1, 3, 128, 128)
+    rollout = model.rollout(seed, steps=2, stride_frames=1)
+    assert rollout.shape == (1, 3, 3, 128, 128)

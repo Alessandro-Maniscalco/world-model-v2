@@ -31,15 +31,24 @@ def test_run_parse_args_uses_expected_defaults() -> None:
     assert config.dynamics_train_timesteps == 1000
     assert config.dynamics_rf_shift == 5.0
     assert config.conditional_frame_timestep == -1.0
+    assert config.conditional_frame_sigma == 0.0
     assert config.dynamics_video_condition_dropout == 0.0
     assert config.dynamics_guidance_scale == 0.0
     assert config.dynamics_self_forcing_loss_weight == 0.0
+    assert config.dynamics_rollout_self_forcing_loss_weight == 0.0
+    assert config.dynamics_self_forcing_mode == "expanded_context"
+    assert config.dynamics_self_forcing_warmup_steps == 0
+    assert config.dynamics_self_forcing_ramp_steps == 0
+    assert config.dynamics_rollout_self_forcing_warmup_steps == 0
+    assert config.dynamics_rollout_self_forcing_ramp_steps == 0
+    assert config.dynamics_self_forcing_rollout_chunks == 0
     assert config.dynamics_context_frames == 4
     assert config.dynamics_target_frames == 1
     assert config.dynamics_conditioning_frame_choices is None
     assert config.dynamics_conditioning_frame_probabilities is None
     assert config.dynamics_validation_conditioning_frame_choices is None
     assert config.dynamics_open_rollout_context_frames is None
+    assert config.dynamics_open_rollout_stride_frames is None
     assert config.dynamics_model_channels == 256
     assert config.dynamics_num_blocks == 4
     assert config.dynamics_num_heads == 4
@@ -48,6 +57,7 @@ def test_run_parse_args_uses_expected_defaults() -> None:
     assert config.dynamics_use_adaln_lora is False
     assert config.dynamics_adaln_lora_dim == 64
     assert config.dynamics_rope_t_extrapolation_ratio == 1.0
+    assert config.dynamics_use_learned_temporal_embedding is False
     assert config.dynamics_validation_metric == "next_frame_mse"
     assert config.kl_beta == 1e-4
     assert config.recon_mse_weight == 1.0
@@ -94,12 +104,28 @@ def test_run_build_config_preserves_rf_dynamics_flags() -> None:
             "3.5",
             "--conditional-frame-timestep",
             "0.75",
+            "--conditional-frame-sigma",
+            "0.125",
             "--dynamics-video-condition-dropout",
             "0.35",
             "--dynamics-guidance-scale",
             "2.0",
             "--dynamics-self-forcing-loss-weight",
             "0.4",
+            "--dynamics-rollout-self-forcing-loss-weight",
+            "0.15",
+            "--dynamics-self-forcing-mode",
+            "rollout",
+            "--dynamics-self-forcing-warmup-steps",
+            "75",
+            "--dynamics-self-forcing-ramp-steps",
+            "125",
+            "--dynamics-rollout-self-forcing-warmup-steps",
+            "25",
+            "--dynamics-rollout-self-forcing-ramp-steps",
+            "50",
+            "--dynamics-self-forcing-rollout-chunks",
+            "2",
             "--dynamics-model-channels",
             "384",
             "--dynamics-num-blocks",
@@ -114,6 +140,7 @@ def test_run_build_config_preserves_rf_dynamics_flags() -> None:
             "96",
             "--dynamics-rope-t-extrapolation-ratio",
             "1.5",
+            "--dynamics-use-learned-temporal-embedding",
             "--dynamics-validation-metric",
             "open_rollout_frame_mse",
         ]
@@ -123,9 +150,17 @@ def test_run_build_config_preserves_rf_dynamics_flags() -> None:
     assert config.dynamics_train_timesteps == 256
     assert config.dynamics_rf_shift == 3.5
     assert config.conditional_frame_timestep == 0.75
+    assert config.conditional_frame_sigma == 0.125
     assert config.dynamics_video_condition_dropout == 0.35
     assert config.dynamics_guidance_scale == 2.0
     assert config.dynamics_self_forcing_loss_weight == 0.4
+    assert config.dynamics_rollout_self_forcing_loss_weight == 0.15
+    assert config.dynamics_self_forcing_mode == "rollout"
+    assert config.dynamics_self_forcing_warmup_steps == 75
+    assert config.dynamics_self_forcing_ramp_steps == 125
+    assert config.dynamics_rollout_self_forcing_warmup_steps == 25
+    assert config.dynamics_rollout_self_forcing_ramp_steps == 50
+    assert config.dynamics_self_forcing_rollout_chunks == 2
     assert config.dynamics_model_channels == 384
     assert config.dynamics_num_blocks == 6
     assert config.dynamics_num_heads == 8
@@ -134,6 +169,7 @@ def test_run_build_config_preserves_rf_dynamics_flags() -> None:
     assert config.dynamics_use_adaln_lora is True
     assert config.dynamics_adaln_lora_dim == 96
     assert config.dynamics_rope_t_extrapolation_ratio == 1.5
+    assert config.dynamics_use_learned_temporal_embedding is True
     assert config.dynamics_validation_metric == "open_rollout_frame_mse"
 
 
@@ -154,6 +190,8 @@ def test_run_build_config_preserves_custom_dynamics_layout_flags() -> None:
             "1",
             "--dynamics-open-rollout-context-frames",
             "1",
+            "--dynamics-open-rollout-stride-frames",
+            "1",
         ]
     )
     config = build_config(args)
@@ -163,6 +201,7 @@ def test_run_build_config_preserves_custom_dynamics_layout_flags() -> None:
     assert config.dynamics_conditioning_frame_probabilities == (0.25, 0.75)
     assert config.dynamics_validation_conditioning_frame_choices == (1,)
     assert config.dynamics_open_rollout_context_frames == 1
+    assert config.dynamics_open_rollout_stride_frames == 1
 
 
 def test_run_build_config_preserves_kl_flag() -> None:

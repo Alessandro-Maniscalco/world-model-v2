@@ -140,6 +140,40 @@ def test_metaworld_transition_dataset_supports_custom_frame_layout(
     assert torch.equal(sample["target_frame_idx"], torch.tensor([1], dtype=torch.long))
 
 
+def test_metaworld_transition_dataset_exposes_future_rollout_targets_when_requested(
+    fake_metaworld_dataset_root: Path,
+) -> None:
+    """The MT50 transition dataset should expose future rollout targets for same-context self-forcing."""
+
+    dataset = MetaWorldTransitionDataset(
+        data_root=str(fake_metaworld_dataset_root),
+        split="train",
+        task_index=0,
+        episode=0,
+        resolution=8,
+        frame_start=0,
+        frame_end=4,
+        frame_layout=DynamicsFrameLayout(context_frames=1, target_frames=2),
+        rollout_context_frames=1,
+        rollout_chunks=1,
+    )
+
+    assert len(dataset) == 1
+    sample = dataset[0]
+    assert sample["future_target_frames"].shape == (2, 3, 8, 8)
+    assert sample["future_actions"].shape == (2, 4)
+    assert torch.equal(sample["future_target_frame_idx"], torch.tensor([3, 4], dtype=torch.long))
+    assert torch.equal(
+        sample["future_actions"],
+        torch.tensor(
+            [
+                [30.0, 31.0, 32.0, 33.0],
+                [40.0, 41.0, 42.0, 43.0],
+            ]
+        ),
+    )
+
+
 def test_resolve_metaworld_split_maps_val_to_train() -> None:
     """MT50 should treat `val` as a request for the train-only split."""
 

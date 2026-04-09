@@ -576,10 +576,24 @@ class MetaWorldTransitionDataset(Dataset[dict[str, Any]]):
         repo_id: str = METAWORLD_DATASET_ID,
         cache_dir: str | Path | None = None,
         frame_layout: DynamicsFrameLayout = DYNAMICS_FRAME_LAYOUT,
+        rollout_context_frames: int | None = None,
+        rollout_chunks: int = 0,
     ) -> None:
         """Cache one MT50 clip for the configured dynamics training windows."""
 
         self.frame_layout = frame_layout
+        self.rollout_context_frames = (
+            frame_layout.context_frames
+            if rollout_context_frames is None
+            else int(rollout_context_frames)
+        )
+        if self.rollout_context_frames < 1 or self.rollout_context_frames >= self.frame_layout.max_frames:
+            raise ValueError("rollout_context_frames must stay within [1, max_frames - 1].")
+        if rollout_chunks < 0:
+            raise ValueError("rollout_chunks must be non-negative.")
+        self.rollout_chunks = int(rollout_chunks)
+        self.rollout_target_frames = self.frame_layout.max_frames - self.rollout_context_frames
+        self.required_frames = self.frame_layout.max_frames + self.rollout_chunks * self.rollout_target_frames
         self.clip = load_metaworld_clip(
             data_root=data_root,
             split=split,
@@ -599,7 +613,7 @@ class MetaWorldTransitionDataset(Dataset[dict[str, Any]]):
         """Return the number of available dynamics windows for the configured layout."""
 
         return max(
-            int(self.clip["frames"].shape[0]) - self.frame_layout.max_frames + 1,
+            int(self.clip["frames"].shape[0]) - self.required_frames + 1,
             0,
         )
 
@@ -608,12 +622,18 @@ class MetaWorldTransitionDataset(Dataset[dict[str, Any]]):
 
         context_stop = index + self.frame_layout.context_frames
         target_stop = context_stop + self.frame_layout.target_frames
+        future_target_stop = target_stop + self.rollout_chunks * self.rollout_target_frames
+        action_stop = index + self.frame_layout.num_action_per_chunk
+        future_action_stop = action_stop + self.rollout_chunks * self.rollout_target_frames
         return {
             "context_frames": self.clip["frames"][index:context_stop],
             "target_frames": self.clip["frames"][context_stop:target_stop],
-            "actions": self.clip["actions"][index : index + self.frame_layout.num_action_per_chunk],
+            "future_target_frames": self.clip["frames"][target_stop:future_target_stop],
+            "actions": self.clip["actions"][index:action_stop],
+            "future_actions": self.clip["actions"][action_stop:future_action_stop],
             "context_frame_idx": self.clip["frame_idx"][index:context_stop],
             "target_frame_idx": self.clip["frame_idx"][context_stop:target_stop],
+            "future_target_frame_idx": self.clip["frame_idx"][target_stop:future_target_stop],
             "episode_idx": self.clip["episode_idx"],
         }
 

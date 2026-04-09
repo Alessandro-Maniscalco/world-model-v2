@@ -226,6 +226,30 @@ def test_build_command_preserves_conditional_frame_timestep() -> None:
     assert command[timestep_index + 1] == "0.0"
 
 
+def test_build_command_preserves_conditional_frame_sigma() -> None:
+    """The sweep helper should forward conditional-frame sigma explicitly."""
+
+    with patch.object(sys, "argv", ["loop_dynamics_sweep.py"]):
+        args = loop_dynamics_sweep.parse_args()
+    args.conditional_frame_sigma = 1e-4
+    command = loop_dynamics_sweep.build_command(
+        args=args,
+        spec=loop_dynamics_sweep.SweepSpec(
+            frame_start=48,
+            frame_end=67,
+            infer_steps=32,
+            batch_size=1,
+            max_steps=10,
+            lr=1e-4,
+        ),
+        run_name="smoke",
+        load_dynamics=None,
+    )
+    assert "--conditional-frame-sigma" in command
+    sigma_index = command.index("--conditional-frame-sigma")
+    assert command[sigma_index + 1] == "0.0001"
+
+
 def test_build_command_preserves_self_forcing_loss_weight() -> None:
     """The sweep helper should forward the causal self-forcing weight explicitly."""
 
@@ -250,6 +274,220 @@ def test_build_command_preserves_self_forcing_loss_weight() -> None:
     assert command[weight_index + 1] == "0.35"
 
 
+def test_build_command_preserves_rollout_self_forcing_loss_weight() -> None:
+    """The sweep helper should forward the rollout self-forcing auxiliary weight explicitly."""
+
+    with patch.object(sys, "argv", ["loop_dynamics_sweep.py"]):
+        args = loop_dynamics_sweep.parse_args()
+    args.dynamics_rollout_self_forcing_loss_weight = 0.2
+    command = loop_dynamics_sweep.build_command(
+        args=args,
+        spec=loop_dynamics_sweep.SweepSpec(
+            frame_start=48,
+            frame_end=67,
+            infer_steps=32,
+            batch_size=1,
+            max_steps=10,
+            lr=1e-4,
+        ),
+        run_name="smoke",
+        load_dynamics=None,
+    )
+    assert "--dynamics-rollout-self-forcing-loss-weight" in command
+    weight_index = command.index("--dynamics-rollout-self-forcing-loss-weight")
+    assert command[weight_index + 1] == "0.2"
+
+
+def test_build_command_preserves_self_forcing_mode() -> None:
+    """The sweep helper should forward the selected self-forcing mode explicitly."""
+
+    with patch.object(sys, "argv", ["loop_dynamics_sweep.py"]):
+        args = loop_dynamics_sweep.parse_args()
+    args.dynamics_self_forcing_mode = "rollout"
+    command = loop_dynamics_sweep.build_command(
+        args=args,
+        spec=loop_dynamics_sweep.SweepSpec(
+            frame_start=48,
+            frame_end=67,
+            infer_steps=32,
+            batch_size=1,
+            max_steps=10,
+            lr=1e-4,
+        ),
+        run_name="smoke",
+        load_dynamics=None,
+    )
+    assert "--dynamics-self-forcing-mode" in command
+    mode_index = command.index("--dynamics-self-forcing-mode")
+    assert command[mode_index + 1] == "rollout"
+
+
+def test_build_command_preserves_learned_temporal_embedding_flag() -> None:
+    """The sweep helper should forward the learned temporal embedding flag explicitly."""
+
+    with patch.object(sys, "argv", ["loop_dynamics_sweep.py"]):
+        args = loop_dynamics_sweep.parse_args()
+    args.dynamics_use_learned_temporal_embedding = True
+    command = loop_dynamics_sweep.build_command(
+        args=args,
+        spec=loop_dynamics_sweep.SweepSpec(
+            frame_start=48,
+            frame_end=67,
+            infer_steps=32,
+            batch_size=1,
+            max_steps=10,
+            lr=1e-4,
+        ),
+        run_name="smoke",
+        load_dynamics=None,
+    )
+    assert "--dynamics-use-learned-temporal-embedding" in command
+
+
+def test_build_command_preserves_self_forcing_warmup_steps() -> None:
+    """The sweep helper should forward self-forcing warmup steps explicitly."""
+
+    with patch.object(sys, "argv", ["loop_dynamics_sweep.py"]):
+        args = loop_dynamics_sweep.parse_args()
+    args.dynamics_self_forcing_warmup_steps = 125
+    command = loop_dynamics_sweep.build_command(
+        args=args,
+        spec=loop_dynamics_sweep.SweepSpec(
+            frame_start=48,
+            frame_end=67,
+            infer_steps=32,
+            batch_size=1,
+            max_steps=10,
+            lr=1e-4,
+        ),
+        run_name="smoke",
+        load_dynamics=None,
+    )
+    assert "--dynamics-self-forcing-warmup-steps" in command
+    warmup_index = command.index("--dynamics-self-forcing-warmup-steps")
+    assert command[warmup_index + 1] == "125"
+
+
+def test_build_command_preserves_self_forcing_ramp_steps() -> None:
+    """The sweep helper should forward self-forcing ramp steps explicitly."""
+
+    with patch.object(sys, "argv", ["loop_dynamics_sweep.py"]):
+        args = loop_dynamics_sweep.parse_args()
+    args.dynamics_self_forcing_ramp_steps = 200
+    command = loop_dynamics_sweep.build_command(
+        args=args,
+        spec=loop_dynamics_sweep.SweepSpec(
+            frame_start=48,
+            frame_end=67,
+            infer_steps=32,
+            batch_size=1,
+            max_steps=10,
+            lr=1e-4,
+        ),
+        run_name="smoke",
+        load_dynamics=None,
+    )
+    assert "--dynamics-self-forcing-ramp-steps" in command
+    ramp_index = command.index("--dynamics-self-forcing-ramp-steps")
+    assert command[ramp_index + 1] == "200"
+
+
+def test_build_command_preserves_rollout_self_forcing_warmup_steps() -> None:
+    """The sweep helper should forward rollout self-forcing warmup steps explicitly."""
+
+    with patch.object(sys, "argv", ["loop_dynamics_sweep.py"]):
+        args = loop_dynamics_sweep.parse_args()
+    args.dynamics_rollout_self_forcing_warmup_steps = 50
+    command = loop_dynamics_sweep.build_command(
+        args=args,
+        spec=loop_dynamics_sweep.SweepSpec(
+            frame_start=48,
+            frame_end=67,
+            infer_steps=32,
+            batch_size=1,
+            max_steps=10,
+            lr=1e-4,
+        ),
+        run_name="smoke",
+        load_dynamics=None,
+    )
+    assert "--dynamics-rollout-self-forcing-warmup-steps" in command
+    warmup_index = command.index("--dynamics-rollout-self-forcing-warmup-steps")
+    assert command[warmup_index + 1] == "50"
+
+
+def test_build_command_preserves_rollout_self_forcing_ramp_steps() -> None:
+    """The sweep helper should forward rollout self-forcing ramp steps explicitly."""
+
+    with patch.object(sys, "argv", ["loop_dynamics_sweep.py"]):
+        args = loop_dynamics_sweep.parse_args()
+    args.dynamics_rollout_self_forcing_ramp_steps = 100
+    command = loop_dynamics_sweep.build_command(
+        args=args,
+        spec=loop_dynamics_sweep.SweepSpec(
+            frame_start=48,
+            frame_end=67,
+            infer_steps=32,
+            batch_size=1,
+            max_steps=10,
+            lr=1e-4,
+        ),
+        run_name="smoke",
+        load_dynamics=None,
+    )
+    assert "--dynamics-rollout-self-forcing-ramp-steps" in command
+    ramp_index = command.index("--dynamics-rollout-self-forcing-ramp-steps")
+    assert command[ramp_index + 1] == "100"
+
+
+def test_build_command_preserves_self_forcing_rollout_chunks() -> None:
+    """The sweep helper should forward rollout self-forcing chunk counts explicitly."""
+
+    with patch.object(sys, "argv", ["loop_dynamics_sweep.py"]):
+        args = loop_dynamics_sweep.parse_args()
+    args.dynamics_self_forcing_rollout_chunks = 2
+    command = loop_dynamics_sweep.build_command(
+        args=args,
+        spec=loop_dynamics_sweep.SweepSpec(
+            frame_start=48,
+            frame_end=67,
+            infer_steps=32,
+            batch_size=1,
+            max_steps=10,
+            lr=1e-4,
+        ),
+        run_name="smoke",
+        load_dynamics=None,
+    )
+    assert "--dynamics-self-forcing-rollout-chunks" in command
+    chunks_index = command.index("--dynamics-self-forcing-rollout-chunks")
+    assert command[chunks_index + 1] == "2"
+
+
+def test_build_command_preserves_open_rollout_stride_frames() -> None:
+    """The sweep helper should forward open-rollout stride frames explicitly."""
+
+    with patch.object(sys, "argv", ["loop_dynamics_sweep.py"]):
+        args = loop_dynamics_sweep.parse_args()
+    args.dynamics_open_rollout_stride_frames = 1
+    command = loop_dynamics_sweep.build_command(
+        args=args,
+        spec=loop_dynamics_sweep.SweepSpec(
+            frame_start=48,
+            frame_end=67,
+            infer_steps=32,
+            batch_size=1,
+            max_steps=10,
+            lr=1e-4,
+        ),
+        run_name="smoke",
+        load_dynamics=None,
+    )
+    assert "--dynamics-open-rollout-stride-frames" in command
+    stride_index = command.index("--dynamics-open-rollout-stride-frames")
+    assert command[stride_index + 1] == "1"
+
+
 def test_build_open_rollout_eval_command_uses_fixed_eval_span() -> None:
     """The sweep helper should build a fixed-span rollout-eval command when requested."""
 
@@ -272,6 +510,25 @@ def test_build_open_rollout_eval_command_uses_fixed_eval_span() -> None:
     assert "--frame-end" in command
     assert command[command.index("--frame-start") + 1] == "48"
     assert command[command.index("--frame-end") + 1] == "67"
+
+
+def test_build_open_rollout_eval_command_preserves_overlap_stride() -> None:
+    """The rollout-eval command should preserve the configured overlap stride."""
+
+    with patch.object(sys, "argv", ["loop_dynamics_sweep.py"]):
+        args = loop_dynamics_sweep.parse_args()
+    args.dynamics_open_rollout_stride_frames = 1
+    command = loop_dynamics_sweep.build_open_rollout_eval_command(
+        args,
+        checkpoint_path=Path("/tmp/best.pt"),
+        output_dir=Path("/tmp/eval"),
+        frame_start=48,
+        frame_end=67,
+    )
+    assert command is not None
+    assert "--dynamics-open-rollout-stride-frames" in command
+    stride_index = command.index("--dynamics-open-rollout-stride-frames")
+    assert command[stride_index + 1] == "1"
 
 
 def test_evaluate_open_rollout_aggregates_multiple_spans() -> None:

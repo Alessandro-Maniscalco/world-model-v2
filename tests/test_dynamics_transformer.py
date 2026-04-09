@@ -16,12 +16,15 @@ def build_dynamics(
     *,
     context_frames: int = DYNAMICS_FRAME_LAYOUT.context_frames,
     target_frames: int = DYNAMICS_FRAME_LAYOUT.target_frames,
+    conditional_frame_sigma: float = 0.0,
     conditioning_frame_choices: tuple[int, ...] | None = None,
     conditioning_frame_probabilities: tuple[float, ...] | None = None,
     validation_conditioning_frame_choices: tuple[int, ...] | None = None,
     open_rollout_context_frames: int | None = None,
+    open_rollout_stride_frames: int | None = None,
     action_conditioning_mode: str = "chunk_per_frame",
     zero_init_action_embedder: bool = False,
+    use_learned_temporal_embedding: bool = False,
 ) -> RectifiedFlowDynamics:
     """Create a small RF DiT dynamics module for unit tests."""
 
@@ -36,6 +39,7 @@ def build_dynamics(
             conditioning_frame_probabilities=conditioning_frame_probabilities,
             validation_conditioning_frame_choices=validation_conditioning_frame_choices,
             open_rollout_context_frames=open_rollout_context_frames,
+            open_rollout_stride_frames=open_rollout_stride_frames,
             in_channels=4,
             out_channels=4,
             patch_spatial=2,
@@ -46,6 +50,8 @@ def build_dynamics(
             action_dim=4,
             action_conditioning_mode=action_conditioning_mode,
             zero_init_action_embedder=zero_init_action_embedder,
+            use_learned_temporal_embedding=use_learned_temporal_embedding,
+            conditional_frame_sigma=conditional_frame_sigma,
             dynamics_infer_steps=4,
             dynamics_train_timesteps=32,
             dynamics_rf_shift=5.0,
@@ -74,6 +80,16 @@ def test_rf_dit_forward_preserves_video_shape() -> None:
     )
     assert output.shape == noisy_latent_video.shape
     assert torch.isfinite(output).all()
+
+
+def test_rf_dit_can_add_learned_temporal_embedding() -> None:
+    """The tiny DiT should optionally carry one learned temporal token bias."""
+
+    dynamics = build_dynamics(use_learned_temporal_embedding=True)
+
+    assert dynamics.cfg.use_learned_temporal_embedding is True
+    assert dynamics.net.temporal_pos_embed is not None
+    assert dynamics.net.temporal_pos_embed.shape == (1, dynamics.cfg.max_frames, 1, 1, 64)
 
 
 def test_prepare_training_inputs_uses_full_clip_rf_interpolation() -> None:
@@ -161,7 +177,7 @@ def test_recover_clean_latent_video_inverts_rf_parameterization() -> None:
         target_sigmas=sigmas,
     )
 
-    assert torch.allclose(recovered, clean)
+    assert torch.allclose(recovered, clean, atol=1e-6, rtol=1e-6)
 
 
 def test_make_zero_actions_matches_transition_chunk_shape() -> None:
@@ -189,6 +205,22 @@ def test_prepare_training_inputs_respects_conditioning_frame_probabilities() -> 
     prepared = dynamics.prepare_training_inputs(clean_latent_video)
 
     assert prepared.num_conditional_frames.tolist() == [1, 1, 1, 1, 1, 1]
+
+
+def test_config_preserves_open_rollout_stride_frames() -> None:
+    """The RF dynamics config should retain an explicit rollout overlap stride."""
+
+    dynamics = build_dynamics(
+        context_frames=1,
+        target_frames=2,
+        conditioning_frame_choices=(1,),
+        conditioning_frame_probabilities=(1.0,),
+        validation_conditioning_frame_choices=(1,),
+        open_rollout_context_frames=1,
+        open_rollout_stride_frames=1,
+    )
+
+    assert dynamics.cfg.open_rollout_stride_frames == 1
 
 
 def test_forward_rejects_wrong_action_horizon() -> None:
@@ -572,6 +604,100 @@ def test_forward_applies_conditional_frame_timestep_override(
     )
     assert torch.allclose(captured["timesteps"][:, :3], torch.full((1, 3), 0.5))
     assert torch.allclose(captured["timesteps"][:, 3:], torch.full((1, 2), 12.0))
+
+
+def test_forward_applies_conditional_frame_sigma_to_repinning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Conditioned frames should be repinned with the configured tiny sigma during training."""
+
+    dynamics = build_dynamics(conditional_frame_sigma=0.25)
+    conditioning_latent_video = torch.zeros(1, 4, 5, 8, 8)
+    noisy_latent_video = torch.full_like(conditioning_latent_video, 9.0)
+    target_velocity = torch.ones_like(conditioning_latent_video)
+    timesteps = torch.full((1, 5), 12.0)
+    condition_mask = dynamics.make_condition_mask(
+        conditioning_latent_video,
+        num_conditional_frames=3,
+    )
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_forward(
+        *,
+        x_B_C_T_H_W: torch.Tensor,
+        timesteps_B_T: torch.Tensor,
+        condition_video_input_mask_B_C_T_H_W: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Capture the repinned DiT input after conditional-sigma preprocessing."""
+
+        del timesteps_B_T, condition_video_input_mask_B_C_T_H_W, action
+        captured["x"] = x_B_C_T_H_W.detach().clone()
+        return torch.zeros_like(x_B_C_T_H_W)
+
+    monkeypatch.setattr(dynamics.net, "forward", fake_forward)
+    dynamics(
+        noisy_latent_video=noisy_latent_video,
+        timesteps=timesteps,
+        condition_mask=condition_mask,
+        actions=None,
+        conditioning_latent_video=conditioning_latent_video,
+        target_velocity=target_velocity,
+    )
+    assert torch.allclose(captured["x"][:, :, :3], torch.full((1, 4, 3, 8, 8), 0.25))
+    assert torch.allclose(captured["x"][:, :, 3:], torch.full((1, 4, 2, 8, 8), 9.0))
+
+
+def test_sample_conditioned_latent_video_repins_context_with_conditional_sigma(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sampling should pin context frames at the configured tiny conditioning sigma."""
+
+    dynamics = build_dynamics(
+        context_frames=2,
+        target_frames=3,
+        conditional_frame_sigma=0.1,
+        conditioning_frame_choices=(2,),
+        conditioning_frame_probabilities=(1.0,),
+        validation_conditioning_frame_choices=(2,),
+        open_rollout_context_frames=2,
+    )
+    conditioning_latent_video = torch.zeros(1, 4, 5, 8, 8)
+    generator = torch.Generator(device="cpu").manual_seed(123)
+    expected_noise = torch.randn(
+        1,
+        4,
+        5,
+        8,
+        8,
+        generator=torch.Generator(device="cpu").manual_seed(123),
+    )
+    captured: dict[str, torch.Tensor] = {}
+
+    monkeypatch.setattr(
+        dynamics.flow,
+        "make_inference_schedule",
+        lambda num_steps, device, dtype: (
+            torch.tensor([1.0], device=device, dtype=dtype),
+            torch.tensor([1.0, 0.0], device=device, dtype=dtype),
+        ),
+    )
+
+    def fake_forward(**kwargs: torch.Tensor) -> torch.Tensor:
+        """Capture the denoising input passed into the first sampling step."""
+
+        captured["x"] = kwargs["noisy_latent_video"].detach().clone()
+        return torch.zeros_like(kwargs["noisy_latent_video"])
+
+    monkeypatch.setattr(dynamics, "forward", fake_forward)
+    dynamics.sample_conditioned_latent_video(
+        conditioning_latent_video=conditioning_latent_video,
+        num_conditional_frames=2,
+        generator=generator,
+        infer_steps=1,
+    )
+    assert torch.allclose(captured["x"][:, :, :2], expected_noise[:, :, :2] * 0.1)
+    assert torch.allclose(captured["x"][:, :, 2:], expected_noise[:, :, 2:])
 
 
 def test_sample_conditioned_latent_video_uses_cfg_guidance(

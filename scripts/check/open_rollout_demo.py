@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--dynamics-infer-steps", type=int, default=None)
+    parser.add_argument("--dynamics-open-rollout-stride-frames", type=int, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir", default="outputs/open_rollout_demo")
     parser.add_argument("--run-name", default="")
@@ -79,6 +80,9 @@ def build_model_from_checkpoint(
         conditional_frame_timestep=float(
             dynamics_config.get("conditional_frame_timestep", config.get("conditional_frame_timestep", -1.0))
         ),
+        conditional_frame_sigma=float(
+            dynamics_config.get("conditional_frame_sigma", config.get("conditional_frame_sigma", 0.0))
+        ),
         dynamics_video_condition_dropout=float(
             dynamics_config.get(
                 "dynamics_video_condition_dropout",
@@ -109,6 +113,10 @@ def build_model_from_checkpoint(
         dynamics_open_rollout_context_frames=dynamics_config.get(
             "open_rollout_context_frames",
             config.get("dynamics_open_rollout_context_frames"),
+        ),
+        dynamics_open_rollout_stride_frames=dynamics_config.get(
+            "open_rollout_stride_frames",
+            config.get("dynamics_open_rollout_stride_frames"),
         ),
         dynamics_model_channels=int(
             dynamics_config.get("model_channels", config.get("dynamics_model_channels", 256))
@@ -141,6 +149,12 @@ def build_model_from_checkpoint(
             dynamics_config.get(
                 "rope_t_extrapolation_ratio",
                 config.get("dynamics_rope_t_extrapolation_ratio", 1.0),
+            )
+        ),
+        dynamics_use_learned_temporal_embedding=bool(
+            dynamics_config.get(
+                "use_learned_temporal_embedding",
+                config.get("dynamics_use_learned_temporal_embedding", False),
             )
         ),
     ).to(device)
@@ -192,7 +206,12 @@ def main() -> None:
             "Open rollout requires more frames than the configured context window."
         )
     with torch.no_grad():
-        rollout = model.rollout(seed_frames, steps=rollout_steps, actions=actions)
+        rollout = model.rollout(
+            seed_frames,
+            steps=rollout_steps,
+            actions=actions,
+            stride_frames=args.dynamics_open_rollout_stride_frames,
+        )
     original = frames[0].detach().cpu()
     predicted = rollout[0].detach().cpu()
     predicted_only = predicted[seed_context_frames:]
@@ -205,6 +224,11 @@ def main() -> None:
         "predicted_frame_count": int(predicted.shape[0]),
         "seed_frames": int(seed_context_frames),
         "loss_frames": int(rollout_steps),
+        "open_rollout_stride_frames": (
+            model.dynamics.cfg.open_rollout_stride_frames
+            if args.dynamics_open_rollout_stride_frames is None
+            else int(args.dynamics_open_rollout_stride_frames)
+        ),
         "open_rollout_frame_mse": float(F.mse_loss(predicted_only, target_only).item()),
         "open_rollout_frame_l1": float(F.l1_loss(predicted_only, target_only).item()),
         "dynamics_infer_steps": int(model.dynamics.cfg.dynamics_infer_steps),

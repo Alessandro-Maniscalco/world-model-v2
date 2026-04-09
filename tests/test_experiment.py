@@ -144,22 +144,26 @@ def test_experiment_supports_custom_dynamics_layout_controls(
             frame_start=111,
             frame_end=112,
             load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            conditional_frame_sigma=1e-4,
             dynamics_context_frames=1,
             dynamics_target_frames=1,
             dynamics_conditioning_frame_choices=(1,),
             dynamics_conditioning_frame_probabilities=(1.0,),
             dynamics_validation_conditioning_frame_choices=(1,),
             dynamics_open_rollout_context_frames=1,
+            dynamics_open_rollout_stride_frames=1,
             device="cpu",
         )
     )
 
     assert experiment.model.dynamics.cfg.context_frames == 1
     assert experiment.model.dynamics.cfg.target_frames == 1
+    assert experiment.model.dynamics.cfg.conditional_frame_sigma == pytest.approx(1e-4)
     assert experiment.model.dynamics.cfg.conditioning_frame_choices == (1,)
     assert experiment.model.dynamics.cfg.conditioning_frame_probabilities == (1.0,)
     assert experiment.model.dynamics.cfg.validation_conditioning_frame_choices == (1,)
     assert experiment.model.dynamics.cfg.open_rollout_context_frames == 1
+    assert experiment.model.dynamics.cfg.open_rollout_stride_frames == 1
     assert len(experiment.train_dataset) == 1
 
 
@@ -177,6 +181,222 @@ def test_experiment_rejects_negative_self_forcing_weight(
                 output_dir=str(tmp_path / "outputs"),
                 run_name="negative_self_forcing",
                 dynamics_self_forcing_loss_weight=-0.1,
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_rejects_negative_rollout_self_forcing_weight(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Negative rollout self-forcing weights should fail fast during config validation."""
+
+    with pytest.raises(ValueError, match="dynamics_rollout_self_forcing_loss_weight"):
+        Experiment(
+            ExperimentConfig(
+                mode="ae_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="negative_rollout_self_forcing",
+                dynamics_rollout_self_forcing_loss_weight=-0.1,
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_rejects_negative_self_forcing_warmup_steps(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Negative self-forcing warmup steps should fail fast during config validation."""
+
+    with pytest.raises(ValueError, match="dynamics_self_forcing_warmup_steps"):
+        Experiment(
+            ExperimentConfig(
+                mode="ae_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="negative_self_forcing_warmup",
+                dynamics_self_forcing_warmup_steps=-1,
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_rejects_negative_self_forcing_ramp_steps(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Negative self-forcing ramp steps should fail fast during config validation."""
+
+    with pytest.raises(ValueError, match="dynamics_self_forcing_ramp_steps"):
+        Experiment(
+            ExperimentConfig(
+                mode="ae_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="negative_self_forcing_ramp",
+                dynamics_self_forcing_ramp_steps=-1,
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_rejects_negative_rollout_self_forcing_warmup_steps(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Negative rollout self-forcing warmup steps should fail fast during config validation."""
+
+    with pytest.raises(ValueError, match="dynamics_rollout_self_forcing_warmup_steps"):
+        Experiment(
+            ExperimentConfig(
+                mode="ae_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="negative_rollout_self_forcing_warmup",
+                dynamics_rollout_self_forcing_warmup_steps=-1,
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_rejects_negative_rollout_self_forcing_ramp_steps(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Negative rollout self-forcing ramp steps should fail fast during config validation."""
+
+    with pytest.raises(ValueError, match="dynamics_rollout_self_forcing_ramp_steps"):
+        Experiment(
+            ExperimentConfig(
+                mode="ae_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="negative_rollout_self_forcing_ramp",
+                dynamics_rollout_self_forcing_ramp_steps=-1,
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_rejects_unknown_self_forcing_mode(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Unknown self-forcing modes should fail fast during config validation."""
+
+    with pytest.raises(ValueError, match="dynamics_self_forcing_mode"):
+        Experiment(
+            ExperimentConfig(
+                mode="ae_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="invalid_self_forcing_mode",
+                dynamics_self_forcing_mode="bad_mode",
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_rejects_negative_self_forcing_rollout_chunks(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Negative rollout chunk counts should fail fast during config validation."""
+
+    with pytest.raises(ValueError, match="dynamics_self_forcing_rollout_chunks"):
+        Experiment(
+            ExperimentConfig(
+                mode="ae_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="negative_self_forcing_rollout_chunks",
+                dynamics_self_forcing_rollout_chunks=-1,
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_rejects_rollout_self_forcing_without_future_chunks(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Rollout self-forcing should require at least one extra future chunk."""
+
+    with pytest.raises(ValueError, match="dynamics_self_forcing_rollout_chunks"):
+        Experiment(
+            ExperimentConfig(
+                mode="dynamics_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="missing_rollout_chunks",
+                dynamics_self_forcing_loss_weight=0.5,
+                dynamics_self_forcing_mode="rollout",
+                dynamics_self_forcing_rollout_chunks=0,
+                load_encoder_decoder="unused.pt",
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_rejects_duplicate_rollout_self_forcing_configuration(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Rollout mode should not also receive the additive rollout auxiliary weight."""
+
+    with pytest.raises(ValueError, match="dynamics_rollout_self_forcing_loss_weight"):
+        Experiment(
+            ExperimentConfig(
+                mode="dynamics_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="duplicate_rollout_self_forcing",
+                dynamics_self_forcing_loss_weight=0.5,
+                dynamics_rollout_self_forcing_loss_weight=0.25,
+                dynamics_self_forcing_mode="rollout",
+                dynamics_self_forcing_rollout_chunks=1,
+                load_encoder_decoder="unused.pt",
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_rejects_out_of_range_conditional_frame_sigma(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Conditioning sigma outside `[0, 1]` should fail fast during config validation."""
+
+    with pytest.raises(ValueError, match="conditional_frame_sigma"):
+        Experiment(
+            ExperimentConfig(
+                mode="ae_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="invalid_conditional_sigma",
+                conditional_frame_sigma=1.5,
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_rejects_non_positive_open_rollout_stride(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Non-positive rollout stride should fail fast during config validation."""
+
+    with pytest.raises(ValueError, match="dynamics_open_rollout_stride_frames"):
+        Experiment(
+            ExperimentConfig(
+                mode="ae_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="invalid_rollout_stride",
+                dynamics_open_rollout_stride_frames=0,
                 device="cpu",
             )
         )
@@ -210,7 +430,9 @@ def test_dynamics_training_step_adds_weighted_self_forcing_loss(
     batch = {
         "context_frames": torch.randn(2, 1, 3, 8, 8),
         "target_frames": torch.randn(2, 2, 3, 8, 8),
+        "future_target_frames": torch.empty(2, 0, 3, 8, 8),
         "actions": torch.zeros(2, 2, 4),
+        "future_actions": torch.empty(2, 0, 4),
     }
     clean_latent_video = torch.randn(2, 4, 3, 8, 8)
     target_velocity = torch.zeros_like(clean_latent_video)
@@ -264,6 +486,498 @@ def test_dynamics_training_step_adds_weighted_self_forcing_loss(
     assert loss_dict["latent_rf_total_loss"] == pytest.approx(2.0)
     assert loss_dict["loss"] == pytest.approx(2.0)
     assert loss_dict["latent_rf_self_forcing_mse_ctx2"] == pytest.approx(2.0)
+    assert loss_dict["active_rollout_self_forcing_loss_weight"] == pytest.approx(0.0)
+
+
+def test_dynamics_training_step_adds_rollout_self_forcing_auxiliary_loss(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dynamics training should support a rollout auxiliary on top of the primary self-forcing loss."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="hybrid_self_forcing_loss",
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            dynamics_context_frames=1,
+            dynamics_target_frames=2,
+            dynamics_conditioning_frame_choices=(1,),
+            dynamics_conditioning_frame_probabilities=(1.0,),
+            dynamics_validation_conditioning_frame_choices=(1,),
+            dynamics_open_rollout_context_frames=1,
+            dynamics_self_forcing_loss_weight=0.5,
+            dynamics_rollout_self_forcing_loss_weight=0.25,
+            dynamics_self_forcing_rollout_chunks=1,
+            device="cpu",
+        )
+    )
+    batch = {
+        "context_frames": torch.randn(2, 1, 3, 8, 8),
+        "target_frames": torch.randn(2, 2, 3, 8, 8),
+        "future_target_frames": torch.randn(2, 2, 3, 8, 8),
+        "actions": torch.zeros(2, 2, 4),
+        "future_actions": torch.zeros(2, 2, 4),
+    }
+    clean_latent_video = torch.randn(2, 4, 3, 8, 8)
+    future_target_latent_video = torch.randn(2, 4, 2, 8, 8)
+    target_velocity = torch.zeros_like(clean_latent_video)
+    predicted_velocity = torch.ones_like(clean_latent_video)
+    dynamics_inputs = DynamicsTrainingInputs(
+        noisy_latent_video=torch.zeros_like(clean_latent_video),
+        conditioning_latent_video=clean_latent_video,
+        target_velocity=target_velocity,
+        timesteps=torch.ones(2, 3),
+        condition_mask=torch.zeros(2, 1, 3, 8, 8),
+        actions=batch["actions"],
+        target_sigmas=torch.ones(2),
+        num_conditional_frames=torch.ones(2, dtype=torch.long),
+        use_video_condition=torch.ones(2, dtype=torch.bool),
+    )
+
+    monkeypatch.setattr(
+        experiment.model,
+        "encode_context_frames",
+        lambda images, deterministic=True: clean_latent_video[:, :, :1],
+    )
+
+    def fake_encode_frame_sequence(images: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+        """Return the right latent slice for target versus future-target encoding."""
+
+        del deterministic
+        if images.shape[1] == 2 and torch.equal(images, batch["target_frames"]):
+            return clean_latent_video[:, :, 1:]
+        if images.shape[1] == 2 and torch.equal(images, batch["future_target_frames"]):
+            return future_target_latent_video
+        raise AssertionError("Unexpected image batch passed to encode_frame_sequence.")
+
+    monkeypatch.setattr(experiment.model, "encode_frame_sequence", fake_encode_frame_sequence)
+    monkeypatch.setattr(
+        experiment.model.dynamics,
+        "prepare_training_inputs",
+        lambda clean_latent_video, actions=None: dynamics_inputs,
+    )
+    monkeypatch.setattr(
+        experiment.model.dynamics,
+        "forward",
+        lambda **kwargs: predicted_velocity,
+    )
+    monkeypatch.setattr(
+        experiment,
+        "_dynamics_self_forcing_loss",
+        lambda **kwargs: (
+            torch.tensor(2.0),
+            {"latent_rf_self_forcing_mse_ctx2": torch.tensor(2.0)},
+        ),
+    )
+    monkeypatch.setattr(
+        experiment,
+        "_dynamics_rollout_self_forcing_loss",
+        lambda **kwargs: (
+            torch.tensor(4.0),
+            {"latent_rf_self_forcing_rollout_mse_chunk1": torch.tensor(4.0)},
+        ),
+    )
+
+    loss_dict = experiment._dynamics_only_training_step(batch)
+
+    assert loss_dict["latent_rf_mse"] == pytest.approx(1.0)
+    assert loss_dict["latent_rf_self_forcing_mse"] == pytest.approx(2.0)
+    assert loss_dict["latent_rf_self_forcing_weighted_loss"] == pytest.approx(1.0)
+    assert loss_dict["latent_rf_rollout_self_forcing_mse"] == pytest.approx(4.0)
+    assert loss_dict["latent_rf_rollout_self_forcing_weighted_loss"] == pytest.approx(1.0)
+    assert loss_dict["active_rollout_self_forcing_loss_weight"] == pytest.approx(0.25)
+    assert loss_dict["latent_rf_total_loss"] == pytest.approx(3.0)
+    assert loss_dict["loss"] == pytest.approx(3.0)
+
+
+def test_dynamics_training_step_disables_self_forcing_during_warmup(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dynamics training should keep self-forcing inactive until the warmup window ends."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="self_forcing_warmup",
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            dynamics_context_frames=1,
+            dynamics_target_frames=2,
+            dynamics_conditioning_frame_choices=(1,),
+            dynamics_conditioning_frame_probabilities=(1.0,),
+            dynamics_validation_conditioning_frame_choices=(1,),
+            dynamics_open_rollout_context_frames=1,
+            dynamics_self_forcing_loss_weight=0.5,
+            dynamics_self_forcing_warmup_steps=10,
+            device="cpu",
+        )
+    )
+    batch = {
+        "context_frames": torch.randn(2, 1, 3, 8, 8),
+        "target_frames": torch.randn(2, 2, 3, 8, 8),
+        "future_target_frames": torch.empty(2, 0, 3, 8, 8),
+        "actions": torch.zeros(2, 2, 4),
+        "future_actions": torch.empty(2, 0, 4),
+    }
+    clean_latent_video = torch.randn(2, 4, 3, 8, 8)
+    target_velocity = torch.zeros_like(clean_latent_video)
+    predicted_velocity = torch.ones_like(clean_latent_video)
+    dynamics_inputs = DynamicsTrainingInputs(
+        noisy_latent_video=torch.zeros_like(clean_latent_video),
+        conditioning_latent_video=clean_latent_video,
+        target_velocity=target_velocity,
+        timesteps=torch.ones(2, 3),
+        condition_mask=torch.zeros(2, 1, 3, 8, 8),
+        actions=batch["actions"],
+        target_sigmas=torch.ones(2),
+        num_conditional_frames=torch.ones(2, dtype=torch.long),
+        use_video_condition=torch.ones(2, dtype=torch.bool),
+    )
+    captured_loss_weight: list[float] = []
+
+    monkeypatch.setattr(
+        experiment.model,
+        "encode_context_frames",
+        lambda images, deterministic=True: clean_latent_video[:, :, :1],
+    )
+    monkeypatch.setattr(
+        experiment.model,
+        "encode_frame_sequence",
+        lambda images, deterministic=True: clean_latent_video[:, :, 1:],
+    )
+    monkeypatch.setattr(
+        experiment.model.dynamics,
+        "prepare_training_inputs",
+        lambda clean_latent_video, actions=None: dynamics_inputs,
+    )
+    monkeypatch.setattr(
+        experiment.model.dynamics,
+        "forward",
+        lambda **kwargs: predicted_velocity,
+    )
+
+    def fake_self_forcing_loss(**kwargs: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Record the active warmup-controlled loss weight before returning a dummy loss."""
+
+        captured_loss_weight.append(float(kwargs["loss_weight"]))
+        return torch.tensor(2.0), {"latent_rf_self_forcing_mse_ctx2": torch.tensor(2.0)}
+
+    monkeypatch.setattr(experiment, "_dynamics_self_forcing_loss", fake_self_forcing_loss)
+
+    loss_dict = experiment._dynamics_only_training_step(batch)
+
+    assert captured_loss_weight == [0.0]
+    assert loss_dict["active_self_forcing_loss_weight"] == pytest.approx(0.0)
+    assert loss_dict["latent_rf_self_forcing_weighted_loss"] == pytest.approx(0.0)
+    assert loss_dict["loss"] == pytest.approx(1.0)
+
+
+def test_dynamics_training_step_ramps_self_forcing_weight_after_warmup(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dynamics training should linearly ramp self-forcing weight after warmup."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="self_forcing_ramp",
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            dynamics_context_frames=1,
+            dynamics_target_frames=2,
+            dynamics_conditioning_frame_choices=(1,),
+            dynamics_conditioning_frame_probabilities=(1.0,),
+            dynamics_validation_conditioning_frame_choices=(1,),
+            dynamics_open_rollout_context_frames=1,
+            dynamics_self_forcing_loss_weight=0.5,
+            dynamics_self_forcing_warmup_steps=10,
+            dynamics_self_forcing_ramp_steps=20,
+            device="cpu",
+        )
+    )
+    batch = {
+        "context_frames": torch.randn(2, 1, 3, 8, 8),
+        "target_frames": torch.randn(2, 2, 3, 8, 8),
+        "future_target_frames": torch.empty(2, 0, 3, 8, 8),
+        "actions": torch.zeros(2, 2, 4),
+        "future_actions": torch.empty(2, 0, 4),
+    }
+    clean_latent_video = torch.randn(2, 4, 3, 8, 8)
+    target_velocity = torch.zeros_like(clean_latent_video)
+    predicted_velocity = torch.ones_like(clean_latent_video)
+    dynamics_inputs = DynamicsTrainingInputs(
+        noisy_latent_video=torch.zeros_like(clean_latent_video),
+        conditioning_latent_video=clean_latent_video,
+        target_velocity=target_velocity,
+        timesteps=torch.ones(2, 3),
+        condition_mask=torch.zeros(2, 1, 3, 8, 8),
+        actions=batch["actions"],
+        target_sigmas=torch.ones(2),
+        num_conditional_frames=torch.ones(2, dtype=torch.long),
+        use_video_condition=torch.ones(2, dtype=torch.bool),
+    )
+    captured_loss_weight: list[float] = []
+
+    monkeypatch.setattr(
+        experiment.model,
+        "encode_context_frames",
+        lambda images, deterministic=True: clean_latent_video[:, :, :1],
+    )
+    monkeypatch.setattr(
+        experiment.model,
+        "encode_frame_sequence",
+        lambda images, deterministic=True: clean_latent_video[:, :, 1:],
+    )
+    monkeypatch.setattr(
+        experiment.model.dynamics,
+        "prepare_training_inputs",
+        lambda clean_latent_video, actions=None: dynamics_inputs,
+    )
+    monkeypatch.setattr(
+        experiment.model.dynamics,
+        "forward",
+        lambda **kwargs: predicted_velocity,
+    )
+
+    def fake_self_forcing_loss(**kwargs: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Record the active ramp-controlled loss weight before returning a dummy loss."""
+
+        captured_loss_weight.append(float(kwargs["loss_weight"]))
+        return torch.tensor(2.0), {"latent_rf_self_forcing_mse_ctx2": torch.tensor(2.0)}
+
+    monkeypatch.setattr(experiment, "_dynamics_self_forcing_loss", fake_self_forcing_loss)
+    experiment.current_step = 19
+
+    loss_dict = experiment._dynamics_only_training_step(batch)
+
+    assert captured_loss_weight == [pytest.approx(0.25)]
+    assert loss_dict["active_self_forcing_loss_weight"] == pytest.approx(0.25)
+    assert loss_dict["latent_rf_self_forcing_weighted_loss"] == pytest.approx(0.5)
+    assert loss_dict["loss"] == pytest.approx(1.5)
+
+
+def test_dynamics_training_step_delays_rollout_self_forcing_auxiliary_during_own_warmup(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rollout auxiliary should stay inactive until its own warmup window ends."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="rollout_aux_warmup",
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            dynamics_context_frames=1,
+            dynamics_target_frames=2,
+            dynamics_conditioning_frame_choices=(1,),
+            dynamics_conditioning_frame_probabilities=(1.0,),
+            dynamics_validation_conditioning_frame_choices=(1,),
+            dynamics_open_rollout_context_frames=1,
+            dynamics_self_forcing_loss_weight=0.5,
+            dynamics_rollout_self_forcing_loss_weight=0.25,
+            dynamics_rollout_self_forcing_warmup_steps=10,
+            dynamics_self_forcing_rollout_chunks=1,
+            device="cpu",
+        )
+    )
+    batch = {
+        "context_frames": torch.randn(2, 1, 3, 8, 8),
+        "target_frames": torch.randn(2, 2, 3, 8, 8),
+        "future_target_frames": torch.randn(2, 2, 3, 8, 8),
+        "actions": torch.zeros(2, 2, 4),
+        "future_actions": torch.zeros(2, 2, 4),
+    }
+    clean_latent_video = torch.randn(2, 4, 3, 8, 8)
+    future_target_latent_video = torch.randn(2, 4, 2, 8, 8)
+    target_velocity = torch.zeros_like(clean_latent_video)
+    predicted_velocity = torch.ones_like(clean_latent_video)
+    dynamics_inputs = DynamicsTrainingInputs(
+        noisy_latent_video=torch.zeros_like(clean_latent_video),
+        conditioning_latent_video=clean_latent_video,
+        target_velocity=target_velocity,
+        timesteps=torch.ones(2, 3),
+        condition_mask=torch.zeros(2, 1, 3, 8, 8),
+        actions=batch["actions"],
+        target_sigmas=torch.ones(2),
+        num_conditional_frames=torch.ones(2, dtype=torch.long),
+        use_video_condition=torch.ones(2, dtype=torch.bool),
+    )
+
+    monkeypatch.setattr(
+        experiment.model,
+        "encode_context_frames",
+        lambda images, deterministic=True: clean_latent_video[:, :, :1],
+    )
+
+    def fake_encode_frame_sequence(images: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+        """Return the right latent slice for target versus future-target encoding."""
+
+        del deterministic
+        if images.shape[1] == 2 and torch.equal(images, batch["target_frames"]):
+            return clean_latent_video[:, :, 1:]
+        if images.shape[1] == 2 and torch.equal(images, batch["future_target_frames"]):
+            return future_target_latent_video
+        raise AssertionError("Unexpected image batch passed to encode_frame_sequence.")
+
+    monkeypatch.setattr(experiment.model, "encode_frame_sequence", fake_encode_frame_sequence)
+    monkeypatch.setattr(
+        experiment.model.dynamics,
+        "prepare_training_inputs",
+        lambda clean_latent_video, actions=None: dynamics_inputs,
+    )
+    monkeypatch.setattr(
+        experiment.model.dynamics,
+        "forward",
+        lambda **kwargs: predicted_velocity,
+    )
+    monkeypatch.setattr(
+        experiment,
+        "_dynamics_self_forcing_loss",
+        lambda **kwargs: (
+            torch.tensor(2.0),
+            {"latent_rf_self_forcing_mse_ctx2": torch.tensor(2.0)},
+        ),
+    )
+    rollout_calls = {"count": 0}
+
+    def fake_rollout_self_forcing_loss(**kwargs: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Record whether the rollout helper ran while the auxiliary was warming up."""
+
+        rollout_calls["count"] += 1
+        return torch.tensor(4.0), {"latent_rf_self_forcing_rollout_mse_chunk1": torch.tensor(4.0)}
+
+    monkeypatch.setattr(experiment, "_dynamics_rollout_self_forcing_loss", fake_rollout_self_forcing_loss)
+
+    loss_dict = experiment._dynamics_only_training_step(batch)
+
+    assert loss_dict["active_self_forcing_loss_weight"] == pytest.approx(0.5)
+    assert loss_dict["active_rollout_self_forcing_loss_weight"] == pytest.approx(0.0)
+    assert rollout_calls["count"] == 0
+    assert loss_dict["latent_rf_rollout_self_forcing_weighted_loss"] == pytest.approx(0.0)
+    assert loss_dict["loss"] == pytest.approx(2.0)
+
+
+def test_dynamics_training_step_ramps_rollout_self_forcing_auxiliary_after_own_warmup(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rollout auxiliary should use its own warmup/ramp schedule instead of sharing the primary one."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="rollout_aux_ramp",
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            dynamics_context_frames=1,
+            dynamics_target_frames=2,
+            dynamics_conditioning_frame_choices=(1,),
+            dynamics_conditioning_frame_probabilities=(1.0,),
+            dynamics_validation_conditioning_frame_choices=(1,),
+            dynamics_open_rollout_context_frames=1,
+            dynamics_self_forcing_loss_weight=0.5,
+            dynamics_rollout_self_forcing_loss_weight=0.25,
+            dynamics_rollout_self_forcing_warmup_steps=10,
+            dynamics_rollout_self_forcing_ramp_steps=20,
+            dynamics_self_forcing_rollout_chunks=1,
+            device="cpu",
+        )
+    )
+    batch = {
+        "context_frames": torch.randn(2, 1, 3, 8, 8),
+        "target_frames": torch.randn(2, 2, 3, 8, 8),
+        "future_target_frames": torch.randn(2, 2, 3, 8, 8),
+        "actions": torch.zeros(2, 2, 4),
+        "future_actions": torch.zeros(2, 2, 4),
+    }
+    clean_latent_video = torch.randn(2, 4, 3, 8, 8)
+    future_target_latent_video = torch.randn(2, 4, 2, 8, 8)
+    target_velocity = torch.zeros_like(clean_latent_video)
+    predicted_velocity = torch.ones_like(clean_latent_video)
+    dynamics_inputs = DynamicsTrainingInputs(
+        noisy_latent_video=torch.zeros_like(clean_latent_video),
+        conditioning_latent_video=clean_latent_video,
+        target_velocity=target_velocity,
+        timesteps=torch.ones(2, 3),
+        condition_mask=torch.zeros(2, 1, 3, 8, 8),
+        actions=batch["actions"],
+        target_sigmas=torch.ones(2),
+        num_conditional_frames=torch.ones(2, dtype=torch.long),
+        use_video_condition=torch.ones(2, dtype=torch.bool),
+    )
+
+    monkeypatch.setattr(
+        experiment.model,
+        "encode_context_frames",
+        lambda images, deterministic=True: clean_latent_video[:, :, :1],
+    )
+
+    def fake_encode_frame_sequence(images: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+        """Return the right latent slice for target versus future-target encoding."""
+
+        del deterministic
+        if images.shape[1] == 2 and torch.equal(images, batch["target_frames"]):
+            return clean_latent_video[:, :, 1:]
+        if images.shape[1] == 2 and torch.equal(images, batch["future_target_frames"]):
+            return future_target_latent_video
+        raise AssertionError("Unexpected image batch passed to encode_frame_sequence.")
+
+    monkeypatch.setattr(experiment.model, "encode_frame_sequence", fake_encode_frame_sequence)
+    monkeypatch.setattr(
+        experiment.model.dynamics,
+        "prepare_training_inputs",
+        lambda clean_latent_video, actions=None: dynamics_inputs,
+    )
+    monkeypatch.setattr(
+        experiment.model.dynamics,
+        "forward",
+        lambda **kwargs: predicted_velocity,
+    )
+    monkeypatch.setattr(
+        experiment,
+        "_dynamics_self_forcing_loss",
+        lambda **kwargs: (
+            torch.tensor(2.0),
+            {"latent_rf_self_forcing_mse_ctx2": torch.tensor(2.0)},
+        ),
+    )
+    monkeypatch.setattr(
+        experiment,
+        "_dynamics_rollout_self_forcing_loss",
+        lambda **kwargs: (
+            torch.tensor(4.0),
+            {"latent_rf_self_forcing_rollout_mse_chunk1": torch.tensor(4.0)},
+        ),
+    )
+    experiment.current_step = 19
+
+    loss_dict = experiment._dynamics_only_training_step(batch)
+
+    assert loss_dict["active_self_forcing_loss_weight"] == pytest.approx(0.5)
+    assert loss_dict["active_rollout_self_forcing_loss_weight"] == pytest.approx(0.125)
+    assert loss_dict["latent_rf_self_forcing_weighted_loss"] == pytest.approx(1.0)
+    assert loss_dict["latent_rf_rollout_self_forcing_weighted_loss"] == pytest.approx(0.5)
+    assert loss_dict["loss"] == pytest.approx(2.5)
 
 
 def test_dynamics_self_forcing_loss_uses_predicted_prefix_for_later_targets(
@@ -324,14 +1038,103 @@ def test_dynamics_self_forcing_loss_uses_predicted_prefix_for_later_targets(
 
     self_forcing_loss, stats = experiment._dynamics_self_forcing_loss(
         clean_latent_video=clean_latent_video,
+        extended_clean_latent_video=clean_latent_video,
         predicted_velocity=predicted_velocity,
         dynamics_inputs=dynamics_inputs,
+        future_actions=torch.empty(1, 0, 4),
+        loss_weight=1.0,
     )
 
     assert self_forcing_loss == pytest.approx(1.0)
     assert stats["latent_rf_self_forcing_mse_ctx2"] == pytest.approx(1.0)
     assert len(captured_conditioning_prefixes) == 1
     assert torch.allclose(captured_conditioning_prefixes[0], clean_latent_video[:, :, :2])
+
+
+def test_dynamics_rollout_self_forcing_loss_uses_same_context_rollout_semantics(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rollout self-forcing should score future chunks using the rollout context length, not an expanded prefix."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="rollout_self_forcing_helper",
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            dynamics_context_frames=1,
+            dynamics_target_frames=2,
+            dynamics_conditioning_frame_choices=(1,),
+            dynamics_conditioning_frame_probabilities=(1.0,),
+            dynamics_validation_conditioning_frame_choices=(1,),
+            dynamics_open_rollout_context_frames=1,
+            dynamics_self_forcing_loss_weight=1.0,
+            dynamics_self_forcing_mode="rollout",
+            dynamics_self_forcing_rollout_chunks=1,
+            device="cpu",
+        )
+    )
+    primary_clean_latent_video = torch.arange(12, dtype=torch.float32).view(1, 1, 3, 2, 2)
+    future_latent_video = torch.arange(12, 20, dtype=torch.float32).view(1, 1, 2, 2, 2)
+    extended_clean_latent_video = torch.cat([primary_clean_latent_video, future_latent_video], dim=2)
+    target_velocity = torch.zeros_like(primary_clean_latent_video)
+    predicted_velocity = torch.zeros_like(primary_clean_latent_video)
+    dynamics_inputs = DynamicsTrainingInputs(
+        noisy_latent_video=primary_clean_latent_video.clone(),
+        conditioning_latent_video=primary_clean_latent_video,
+        target_velocity=target_velocity,
+        timesteps=torch.ones(1, 3),
+        condition_mask=experiment.model.dynamics.make_condition_mask(
+            primary_clean_latent_video,
+            num_conditional_frames=1,
+        ),
+        actions=torch.tensor([[[0.0, 1.0, 2.0, 3.0], [1.0, 2.0, 3.0, 4.0]]]),
+        target_sigmas=torch.ones(1),
+        num_conditional_frames=torch.ones(1, dtype=torch.long),
+        use_video_condition=torch.ones(1, dtype=torch.bool),
+    )
+    future_actions = torch.tensor([[[2.0, 3.0, 4.0, 5.0], [3.0, 4.0, 5.0, 6.0]]])
+    captured_contexts: list[torch.Tensor] = []
+    captured_actions: list[torch.Tensor] = []
+
+    monkeypatch.setattr(
+        experiment.model.dynamics.flow,
+        "interpolate",
+        lambda noise, clean, sigmas: (clean.clone(), torch.zeros_like(clean)),
+    )
+
+    def fake_forward(**kwargs: torch.Tensor) -> torch.Tensor:
+        """Return a unit error on future targets while recording rollout contexts and actions."""
+
+        captured_contexts.append(kwargs["conditioning_latent_video"][:, :, :1].detach().clone())
+        captured_actions.append(kwargs["actions"].detach().clone())
+        output = kwargs["target_velocity"].clone()
+        output[:, :, 1:] = output[:, :, 1:] + 1.0
+        return output
+
+    monkeypatch.setattr(experiment.model.dynamics, "forward", fake_forward)
+
+    self_forcing_loss, stats = experiment._dynamics_self_forcing_loss(
+        clean_latent_video=primary_clean_latent_video,
+        extended_clean_latent_video=extended_clean_latent_video,
+        predicted_velocity=predicted_velocity,
+        dynamics_inputs=dynamics_inputs,
+        future_actions=future_actions,
+        loss_weight=1.0,
+    )
+
+    assert self_forcing_loss == pytest.approx(1.0)
+    assert stats["latent_rf_self_forcing_rollout_mse_chunk1"] == pytest.approx(1.0)
+    assert len(captured_contexts) == 1
+    assert torch.equal(captured_contexts[0], primary_clean_latent_video[:, :, 2:3])
+    assert torch.equal(
+        captured_actions[0],
+        torch.tensor([[[2.0, 3.0, 4.0, 5.0], [3.0, 4.0, 5.0, 6.0]]]),
+    )
 
 
 def test_experiment_rejects_validation_plateau_without_validation_interval(
@@ -589,6 +1392,32 @@ def test_experiment_accepts_compatible_dynamics_checkpoint_without_action_condit
 
     dynamics_weight = next(experiment.model.dynamics.parameters())
     assert torch.allclose(dynamics_weight, torch.full_like(dynamics_weight, 0.75))
+
+
+def test_experiment_accepts_older_dynamics_checkpoint_with_new_temporal_embedding_enabled(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Older RF-DiT checkpoints should warm start when the learned temporal embedding is newly enabled."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="temporal_embedding_warm_start",
+            **DEBUG_FRAME_KWARGS,
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            load_dynamics=str(saved_world_model_ae_checkpoint),
+            dynamics_use_learned_temporal_embedding=True,
+            device="cpu",
+        )
+    )
+
+    assert experiment.model.dynamics.cfg.use_learned_temporal_embedding is True
+    assert experiment.model.dynamics.net.temporal_pos_embed is not None
+    assert torch.count_nonzero(experiment.model.dynamics.net.temporal_pos_embed) == 0
 
 
 def test_experiment_rejects_explicitly_mismatched_action_conditioning_mode(

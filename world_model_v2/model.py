@@ -49,6 +49,7 @@ class WorldModel(nn.Module):
         dynamics_train_timesteps: int = 1000,
         dynamics_rf_shift: float = 5.0,
         conditional_frame_timestep: float = -1.0,
+        conditional_frame_sigma: float = 0.0,
         dynamics_video_condition_dropout: float = 0.0,
         dynamics_guidance_scale: float = 0.0,
         dynamics_context_frames: int = DYNAMICS_FRAME_LAYOUT.context_frames,
@@ -57,6 +58,7 @@ class WorldModel(nn.Module):
         dynamics_conditioning_frame_probabilities: tuple[float, ...] | list[float] | None = None,
         dynamics_validation_conditioning_frame_choices: tuple[int, ...] | list[int] | None = None,
         dynamics_open_rollout_context_frames: int | None = None,
+        dynamics_open_rollout_stride_frames: int | None = None,
         dynamics_model_channels: int = 256,
         dynamics_num_blocks: int = 4,
         dynamics_num_heads: int = 4,
@@ -65,6 +67,7 @@ class WorldModel(nn.Module):
         dynamics_use_adaln_lora: bool = False,
         dynamics_adaln_lora_dim: int = 64,
         dynamics_rope_t_extrapolation_ratio: float = 1.0,
+        dynamics_use_learned_temporal_embedding: bool = False,
     ) -> None:
         """Create the world model around the Wan autoencoder path."""
 
@@ -113,6 +116,7 @@ class WorldModel(nn.Module):
                 conditioning_frame_probabilities=dynamics_conditioning_frame_probabilities,
                 validation_conditioning_frame_choices=dynamics_validation_conditioning_frame_choices,
                 open_rollout_context_frames=dynamics_open_rollout_context_frames,
+                open_rollout_stride_frames=dynamics_open_rollout_stride_frames,
                 in_channels=latent_channels,
                 out_channels=latent_channels,
                 patch_spatial=dynamics_patch_spatial,
@@ -131,10 +135,12 @@ class WorldModel(nn.Module):
                 rope_h_extrapolation_ratio=1.0,
                 rope_w_extrapolation_ratio=1.0,
                 rope_t_extrapolation_ratio=dynamics_rope_t_extrapolation_ratio,
+                use_learned_temporal_embedding=dynamics_use_learned_temporal_embedding,
                 action_dim=4,
                 action_conditioning_mode=dynamics_action_conditioning_mode,
                 zero_init_action_embedder=dynamics_zero_init_action_embedder,
                 conditional_frame_timestep=conditional_frame_timestep,
+                conditional_frame_sigma=conditional_frame_sigma,
                 dynamics_infer_steps=dynamics_infer_steps,
                 dynamics_train_timesteps=dynamics_train_timesteps,
                 dynamics_rf_shift=dynamics_rf_shift,
@@ -325,7 +331,13 @@ class WorldModel(nn.Module):
         )
         return self.decode_frame_sequence(next_latents)
 
-    def rollout(self, seed_frames: torch.Tensor, steps: int, actions: torch.Tensor | None = None) -> torch.Tensor:
+    def rollout(
+        self,
+        seed_frames: torch.Tensor,
+        steps: int,
+        actions: torch.Tensor | None = None,
+        stride_frames: int | None = None,
+    ) -> torch.Tensor:
         """Autoregressively predict a requested number of future frames."""
 
         if steps < 0:
@@ -360,6 +372,13 @@ class WorldModel(nn.Module):
                 raise ValueError(
                     f"Expected rollout action dim {self.dynamics.cfg.action_dim}, received {actions.shape[2]}."
                 )
+        resolved_stride_frames = (
+            self.dynamics.cfg.open_rollout_stride_frames
+            if stride_frames is None
+            else int(stride_frames)
+        )
+        if resolved_stride_frames is not None and resolved_stride_frames < 1:
+            raise ValueError("stride_frames must be positive when provided.")
         predicted_frames = [seed_frames[:, frame_index] for frame_index in range(seed_frames.shape[1])]
         full_rollout_latents = self.encode_context_frames(seed_frames, deterministic=True)
         generated_frames = 0
@@ -374,7 +393,8 @@ class WorldModel(nn.Module):
             )
             current_latents = full_rollout_latents[:, :, -current_context_frames:]
             chunk_target_capacity = self.dynamics.cfg.max_frames - current_context_frames
-            chunk_target_frames = min(chunk_target_capacity, steps - generated_frames)
+            stride = chunk_target_capacity if resolved_stride_frames is None else resolved_stride_frames
+            chunk_target_frames = min(chunk_target_capacity, stride, steps - generated_frames)
             action_window = None
             if actions is not None:
                 action_start = available_frames - current_context_frames

@@ -74,15 +74,24 @@ class ExperimentConfig:
     dynamics_train_timesteps: int = 1000
     dynamics_rf_shift: float = 5.0
     conditional_frame_timestep: float = -1.0
+    conditional_frame_sigma: float = 0.0
     dynamics_video_condition_dropout: float = 0.0
     dynamics_guidance_scale: float = 0.0
     dynamics_self_forcing_loss_weight: float = 0.0
+    dynamics_rollout_self_forcing_loss_weight: float = 0.0
+    dynamics_self_forcing_mode: str = "expanded_context"
+    dynamics_self_forcing_warmup_steps: int = 0
+    dynamics_self_forcing_ramp_steps: int = 0
+    dynamics_rollout_self_forcing_warmup_steps: int = 0
+    dynamics_rollout_self_forcing_ramp_steps: int = 0
+    dynamics_self_forcing_rollout_chunks: int = 0
     dynamics_context_frames: int = DYNAMICS_FRAME_LAYOUT.context_frames
     dynamics_target_frames: int = DYNAMICS_FRAME_LAYOUT.target_frames
     dynamics_conditioning_frame_choices: tuple[int, ...] | None = None
     dynamics_conditioning_frame_probabilities: tuple[float, ...] | None = None
     dynamics_validation_conditioning_frame_choices: tuple[int, ...] | None = None
     dynamics_open_rollout_context_frames: int | None = None
+    dynamics_open_rollout_stride_frames: int | None = None
     dynamics_model_channels: int = 256
     dynamics_num_blocks: int = 4
     dynamics_num_heads: int = 4
@@ -91,6 +100,7 @@ class ExperimentConfig:
     dynamics_use_adaln_lora: bool = False
     dynamics_adaln_lora_dim: int = 64
     dynamics_rope_t_extrapolation_ratio: float = 1.0
+    dynamics_use_learned_temporal_embedding: bool = False
     dynamics_validation_metric: str = "next_frame_mse"
     kl_beta: float = 1e-4
     recon_mse_weight: float = 1.0
@@ -317,6 +327,7 @@ class Experiment:
             dynamics_train_timesteps=cfg.dynamics_train_timesteps,
             dynamics_rf_shift=cfg.dynamics_rf_shift,
             conditional_frame_timestep=cfg.conditional_frame_timestep,
+            conditional_frame_sigma=cfg.conditional_frame_sigma,
             dynamics_video_condition_dropout=cfg.dynamics_video_condition_dropout,
             dynamics_guidance_scale=cfg.dynamics_guidance_scale,
             dynamics_context_frames=cfg.dynamics_context_frames,
@@ -325,6 +336,7 @@ class Experiment:
             dynamics_conditioning_frame_probabilities=cfg.dynamics_conditioning_frame_probabilities,
             dynamics_validation_conditioning_frame_choices=cfg.dynamics_validation_conditioning_frame_choices,
             dynamics_open_rollout_context_frames=cfg.dynamics_open_rollout_context_frames,
+            dynamics_open_rollout_stride_frames=cfg.dynamics_open_rollout_stride_frames,
             dynamics_model_channels=cfg.dynamics_model_channels,
             dynamics_num_blocks=cfg.dynamics_num_blocks,
             dynamics_num_heads=cfg.dynamics_num_heads,
@@ -333,6 +345,7 @@ class Experiment:
             dynamics_use_adaln_lora=cfg.dynamics_use_adaln_lora,
             dynamics_adaln_lora_dim=cfg.dynamics_adaln_lora_dim,
             dynamics_rope_t_extrapolation_ratio=cfg.dynamics_rope_t_extrapolation_ratio,
+            dynamics_use_learned_temporal_embedding=cfg.dynamics_use_learned_temporal_embedding,
         ).to(self.device)
         self._load_requested_pretrained_weights()
         self.model.configure_trainability(cfg.mode)
@@ -389,12 +402,57 @@ class Experiment:
             raise ValueError("dynamics_rf_shift must be positive.")
         if self.cfg.conditional_frame_timestep < -1.0:
             raise ValueError("conditional_frame_timestep must be -1 or a non-negative value.")
+        if not 0.0 <= self.cfg.conditional_frame_sigma <= 1.0:
+            raise ValueError("conditional_frame_sigma must be between 0 and 1.")
+        if (
+            self.cfg.dynamics_open_rollout_stride_frames is not None
+            and self.cfg.dynamics_open_rollout_stride_frames < 1
+        ):
+            raise ValueError("dynamics_open_rollout_stride_frames must be positive.")
         if not 0.0 <= self.cfg.dynamics_video_condition_dropout <= 1.0:
             raise ValueError("dynamics_video_condition_dropout must be between 0 and 1.")
         if self.cfg.dynamics_guidance_scale < 0.0:
             raise ValueError("dynamics_guidance_scale must be non-negative.")
         if self.cfg.dynamics_self_forcing_loss_weight < 0.0:
             raise ValueError("dynamics_self_forcing_loss_weight must be non-negative.")
+        if self.cfg.dynamics_rollout_self_forcing_loss_weight < 0.0:
+            raise ValueError("dynamics_rollout_self_forcing_loss_weight must be non-negative.")
+        if self.cfg.dynamics_self_forcing_mode not in {"expanded_context", "rollout"}:
+            raise ValueError(
+                "dynamics_self_forcing_mode must be 'expanded_context' or 'rollout'."
+            )
+        if self.cfg.dynamics_self_forcing_warmup_steps < 0:
+            raise ValueError("dynamics_self_forcing_warmup_steps must be non-negative.")
+        if self.cfg.dynamics_self_forcing_ramp_steps < 0:
+            raise ValueError("dynamics_self_forcing_ramp_steps must be non-negative.")
+        if self.cfg.dynamics_rollout_self_forcing_warmup_steps < 0:
+            raise ValueError("dynamics_rollout_self_forcing_warmup_steps must be non-negative.")
+        if self.cfg.dynamics_rollout_self_forcing_ramp_steps < 0:
+            raise ValueError("dynamics_rollout_self_forcing_ramp_steps must be non-negative.")
+        if self.cfg.dynamics_self_forcing_rollout_chunks < 0:
+            raise ValueError("dynamics_self_forcing_rollout_chunks must be non-negative.")
+        if (
+            self.cfg.dynamics_self_forcing_mode == "rollout"
+            and self.cfg.dynamics_rollout_self_forcing_loss_weight > 0.0
+        ):
+            raise ValueError(
+                "dynamics_rollout_self_forcing_loss_weight cannot be combined with dynamics_self_forcing_mode='rollout'."
+            )
+        if (
+            self.cfg.dynamics_self_forcing_loss_weight > 0.0
+            and self.cfg.dynamics_self_forcing_mode == "rollout"
+            and self.cfg.dynamics_self_forcing_rollout_chunks < 1
+        ):
+            raise ValueError(
+                "dynamics_self_forcing_rollout_chunks must be positive when rollout self-forcing is enabled."
+            )
+        if (
+            self.cfg.dynamics_rollout_self_forcing_loss_weight > 0.0
+            and self.cfg.dynamics_self_forcing_rollout_chunks < 1
+        ):
+            raise ValueError(
+                "dynamics_self_forcing_rollout_chunks must be positive when rollout self-forcing auxiliary loss is enabled."
+            )
         if self.cfg.dynamics_context_frames < 1:
             raise ValueError("dynamics_context_frames must be positive.")
         if self.cfg.dynamics_target_frames < 1:
@@ -451,9 +509,16 @@ class Experiment:
         """Reject dynamics-only runs that do not contain any valid dynamics windows."""
 
         if self.cfg.mode == "dynamics_only" and len(self.train_dataset) < 1:
+            required_frames = self.model.dynamics.cfg.max_frames
+            if self.cfg.dynamics_self_forcing_rollout_chunks > 0:
+                rollout_target_frames = (
+                    self.model.dynamics.cfg.max_frames
+                    - self.model.dynamics.cfg.open_rollout_context_frames
+                )
+                required_frames += self.cfg.dynamics_self_forcing_rollout_chunks * rollout_target_frames
             raise ValueError(
-                f"dynamics_only requires at least {self.model.dynamics.cfg.max_frames} "
-                "frames in the selected clip so one valid dynamics window exists."
+                f"dynamics_only requires at least {required_frames} frames in the selected clip "
+                "so one valid dynamics window exists."
             )
 
     def _default_run_name(self, mode: str) -> str:
@@ -495,6 +560,8 @@ class Experiment:
                 dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
                 return MetaWorldFrameDataset(**dataset_kwargs)
             dataset_kwargs["frame_layout"] = frame_layout
+            dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
+            dataset_kwargs["rollout_chunks"] = self.cfg.dynamics_self_forcing_rollout_chunks
             return MetaWorldTransitionDataset(**dataset_kwargs)
         dataset_kwargs = {
             "data_root": self.cfg.data_root,
@@ -512,6 +579,8 @@ class Experiment:
             dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
             return FrameDataset(**dataset_kwargs)
         dataset_kwargs["frame_layout"] = frame_layout
+        dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
+        dataset_kwargs["rollout_chunks"] = self.cfg.dynamics_self_forcing_rollout_chunks
         return TransitionDataset(**dataset_kwargs)
 
     def _build_train_loader(self, dataset: Dataset[dict[str, Any]]) -> DataLoader[Any]:
@@ -806,13 +875,20 @@ class Experiment:
             checkpoint = load_training_checkpoint(self.cfg.load_dynamics, self.device)
             self._assert_checkpoint_backend(checkpoint, self.cfg.load_dynamics)
             self._assert_checkpoint_dynamics_backend(checkpoint, self.cfg.load_dynamics)
-            self._load_submodule_state("dynamics", self.model.dynamics, checkpoint["model_state"])
+            self._load_submodule_state(
+                "dynamics",
+                self.model.dynamics,
+                checkpoint["model_state"],
+                allowed_missing_keys=self._allowed_dynamics_missing_keys(),
+            )
 
     def _load_submodule_state(
         self,
         prefix: str,
         module: torch.nn.Module,
         model_state: dict[str, torch.Tensor],
+        *,
+        allowed_missing_keys: set[str] | None = None,
     ) -> None:
         """Load one named submodule from a saved state dictionary."""
 
@@ -824,7 +900,27 @@ class Experiment:
         }
         if not submodule_state:
             raise KeyError(f"Checkpoint is missing weights for {prefix}.")
-        module.load_state_dict(submodule_state, strict=True)
+        allowed_missing_keys = set() if allowed_missing_keys is None else set(allowed_missing_keys)
+        incompatible = module.load_state_dict(submodule_state, strict=False)
+        missing_keys = set(incompatible.missing_keys)
+        unexpected_keys = set(incompatible.unexpected_keys)
+        disallowed_missing_keys = missing_keys - allowed_missing_keys
+        if disallowed_missing_keys:
+            raise RuntimeError(
+                f"Checkpoint is missing required weights for {prefix}: {sorted(disallowed_missing_keys)}."
+            )
+        if unexpected_keys:
+            raise RuntimeError(
+                f"Checkpoint has unexpected weights for {prefix}: {sorted(unexpected_keys)}."
+            )
+
+    def _allowed_dynamics_missing_keys(self) -> set[str]:
+        """Return optional dynamics parameters that older checkpoints may legitimately miss."""
+
+        allowed_missing_keys: set[str] = set()
+        if self.cfg.dynamics_use_learned_temporal_embedding:
+            allowed_missing_keys.add("net.temporal_pos_embed")
+        return allowed_missing_keys
 
     def _load_resume(self) -> int:
         """Restore a previous training checkpoint and return its step."""
@@ -1015,10 +1111,26 @@ class Experiment:
         context_frames = batch["context_frames"]
         target_frames = batch["target_frames"]
         actions = batch["actions"]
+        future_target_frames = batch["future_target_frames"]
+        future_actions = batch["future_actions"]
         with torch.no_grad():
             context_latent_video = self.model.encode_context_frames(context_frames, deterministic=True)
             target_latent_video = self.model.encode_frame_sequence(target_frames, deterministic=True)
+            if future_target_frames.shape[1] > 0:
+                future_target_latent_video = self.model.encode_frame_sequence(
+                    future_target_frames,
+                    deterministic=True,
+                )
+            else:
+                future_target_latent_video = context_latent_video.new_empty(
+                    context_latent_video.shape[0],
+                    context_latent_video.shape[1],
+                    0,
+                    context_latent_video.shape[3],
+                    context_latent_video.shape[4],
+                )
         clean_latent_video = torch.cat([context_latent_video, target_latent_video], dim=2)
+        extended_clean_latent_video = torch.cat([clean_latent_video, future_target_latent_video], dim=2)
         dynamics_inputs = self.model.dynamics.prepare_training_inputs(clean_latent_video, actions=actions)
         predicted_velocity = self.model.dynamics(
             noisy_latent_video=dynamics_inputs.noisy_latent_video,
@@ -1030,49 +1142,153 @@ class Experiment:
             use_video_condition=dynamics_inputs.use_video_condition,
         )
         latent_rf_mse = F.mse_loss(predicted_velocity, dynamics_inputs.target_velocity)
+        active_self_forcing_loss_weight = self._active_dynamics_self_forcing_loss_weight()
+        active_rollout_self_forcing_loss_weight = self._active_dynamics_rollout_self_forcing_loss_weight()
         latent_rf_self_forcing_mse, self_forcing_stats = self._dynamics_self_forcing_loss(
             clean_latent_video=clean_latent_video,
+            extended_clean_latent_video=extended_clean_latent_video,
             predicted_velocity=predicted_velocity,
             dynamics_inputs=dynamics_inputs,
+            future_actions=future_actions,
+            loss_weight=active_self_forcing_loss_weight,
         )
-        weighted_self_forcing_loss = (
-            self.cfg.dynamics_self_forcing_loss_weight * latent_rf_self_forcing_mse
+        weighted_self_forcing_loss = active_self_forcing_loss_weight * latent_rf_self_forcing_mse
+        latent_rf_rollout_self_forcing_mse, rollout_self_forcing_stats = (
+            self._dynamics_rollout_self_forcing_loss(
+                clean_latent_video=clean_latent_video,
+                extended_clean_latent_video=extended_clean_latent_video,
+                predicted_velocity=predicted_velocity,
+                dynamics_inputs=dynamics_inputs,
+                future_actions=future_actions,
+            )
+            if active_rollout_self_forcing_loss_weight > 0.0
+            else (predicted_velocity.new_zeros(()), {})
         )
-        total_loss = latent_rf_mse + weighted_self_forcing_loss
+        weighted_rollout_self_forcing_loss = (
+            active_rollout_self_forcing_loss_weight * latent_rf_rollout_self_forcing_mse
+        )
+        total_loss = latent_rf_mse + weighted_self_forcing_loss + weighted_rollout_self_forcing_loss
         metrics = {
             "loss": total_loss,
             "latent_rf_mse": latent_rf_mse.detach(),
             "target_sigma": dynamics_inputs.target_sigmas.mean().detach(),
             "conditioning_frames_mean": dynamics_inputs.num_conditional_frames.float().mean().detach(),
             "use_video_condition_mean": dynamics_inputs.use_video_condition.float().mean().detach(),
+            "active_self_forcing_loss_weight": torch.tensor(
+                active_self_forcing_loss_weight,
+                device=latent_rf_mse.device,
+            ),
+            "active_rollout_self_forcing_loss_weight": torch.tensor(
+                active_rollout_self_forcing_loss_weight,
+                device=latent_rf_mse.device,
+            ),
         }
         if self.cfg.dynamics_self_forcing_loss_weight > 0.0:
             metrics.update(
                 {
                     "latent_rf_self_forcing_mse": latent_rf_self_forcing_mse.detach(),
                     "latent_rf_self_forcing_weighted_loss": weighted_self_forcing_loss.detach(),
-                    "latent_rf_total_loss": total_loss.detach(),
                     **self_forcing_stats,
                 }
             )
+        if self.cfg.dynamics_rollout_self_forcing_loss_weight > 0.0:
+            metrics.update(
+                {
+                    "latent_rf_rollout_self_forcing_mse": latent_rf_rollout_self_forcing_mse.detach(),
+                    "latent_rf_rollout_self_forcing_weighted_loss": weighted_rollout_self_forcing_loss.detach(),
+                    **rollout_self_forcing_stats,
+                }
+            )
+        if (
+            self.cfg.dynamics_self_forcing_loss_weight > 0.0
+            or self.cfg.dynamics_rollout_self_forcing_loss_weight > 0.0
+        ):
+            metrics["latent_rf_total_loss"] = total_loss.detach()
         return metrics
 
+    def _dynamics_self_forcing_schedule_scale(self) -> float:
+        """Return the warmup/ramp multiplier for the primary self-forcing objective."""
+
+        return self._scheduled_loss_scale(
+            warmup_steps=self.cfg.dynamics_self_forcing_warmup_steps,
+            ramp_steps=self.cfg.dynamics_self_forcing_ramp_steps,
+        )
+
+    def _dynamics_rollout_self_forcing_schedule_scale(self) -> float:
+        """Return the warmup/ramp multiplier for the rollout self-forcing auxiliary."""
+
+        return self._scheduled_loss_scale(
+            warmup_steps=self.cfg.dynamics_rollout_self_forcing_warmup_steps,
+            ramp_steps=self.cfg.dynamics_rollout_self_forcing_ramp_steps,
+        )
+
+    def _scheduled_loss_scale(self, *, warmup_steps: int, ramp_steps: int) -> float:
+        """Return the active multiplier for a warmup-then-ramp loss schedule."""
+
+        if self.current_step < warmup_steps:
+            return 0.0
+        if ramp_steps > 0:
+            transitioned_steps = self.current_step - warmup_steps + 1
+            return min(max(float(transitioned_steps), 0.0) / float(ramp_steps), 1.0)
+        return 1.0
+
+    def _active_dynamics_self_forcing_loss_weight(self) -> float:
+        """Return the active primary self-forcing weight after the configured warmup window."""
+
+        return (
+            float(self.cfg.dynamics_self_forcing_loss_weight)
+            * self._dynamics_self_forcing_schedule_scale()
+        )
+
+    def _active_dynamics_rollout_self_forcing_loss_weight(self) -> float:
+        """Return the active rollout self-forcing auxiliary weight after its own schedule."""
+
+        return (
+            float(self.cfg.dynamics_rollout_self_forcing_loss_weight)
+            * self._dynamics_rollout_self_forcing_schedule_scale()
+        )
+
     def _dynamics_self_forcing_loss(
+        self,
+        *,
+        clean_latent_video: torch.Tensor,
+        extended_clean_latent_video: torch.Tensor,
+        predicted_velocity: torch.Tensor,
+        dynamics_inputs: DynamicsTrainingInputs,
+        future_actions: torch.Tensor,
+        loss_weight: float,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return a DreamDojo-inspired causal self-forcing loss for later target frames."""
+
+        zero = predicted_velocity.new_zeros(())
+        if loss_weight <= 0.0:
+            return zero, {}
+        if self.cfg.dynamics_self_forcing_mode == "rollout":
+            return self._dynamics_rollout_self_forcing_loss(
+                clean_latent_video=clean_latent_video,
+                extended_clean_latent_video=extended_clean_latent_video,
+                predicted_velocity=predicted_velocity,
+                dynamics_inputs=dynamics_inputs,
+                future_actions=future_actions,
+            )
+        if self.model.dynamics.cfg.target_frames < 2:
+            return zero, {}
+        return self._dynamics_expanded_context_self_forcing_loss(
+            clean_latent_video=clean_latent_video,
+            predicted_velocity=predicted_velocity,
+            dynamics_inputs=dynamics_inputs,
+        )
+
+    def _dynamics_expanded_context_self_forcing_loss(
         self,
         *,
         clean_latent_video: torch.Tensor,
         predicted_velocity: torch.Tensor,
         dynamics_inputs: DynamicsTrainingInputs,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Return a DreamDojo-inspired causal self-forcing loss for later target frames."""
+        """Score the later within-chunk target after expanding the predicted prefix."""
 
         zero = predicted_velocity.new_zeros(())
-        if (
-            self.cfg.dynamics_self_forcing_loss_weight <= 0.0
-            or self.model.dynamics.cfg.target_frames < 2
-        ):
-            return zero, {}
-
         base_reference_noise = (
             dynamics_inputs.target_velocity + dynamics_inputs.conditioning_latent_video
         )
@@ -1126,6 +1342,86 @@ class Experiment:
                 target_sigmas=dynamics_inputs.target_sigmas,
             ).detach()
         return total_self_forcing_loss / total_self_forcing_steps, stats
+
+    def _dynamics_rollout_self_forcing_loss(
+        self,
+        *,
+        clean_latent_video: torch.Tensor,
+        extended_clean_latent_video: torch.Tensor,
+        predicted_velocity: torch.Tensor,
+        dynamics_inputs: DynamicsTrainingInputs,
+        future_actions: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Score future chunks with the same rollout context semantics used at inference."""
+
+        zero = predicted_velocity.new_zeros(())
+        rollout_chunks = self.cfg.dynamics_self_forcing_rollout_chunks
+        if rollout_chunks < 1:
+            return zero, {}
+        rollout_context_frames = self.model.dynamics.cfg.open_rollout_context_frames
+        rollout_target_frames = self.model.dynamics.cfg.max_frames - rollout_context_frames
+        future_latent_video = extended_clean_latent_video[:, :, clean_latent_video.shape[2]:]
+        expected_future_frames = rollout_chunks * rollout_target_frames
+        if future_latent_video.shape[2] < expected_future_frames:
+            raise ValueError(
+                "extended_clean_latent_video is missing the future target frames required for rollout self-forcing."
+            )
+        if future_actions.shape[1] < rollout_chunks * rollout_target_frames:
+            raise ValueError(
+                "future_actions is missing the action horizon required for rollout self-forcing."
+            )
+        full_actions = torch.cat([dynamics_inputs.actions, future_actions], dim=1)
+        predicted_history = self.model.dynamics.recover_clean_latent_video(
+            noisy_latent_video=dynamics_inputs.noisy_latent_video,
+            predicted_velocity=predicted_velocity,
+            target_sigmas=dynamics_inputs.target_sigmas,
+        ).detach()
+        total_self_forcing_loss = zero
+        stats: dict[str, torch.Tensor] = {}
+        for chunk_index in range(rollout_chunks):
+            future_start = chunk_index * rollout_target_frames
+            future_stop = future_start + rollout_target_frames
+            chunk_context = predicted_history[:, :, -rollout_context_frames:]
+            chunk_targets = future_latent_video[:, :, future_start:future_stop]
+            auxiliary_clean_latent_video = torch.cat([chunk_context, chunk_targets], dim=2)
+            reference_noise = torch.randn_like(auxiliary_clean_latent_video)
+            auxiliary_noisy_latent_video, auxiliary_target_velocity = self.model.dynamics.flow.interpolate(
+                noise=reference_noise,
+                clean=auxiliary_clean_latent_video,
+                sigmas=dynamics_inputs.target_sigmas,
+            )
+            auxiliary_condition_mask = self.model.dynamics.make_condition_mask(
+                auxiliary_clean_latent_video,
+                num_conditional_frames=rollout_context_frames,
+            )
+            action_start = (chunk_index + 1) * rollout_target_frames
+            action_stop = action_start + self.model.dynamics.cfg.num_action_per_chunk
+            auxiliary_actions = full_actions[:, action_start:action_stop]
+            auxiliary_predicted_velocity = self.model.dynamics(
+                noisy_latent_video=auxiliary_noisy_latent_video,
+                timesteps=dynamics_inputs.timesteps,
+                condition_mask=auxiliary_condition_mask,
+                actions=auxiliary_actions,
+                conditioning_latent_video=auxiliary_clean_latent_video,
+                target_velocity=auxiliary_target_velocity,
+                use_video_condition=True,
+            )
+            step_loss = F.mse_loss(
+                auxiliary_predicted_velocity[:, :, rollout_context_frames:],
+                auxiliary_target_velocity[:, :, rollout_context_frames:],
+            )
+            total_self_forcing_loss = total_self_forcing_loss + step_loss
+            stats[f"latent_rf_self_forcing_rollout_mse_chunk{chunk_index + 1}"] = step_loss.detach()
+            predicted_chunk = self.model.dynamics.recover_clean_latent_video(
+                noisy_latent_video=auxiliary_noisy_latent_video,
+                predicted_velocity=auxiliary_predicted_velocity,
+                target_sigmas=dynamics_inputs.target_sigmas,
+            ).detach()
+            predicted_history = torch.cat(
+                [predicted_history, predicted_chunk[:, :, rollout_context_frames:]],
+                dim=2,
+            )
+        return total_self_forcing_loss / rollout_chunks, stats
 
     @torch.no_grad()
     def _validate_ae_only_frames(
@@ -1328,6 +1624,7 @@ class Experiment:
             seed_frames,
             steps=rollout_steps,
             actions=rollout_actions,
+            stride_frames=self.model.dynamics.cfg.open_rollout_stride_frames,
         )[0]
         predicted_targets = predicted[context_frames:]
         target_frames = frames[context_frames:]
@@ -1343,6 +1640,11 @@ class Experiment:
         stats = {
             "open_rollout_seed_frames": int(context_frames),
             "open_rollout_loss_frames": int(rollout_steps),
+            "open_rollout_stride_frames": (
+                int(self.model.dynamics.cfg.open_rollout_stride_frames)
+                if self.model.dynamics.cfg.open_rollout_stride_frames is not None
+                else None
+            ),
             "open_rollout_decoded_frame_count": int(predicted.shape[0]),
             "open_rollout_predicted_frame_count": int(predicted.shape[0]),
             "open_rollout_frame_mse": float(F.mse_loss(predicted_targets, target_frames).item()),
@@ -1448,6 +1750,11 @@ class Experiment:
                     self.model.dynamics.cfg.validation_conditioning_frame_choices
                 ),
                 "open_rollout_context_frames": int(self.model.dynamics.cfg.open_rollout_context_frames),
+                "open_rollout_stride_frames": (
+                    None
+                    if self.model.dynamics.cfg.open_rollout_stride_frames is None
+                    else int(self.model.dynamics.cfg.open_rollout_stride_frames)
+                ),
                 "mode": self.cfg.mode,
                 "ae_backend": self.cfg.ae_backend,
                 "dynamics_backend": self.model.dynamics_backend,

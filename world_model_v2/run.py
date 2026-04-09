@@ -65,15 +65,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dynamics-train-timesteps", type=int, default=1000)
     parser.add_argument("--dynamics-rf-shift", type=float, default=5.0)
     parser.add_argument("--conditional-frame-timestep", type=float, default=-1.0)
+    parser.add_argument("--conditional-frame-sigma", type=float, default=0.0)
     parser.add_argument("--dynamics-video-condition-dropout", type=float, default=0.0)
     parser.add_argument("--dynamics-guidance-scale", type=float, default=0.0)
     parser.add_argument("--dynamics-self-forcing-loss-weight", type=float, default=0.0)
+    parser.add_argument("--dynamics-rollout-self-forcing-loss-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--dynamics-self-forcing-mode",
+        choices=["expanded_context", "rollout"],
+        default="expanded_context",
+    )
+    parser.add_argument("--dynamics-self-forcing-warmup-steps", type=int, default=0)
+    parser.add_argument("--dynamics-self-forcing-ramp-steps", type=int, default=0)
+    parser.add_argument("--dynamics-rollout-self-forcing-warmup-steps", type=int, default=0)
+    parser.add_argument("--dynamics-rollout-self-forcing-ramp-steps", type=int, default=0)
+    parser.add_argument("--dynamics-self-forcing-rollout-chunks", type=int, default=0)
     parser.add_argument("--dynamics-context-frames", type=int, default=4)
     parser.add_argument("--dynamics-target-frames", type=int, default=1)
     parser.add_argument("--dynamics-conditioning-frame-choices", default=None)
     parser.add_argument("--dynamics-conditioning-frame-probabilities", default=None)
     parser.add_argument("--dynamics-validation-conditioning-frame-choices", default=None)
     parser.add_argument("--dynamics-open-rollout-context-frames", type=int, default=None)
+    parser.add_argument("--dynamics-open-rollout-stride-frames", type=int, default=None)
     parser.add_argument("--dynamics-model-channels", type=int, default=256)
     parser.add_argument("--dynamics-num-blocks", type=int, default=4)
     parser.add_argument("--dynamics-num-heads", type=int, default=4)
@@ -86,6 +99,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dynamics-use-adaln-lora", action="store_true")
     parser.add_argument("--dynamics-adaln-lora-dim", type=int, default=64)
     parser.add_argument("--dynamics-rope-t-extrapolation-ratio", type=float, default=1.0)
+    parser.add_argument("--dynamics-use-learned-temporal-embedding", action="store_true")
     parser.add_argument(
         "--dynamics-validation-metric",
         choices=["next_frame_mse", "open_rollout_frame_mse"],
@@ -145,9 +159,17 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         dynamics_train_timesteps=args.dynamics_train_timesteps,
         dynamics_rf_shift=args.dynamics_rf_shift,
         conditional_frame_timestep=args.conditional_frame_timestep,
+        conditional_frame_sigma=args.conditional_frame_sigma,
         dynamics_video_condition_dropout=args.dynamics_video_condition_dropout,
         dynamics_guidance_scale=args.dynamics_guidance_scale,
         dynamics_self_forcing_loss_weight=args.dynamics_self_forcing_loss_weight,
+        dynamics_rollout_self_forcing_loss_weight=args.dynamics_rollout_self_forcing_loss_weight,
+        dynamics_self_forcing_mode=args.dynamics_self_forcing_mode,
+        dynamics_self_forcing_warmup_steps=args.dynamics_self_forcing_warmup_steps,
+        dynamics_self_forcing_ramp_steps=args.dynamics_self_forcing_ramp_steps,
+        dynamics_rollout_self_forcing_warmup_steps=args.dynamics_rollout_self_forcing_warmup_steps,
+        dynamics_rollout_self_forcing_ramp_steps=args.dynamics_rollout_self_forcing_ramp_steps,
+        dynamics_self_forcing_rollout_chunks=args.dynamics_self_forcing_rollout_chunks,
         dynamics_context_frames=args.dynamics_context_frames,
         dynamics_target_frames=args.dynamics_target_frames,
         dynamics_conditioning_frame_choices=parse_int_csv(
@@ -160,6 +182,7 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
             args.dynamics_validation_conditioning_frame_choices
         ),
         dynamics_open_rollout_context_frames=args.dynamics_open_rollout_context_frames,
+        dynamics_open_rollout_stride_frames=args.dynamics_open_rollout_stride_frames,
         dynamics_model_channels=args.dynamics_model_channels,
         dynamics_num_blocks=args.dynamics_num_blocks,
         dynamics_num_heads=args.dynamics_num_heads,
@@ -168,6 +191,7 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         dynamics_use_adaln_lora=args.dynamics_use_adaln_lora,
         dynamics_adaln_lora_dim=args.dynamics_adaln_lora_dim,
         dynamics_rope_t_extrapolation_ratio=args.dynamics_rope_t_extrapolation_ratio,
+        dynamics_use_learned_temporal_embedding=args.dynamics_use_learned_temporal_embedding,
         dynamics_validation_metric=args.dynamics_validation_metric,
         kl_beta=args.kl_beta,
         recon_mse_weight=args.recon_mse_weight,

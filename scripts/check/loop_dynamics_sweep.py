@@ -114,6 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dynamics-conditioning-frame-probabilities", default=None)
     parser.add_argument("--dynamics-validation-conditioning-frame-choices", default=None)
     parser.add_argument("--dynamics-open-rollout-context-frames", type=int, default=None)
+    parser.add_argument("--dynamics-open-rollout-stride-frames", type=int, default=None)
     parser.add_argument("--dynamics-model-channels", type=int, default=256)
     parser.add_argument("--dynamics-num-blocks", type=int, default=4)
     parser.add_argument("--dynamics-num-heads", type=int, default=4)
@@ -126,6 +127,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dynamics-use-adaln-lora", action="store_true")
     parser.add_argument("--dynamics-adaln-lora-dim", type=int, default=64)
     parser.add_argument("--dynamics-rope-t-extrapolation-ratio", type=float, default=1.0)
+    parser.add_argument("--dynamics-use-learned-temporal-embedding", action="store_true")
     parser.add_argument(
         "--conditional-frame-timestep",
         type=float,
@@ -133,10 +135,58 @@ def parse_args() -> argparse.Namespace:
         help="Forward the conditioning-frame timestep used by dynamics conditioning.",
     )
     parser.add_argument(
+        "--conditional-frame-sigma",
+        type=float,
+        default=0.0,
+        help="Optional tiny noise sigma applied to conditioned frames before repinning.",
+    )
+    parser.add_argument(
         "--dynamics-self-forcing-loss-weight",
         type=float,
         default=0.0,
         help="Optional DreamDojo-inspired causal self-forcing auxiliary loss weight.",
+    )
+    parser.add_argument(
+        "--dynamics-rollout-self-forcing-loss-weight",
+        type=float,
+        default=0.0,
+        help="Optional additional rollout-aligned self-forcing loss weight used on top of the primary mode.",
+    )
+    parser.add_argument(
+        "--dynamics-self-forcing-mode",
+        choices=["expanded_context", "rollout"],
+        default="expanded_context",
+        help="Choose between the legacy expanded-prefix auxiliary and same-context rollout self-forcing.",
+    )
+    parser.add_argument(
+        "--dynamics-self-forcing-warmup-steps",
+        type=int,
+        default=0,
+        help="Optional number of optimizer steps to keep self-forcing disabled before enabling it.",
+    )
+    parser.add_argument(
+        "--dynamics-self-forcing-ramp-steps",
+        type=int,
+        default=0,
+        help="Optional number of optimizer steps used to ramp self-forcing from zero to the target weight.",
+    )
+    parser.add_argument(
+        "--dynamics-rollout-self-forcing-warmup-steps",
+        type=int,
+        default=0,
+        help="Optional number of optimizer steps to keep the rollout self-forcing auxiliary disabled before enabling it.",
+    )
+    parser.add_argument(
+        "--dynamics-rollout-self-forcing-ramp-steps",
+        type=int,
+        default=0,
+        help="Optional number of optimizer steps used to ramp the rollout self-forcing auxiliary from zero to the target weight.",
+    )
+    parser.add_argument(
+        "--dynamics-self-forcing-rollout-chunks",
+        type=int,
+        default=0,
+        help="Optional number of extra rollout chunks used by same-context self-forcing.",
     )
     parser.add_argument(
         "--dynamics-validation-metric",
@@ -310,14 +360,35 @@ def build_command(
         "0",
         "--conditional-frame-timestep",
         str(args.conditional_frame_timestep),
+        "--conditional-frame-sigma",
+        str(args.conditional_frame_sigma),
         "--dynamics-self-forcing-loss-weight",
         str(args.dynamics_self_forcing_loss_weight),
+        "--dynamics-rollout-self-forcing-loss-weight",
+        str(args.dynamics_rollout_self_forcing_loss_weight),
+        "--dynamics-self-forcing-mode",
+        str(args.dynamics_self_forcing_mode),
+        "--dynamics-self-forcing-warmup-steps",
+        str(args.dynamics_self_forcing_warmup_steps),
+        "--dynamics-self-forcing-ramp-steps",
+        str(args.dynamics_self_forcing_ramp_steps),
+        "--dynamics-rollout-self-forcing-warmup-steps",
+        str(args.dynamics_rollout_self_forcing_warmup_steps),
+        "--dynamics-rollout-self-forcing-ramp-steps",
+        str(args.dynamics_rollout_self_forcing_ramp_steps),
+        "--dynamics-self-forcing-rollout-chunks",
+        str(args.dynamics_self_forcing_rollout_chunks),
         "--dynamics-infer-steps",
         str(spec.infer_steps),
         "--dynamics-train-timesteps",
         str(args.dynamics_train_timesteps),
         "--dynamics-rf-shift",
         str(args.dynamics_rf_shift),
+        *(
+            ["--dynamics-use-learned-temporal-embedding"]
+            if args.dynamics_use_learned_temporal_embedding
+            else []
+        ),
         "--dynamics-context-frames",
         str(args.dynamics_context_frames),
         "--dynamics-target-frames",
@@ -375,6 +446,13 @@ def build_command(
                 str(args.dynamics_open_rollout_context_frames),
             ]
         )
+    if args.dynamics_open_rollout_stride_frames is not None:
+        command.extend(
+            [
+                "--dynamics-open-rollout-stride-frames",
+                str(args.dynamics_open_rollout_stride_frames),
+            ]
+        )
     if args.dynamics_zero_init_action_embedder:
         command.append("--dynamics-zero-init-action-embedder")
     if args.dynamics_use_adaln_lora:
@@ -424,6 +502,13 @@ def build_open_rollout_eval_command(
         "--run-name",
         f"open_rollout_eval_f{frame_start}_{frame_end}",
     ]
+    if args.dynamics_open_rollout_stride_frames is not None:
+        command.extend(
+            [
+                "--dynamics-open-rollout-stride-frames",
+                str(args.dynamics_open_rollout_stride_frames),
+            ]
+        )
     command.extend(["--metaworld-task-index", str(args.metaworld_task_index)])
     return command
 
