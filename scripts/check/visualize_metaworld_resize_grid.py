@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from world_model_v2.minimal.metaworld_dataset import MetaWorldFrameRecord, MetaWorldRepository
+from world_model_v2.metaworld_dataset import MetaWorldFrameRecord, MetaWorldRepository
 
 
 DEFAULT_SIZES = (480, 384, 320, 256, 240, 192, 160, 128)

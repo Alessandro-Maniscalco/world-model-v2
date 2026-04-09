@@ -2,7 +2,7 @@
 
 source .venv/bin/activate
 python scripts/check/plot_last_run_metrics.py
-python scripts/check/plot_last_run_metrics.py --run-dir outputs/minimal/dynamics_only_single_grasp_ep0_f111_116_from_last
+python scripts/check/plot_last_run_metrics.py --run-dir outputs/dynamics_only_single_grasp_ep0_f111_116_from_last
 """
 
 from __future__ import annotations

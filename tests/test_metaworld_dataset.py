@@ -1,4 +1,4 @@
-"""Tests for the parquet-backed MetaWorld minimal dataset helpers."""
+"""Tests for the parquet-backed MetaWorld dataset helpers."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ from pathlib import Path
 
 import torch
 
-from world_model_v2.minimal.metaworld_dataset import (
+from world_model_v2.dynamics_transformer import DYNAMICS_FRAME_LAYOUT, DynamicsFrameLayout
+from world_model_v2.metaworld_dataset import (
     MetaWorldFrameDataset,
     MetaWorldTransitionDataset,
     MetaWorldValidationClipDataset,
@@ -75,12 +76,22 @@ def test_metaworld_transition_dataset_returns_consecutive_pairs(
     )
     sample = dataset[0]
     assert len(dataset) == 1
-    assert sample["context_frames"].shape == (3, 3, 8, 8)
-    assert sample["target_frames"].shape == (2, 3, 8, 8)
-    assert sample["actions"].shape == (4, 4)
+    assert sample["context_frames"].shape == (DYNAMICS_FRAME_LAYOUT.context_frames, 3, 8, 8)
+    assert sample["target_frames"].shape == (DYNAMICS_FRAME_LAYOUT.target_frames, 3, 8, 8)
+    assert sample["actions"].shape == (DYNAMICS_FRAME_LAYOUT.num_action_per_chunk, 4)
     assert torch.equal(sample["actions"][0], torch.tensor([10.0, 11.0, 12.0, 13.0]))
-    assert torch.equal(sample["context_frame_idx"], torch.tensor([0, 1, 2], dtype=torch.long))
-    assert torch.equal(sample["target_frame_idx"], torch.tensor([3, 4], dtype=torch.long))
+    assert torch.equal(
+        sample["context_frame_idx"],
+        torch.arange(DYNAMICS_FRAME_LAYOUT.context_frames, dtype=torch.long),
+    )
+    assert torch.equal(
+        sample["target_frame_idx"],
+        torch.arange(
+            DYNAMICS_FRAME_LAYOUT.context_frames,
+            DYNAMICS_FRAME_LAYOUT.max_frames,
+            dtype=torch.long,
+        ),
+    )
     assert sample["episode_idx"].item() == 0
 
 
@@ -102,6 +113,31 @@ def test_metaworld_validation_dataset_returns_one_clip(
     assert sample["actions"].shape == (1, 4)
     assert torch.equal(sample["actions"][0], torch.tensor([90.0, 91.0, 92.0, 93.0]))
     assert torch.equal(sample["frame_idx"], torch.tensor([0, 1], dtype=torch.long))
+
+
+def test_metaworld_transition_dataset_supports_custom_frame_layout(
+    fake_metaworld_dataset_root: Path,
+) -> None:
+    """The MT50 transition dataset should support custom context and target windows."""
+
+    dataset = MetaWorldTransitionDataset(
+        data_root=str(fake_metaworld_dataset_root),
+        split="train",
+        task_index=0,
+        episode=0,
+        resolution=8,
+        frame_start=0,
+        frame_end=1,
+        frame_layout=DynamicsFrameLayout(context_frames=1, target_frames=1),
+    )
+
+    assert len(dataset) == 1
+    sample = dataset[0]
+    assert sample["context_frames"].shape == (1, 3, 8, 8)
+    assert sample["target_frames"].shape == (1, 3, 8, 8)
+    assert sample["actions"].shape == (1, 4)
+    assert torch.equal(sample["context_frame_idx"], torch.tensor([0], dtype=torch.long))
+    assert torch.equal(sample["target_frame_idx"], torch.tensor([1], dtype=torch.long))
 
 
 def test_resolve_metaworld_split_maps_val_to_train() -> None:

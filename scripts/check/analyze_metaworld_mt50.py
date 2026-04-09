@@ -641,12 +641,12 @@ def build_report(
     lines.append("")
     lines.append("## Training hook in this repo")
     lines.append(
-        "- The minimal Wan VAE path in this repo can now read MT50 directly through"
-        " `world_model_v2/minimal/run.py` with `--dataset-format lerobot_metaworld`."
+        "- The root Wan VAE plus RF-DiT path in this repo can now read MT50 directly through"
+        " `world_model_v2.run` with `--dataset-format lerobot_metaworld`."
     )
     lines.append("```bash")
     lines.append("source .venv/bin/activate")
-    lines.append("python -m world_model_v2.minimal.run \\")
+    lines.append("python -m world_model_v2.run \\")
     lines.append("  --mode ae_only \\")
     lines.append("  --dataset-format lerobot_metaworld \\")
     lines.append("  --metaworld-task-index 0 \\")

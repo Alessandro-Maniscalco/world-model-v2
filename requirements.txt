@@ -6,7 +6,6 @@ pyarrow
 huggingface_hub
 matplotlib
 torch==2.7.1
-torchvision==0.22.1
 Pillow
 imageio
 imageio-ffmpeg
