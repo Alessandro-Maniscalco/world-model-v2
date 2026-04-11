@@ -5,8 +5,10 @@ diffusers
 pyarrow
 huggingface_hub
 matplotlib
+mani_skill
 torch==2.7.1
 Pillow
 imageio
 imageio-ffmpeg
+gymnasium
 pytest

@@ -21,10 +21,28 @@ import matplotlib.pyplot as plt
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
 DEFAULT_OUTPUT_NAME = "metrics_validation_plot.png"
-TRAIN_METRICS_TO_PLOT = ("loss",)
-VALIDATION_METRICS_TO_PLOT = ("ae_loss",)
+MAX_TRAIN_METRICS = 2
+MAX_VALIDATION_METRICS = 4
+TRAIN_METRIC_PRIORITY = (
+    "loss",
+    "latent_rf_total_loss",
+    "latent_rf_mse",
+)
+VALIDATION_METRIC_PRIORITY = (
+    "ae_loss",
+    "next_frame_mse",
+    "worst_case_next_frame_mse",
+    "open_rollout_consistency_score",
+    "open_rollout_frame_mse",
+    "next_latent_mse",
+    "target_motion_ratio",
+    "open_rollout_target_motion_ratio",
+    "predicted_target_motion_l1",
+    "open_rollout_predicted_target_motion_l1",
+)
 VALIDATION_METADATA_KEYS = {
     "episode",
+    "elapsed_run_seconds",
     "input_frame_count",
     "decoded_frame_count",
     "predicted_frame_count",
@@ -76,23 +94,34 @@ def is_numeric(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def is_validation_metadata_key(key: str) -> bool:
+    """Return whether a validation payload key should be treated as metadata."""
+
+    if key in VALIDATION_METADATA_KEYS:
+        return True
+    return any(
+        fragment in key
+        for fragment in ("frame_count", "loss_frames", "seed_frames", "episode_count")
+    )
+
+
 def collect_training_series(records: list[dict[str, Any]]) -> dict[str, list[tuple[int, float]]]:
-    """Collect the selected numeric training metrics keyed by metric name."""
+    """Collect numeric training metrics keyed by metric name."""
 
     series: dict[str, list[tuple[int, float]]] = {}
     for record in records:
-        if "loss" not in record or "step" not in record:
+        if "step" not in record:
             continue
         step = int(record["step"])
         for key, value in record.items():
-            if key not in TRAIN_METRICS_TO_PLOT or not is_numeric(value):
+            if key == "step" or not is_numeric(value):
                 continue
             series.setdefault(key, []).append((step, float(value)))
     return series
 
 
 def collect_validation_series(records: list[dict[str, Any]]) -> dict[str, list[tuple[int, float]]]:
-    """Collect the selected numeric validation metrics keyed by metric name."""
+    """Collect numeric validation metrics keyed by metric name."""
 
     series: dict[str, list[tuple[int, float]]] = {}
     for record in records:
@@ -101,11 +130,7 @@ def collect_validation_series(records: list[dict[str, Any]]) -> dict[str, list[t
             continue
         step = int(record["step"])
         for key, value in validation.items():
-            if (
-                key in VALIDATION_METADATA_KEYS
-                or key not in VALIDATION_METRICS_TO_PLOT
-                or not is_numeric(value)
-            ):
+            if is_validation_metadata_key(key) or not is_numeric(value):
                 continue
             series.setdefault(key, []).append((step, float(value)))
     return series
@@ -121,18 +146,78 @@ def collect_stop_step(records: list[dict[str, Any]]) -> int | None:
     return None
 
 
+def extract_run_config(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return the run config recorded in the run_start event when present."""
+
+    run_start = next((record["run_start"] for record in records if "run_start" in record), {})
+    return run_start.get("config", {}) if isinstance(run_start, dict) else {}
+
+
+def select_metric_names(
+    series: dict[str, list[tuple[int, float]]],
+    preferred_metrics: tuple[str, ...],
+    *,
+    max_metrics: int,
+    primary_metric: str | None = None,
+) -> tuple[str, ...]:
+    """Return a compact ordered subset of series names to plot."""
+
+    selected: list[str] = []
+    if primary_metric and primary_metric in series:
+        selected.append(primary_metric)
+    for key in preferred_metrics:
+        if key in series and key not in selected:
+            selected.append(key)
+    if selected:
+        return tuple(selected[:max_metrics])
+    ranked_keys = sorted(series, key=lambda key: (-len(series[key]), key))
+    return tuple(ranked_keys[:max_metrics])
+
+
+def select_training_metric_names(
+    series: dict[str, list[tuple[int, float]]],
+) -> tuple[str, ...]:
+    """Return the compact subset of training metrics to plot."""
+
+    return select_metric_names(
+        series,
+        TRAIN_METRIC_PRIORITY,
+        max_metrics=MAX_TRAIN_METRICS,
+    )
+
+
+def select_validation_metric_names(
+    records: list[dict[str, Any]],
+    series: dict[str, list[tuple[int, float]]],
+) -> tuple[str, ...]:
+    """Return the compact subset of validation metrics to plot."""
+
+    if "ae_loss" in series:
+        return ("ae_loss",)
+    config = extract_run_config(records)
+    primary_metric = str(config.get("dynamics_validation_metric", "")).strip() or None
+    return select_metric_names(
+        series,
+        VALIDATION_METRIC_PRIORITY,
+        max_metrics=MAX_VALIDATION_METRICS,
+        primary_metric=primary_metric,
+    )
+
+
 def summarize_latest_metrics(
     training_series: dict[str, list[tuple[int, float]]],
     validation_series: dict[str, list[tuple[int, float]]],
+    training_metric_names: tuple[str, ...],
+    validation_metric_names: tuple[str, ...],
 ) -> dict[str, float]:
     """Return the latest plotted value for each selected metric."""
 
     summary: dict[str, float] = {}
-    for key in TRAIN_METRICS_TO_PLOT:
+    for key in training_metric_names:
         values = training_series.get(key, [])
         if values:
             summary[key] = values[-1][1]
-    for key in VALIDATION_METRICS_TO_PLOT:
+    for key in validation_metric_names:
         values = validation_series.get(key, [])
         if values:
             summary[f"validation.{key}"] = values[-1][1]
@@ -148,14 +233,16 @@ def build_plot(
 
     training_series = collect_training_series(records)
     validation_series = collect_validation_series(records)
-    if not training_series and not validation_series:
+    training_metric_names = select_training_metric_names(training_series)
+    validation_metric_names = select_validation_metric_names(records, validation_series)
+    if not training_metric_names and not validation_metric_names:
         raise ValueError(f"No plottable metrics found in {run_dir / 'metrics.jsonl'}.")
 
     fig, ax_train = plt.subplots(figsize=(12, 7))
     ax_val = ax_train.twinx()
 
     train_colors = plt.get_cmap("tab10")
-    for index, key in enumerate(TRAIN_METRICS_TO_PLOT):
+    for index, key in enumerate(training_metric_names):
         values = training_series.get(key, [])
         if not values:
             continue
@@ -173,7 +260,7 @@ def build_plot(
         )
 
     val_colors = plt.get_cmap("Dark2")
-    for index, key in enumerate(VALIDATION_METRICS_TO_PLOT):
+    for index, key in enumerate(validation_metric_names):
         values = validation_series.get(key, [])
         if not values:
             continue
@@ -201,8 +288,8 @@ def build_plot(
             label=f"stop@{stop_step}",
         )
 
+    config = extract_run_config(records)
     run_start = next((record["run_start"] for record in records if "run_start" in record), {})
-    config = run_start.get("config", {}) if isinstance(run_start, dict) else {}
     mode = str(config.get("mode", run_start.get("mode", "unknown")))
     ax_train.set_title(f"{run_dir.name} ({mode})")
     ax_train.set_xlabel("Step")
@@ -226,7 +313,12 @@ def build_plot(
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
 
-    summary = summarize_latest_metrics(training_series, validation_series)
+    summary = summarize_latest_metrics(
+        training_series,
+        validation_series,
+        training_metric_names,
+        validation_metric_names,
+    )
     return {
         "run_dir": str(run_dir),
         "metrics_path": str(run_dir / "metrics.jsonl"),

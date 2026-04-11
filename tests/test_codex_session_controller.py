@@ -34,11 +34,12 @@ def _make_args(output_dir: Path) -> SimpleNamespace:
     return SimpleNamespace(
         codex_bin="codex",
         dangerously_bypass_approvals_and_sandbox=False,
+        goal="maximize architecture quality",
         max_iterations=2,
         max_output_chars=12000,
         model="",
         output_dir=str(output_dir),
-        prompt="controller goal",
+        prompt="controller instructions",
         prompt_file="",
         sandbox="danger-full-access",
         skip_git_repo_check=False,
@@ -239,17 +240,53 @@ def test_build_resume_prompt_marks_failed_training_command() -> None:
         repo_changes=["M world_model_v2/run.py"],
         max_output_chars=200,
         iteration=3,
+        goal="maximize architecture quality",
     )
 
+    assert "Remember the goal:\nmaximize architecture quality" in prompt
     assert "failed" in prompt
     assert "Exit code: 7" in prompt
     assert "not automatically fatal" in prompt
-    assert "Training command summary: `python train.py`" in prompt
-    assert "Stdout log: stdout.log" in prompt
-    assert "Stderr log: stderr.log" in prompt
+    assert 'Training command summary: "python train.py"' in prompt
+    assert 'Stdout log: "stdout.log"' in prompt
+    assert 'Stderr log: "stderr.log"' in prompt
     assert "oops" in prompt
     assert "traceback" in prompt
     assert "M world_model_v2/run.py" in prompt
+
+
+def test_build_resume_prompt_keeps_same_shape_without_training_result() -> None:
+    """Resume prompts should still restate the goal and use explicit empty run fields."""
+
+    prompt = codex_session_controller.build_resume_prompt(
+        result=None,
+        repo_changes=[],
+        max_output_chars=200,
+        iteration=5,
+        goal="maximize architecture quality",
+    )
+
+    assert "Remember the goal:\nmaximize architecture quality" in prompt
+    assert "No external training command was run after the previous turn." in prompt
+    assert 'Training command summary: ""' in prompt
+    assert "Exit code: null" in prompt
+    assert "Duration seconds: null" in prompt
+    assert 'Stdout log: ""' in prompt
+    assert 'Stderr log: ""' in prompt
+    assert "```" in prompt
+    assert "[empty]" in prompt
+
+
+def test_build_controller_prompt_includes_instructions_and_goal() -> None:
+    """The initial controller prompt should carry both instructions and the persistent goal."""
+
+    prompt = codex_session_controller.build_controller_prompt(
+        prompt="inspect code and search broadly",
+        goal="find the best architecture",
+    )
+
+    assert "Session instructions:\ninspect code and search broadly" in prompt
+    assert "Remember the goal:\nfind the best architecture" in prompt
 
 
 def test_summarize_output_for_prompt_compacts_json_lines() -> None:
@@ -396,11 +433,13 @@ def test_main_allows_training_command_without_code_changes(
 
     assert len(prompts) == 2
     assert training_calls == [("python train.py", 1)]
-    assert "No external training command was run after the previous turn." not in prompts[1]
+    assert "Remember the goal:\nmaximize architecture quality" in prompts[1]
     assert "Controller-observed repo changes from your previous turn: none." in prompts[1]
-    assert "Training command summary: `python train.py`" in prompts[1]
+    assert 'Training command summary: "python train.py"' in prompts[1]
     assert "Stdout log:" in prompts[1]
+    assert "stdout.log" in prompts[1]
     assert "Stderr log:" in prompts[1]
+    assert "stderr.log" in prompts[1]
     assert "attach to this Codex session with: codex resume thread-xyz" in captured.out
     assert (tmp_path / "session_resume_command.txt").read_text(encoding="utf-8") == "codex resume thread-xyz\n"
     summary_records = _read_jsonl(tmp_path / "summary.jsonl")
@@ -483,11 +522,14 @@ def test_main_records_failed_training_command_and_continues(
     codex_session_controller.main()
 
     assert len(prompts) == 2
+    assert "Remember the goal:\nmaximize architecture quality" in prompts[1]
     assert "failed" in prompts[1]
     assert "Exit code: 3" in prompts[1]
-    assert "Training command summary: `python train.py`" in prompts[1]
+    assert 'Training command summary: "python train.py"' in prompts[1]
     assert "Stdout log:" in prompts[1]
+    assert "stdout.log" in prompts[1]
     assert "Stderr log:" in prompts[1]
+    assert "stderr.log" in prompts[1]
     assert "bad stdout" in prompts[1]
     assert "bad stderr" in prompts[1]
     assert "M world_model_v2/model.py" in prompts[1]

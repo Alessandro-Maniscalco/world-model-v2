@@ -1,876 +1,314 @@
 ## Goal
- I am working on the dynamics training. I am following closely https://github.com/NVIDIA/DreamDojo design. DreamDojo uses 1 context latent and 3 inferred latents.
-
- To look into:
- First, the action-conditioned teacher really is a 1 latent ctx + 3 latent targets setup: in their 2B action-conditioned rectified-flow config they set min_num_conditional_frames = max_num_conditional_frames = 1, state_t = 1 + 12 // 4, and num_action_per_chunk = 12, so one clean latent is used to predict three future latents from a 12-action chunk with temporal compression ratio 4 (config). During denoising they strongly pin that context latent by replacing it with ground truth and forcing a tiny conditioning noise sigma_conditional = 1e-4 (model). My inference from the code is that the teacher “finds” the later frames jointly in one denoising pass, not by explicit within-chunk autoregression.
-
-Second, DreamDojo does not stop there. Their docs say long-horizon stability comes from distillation into a causal student, with a warmup stage and then self-forcing to reduce error accumulation (DISTILL.md). The warmup model explicitly makes the network temporally causal (warmup), and the self-forcing config trains a causal student initialized from the teacher (self-forcing config). They also use chunk overlap for temporal consistency in autoregressive inference (config).
-
-The other big difference is that their action-conditioned teacher is warm-started from a pretrained video model, not trained from scratch on the 1+3 task (post-train docs, load path in config). So the short answer is: DreamDojo gets away with 1->3 because it uses a strongly anchored pretrained teacher, joint denoising over the whole latent chunk, and then a separate causal self-forcing distillation stage for rollout stability.
-
-## Progress
-
-1 ctx 1 inferred, mp4: outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to1_f48_67/samples/step_001500/episode_0.mp4.
-learned: works. Predicted frame is closer to current gt than previous gt, so it is not just copying the ctx frame. 
-Test: all 19/19 predicted frames are closer to the current GT than the previous GT. Mean cropped-frame MSE was 3.76e-4 to gt[t] versus 1.73e-3 to gt[t-1]
-
-1 ctx 2 inferred, mp4: outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_f48_67/samples/step_002000/episode_0.mp4
-learned: first inferred moves correctly. Second inferred often lags and stays closer to the previous frame than the current gt.
-
-3 frames, 1/2 cts 2/1 inferred, val 1 ctx 2 inferred, mp4: outputs/controller_dreamdojo_progressive/controller_mixed12_rfshift3_f48_67/samples/step_002000/episode_0.mp4
-learned: mixed [1,2] conditioning with rf_shift=3 and infer_steps=32 did not remove the pattern. Arm motion appears, then one frame changes only slightly, then motion continues, which suggests the weak frame is still the second inferred frame.
-
-## Latest Code Change
-
-2026-04-08:
-Implemented a DreamDojo-inspired causal self-forcing auxiliary loss for dynamics training.
-
-Why:
-The current 1 ctx -> 2 target teacher already predicts both future latents jointly, but the weak second inferred frame suggests the model is not being trained hard enough on the case where its first prediction becomes the next causal context. DreamDojo addresses this with warmup + self-forcing distillation. I added the cheapest clean approximation of that idea inside the current teacher-training codepath.
-
-What changed:
-- Added `--dynamics-self-forcing-loss-weight` to `world_model_v2.run`.
-- In `Experiment._dynamics_only_training_step`, after the standard RF teacher loss, the code now optionally:
-  - reconstructs the model's predicted clean latent chunk,
-  - detaches the predicted prefix,
-  - feeds that predicted prefix back in as a longer conditioning window (`ctx+1`, `ctx+2`, ...),
-  - applies an auxiliary RF MSE only on the remaining later target frames.
-- Added helper support for explicit conditioning masks outside the main sampled training choices so the auxiliary causal passes can use `2` conditioned frames even in a `1 -> 2` run.
-- Threaded the new flag through `scripts/check/loop_dynamics_sweep.py` so controller sweeps can search it directly.
-
-Small checks run inside Codex:
-- `source .venv/bin/activate && pytest tests/test_dynamics_transformer.py tests/test_experiment.py tests/test_run.py tests/test_loop_dynamics_sweep.py -q`
-- `source .venv/bin/activate && pytest tests/test_experiment_runtime.py tests/test_model.py tests/test_model_runtime.py -q`
-- Result: 98 tests passed.
-
-Recommended next training direction:
-- Re-run the focused `1 ctx 2 inferred` setup with `--dynamics-self-forcing-loss-weight 0.5`.
-- If the second target improves but the first target regresses, sweep `0.25` and `1.0` next.
-
-## Latest Result
-
-1 ctx 2 inferred + self-forcing 0.5, best checkpoint:
-`outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_ft_f48_67/checkpoints/best.pt`
-
-Validated with:
-`source .venv/bin/activate && python scripts/check/open_rollout_demo.py --checkpoint outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_ft_f48_67/checkpoints/best.pt --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --device cuda --output-dir outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_ft_f48_67/manual_best_open_rollout_check`
-
-learned:
-- The self-forcing loss did what it was supposed to do on the teacher-forced `1 -> 2` task.
-- The weak second inferred frame improved a lot:
-  - old `next_frame_mse_target_1`: `1.2786e-3`
-  - new best `next_frame_mse_target_1`: `6.3489e-4`
-- The first inferred frame became worse:
-  - old `next_frame_mse_target_0`: `4.2226e-4`
-  - new best `next_frame_mse_target_0`: `7.1931e-4`
-- Overall teacher-forced `1 -> 2` MSE still improved:
-  - old `next_frame_mse`: `8.2792e-4`
-  - new best `next_frame_mse`: `6.7932e-4`
-- Open-rollout improved only slightly:
-  - old best `open_rollout_frame_mse`: `3.6188e-2`
-  - new best `open_rollout_frame_mse`: `3.5676e-2`
-- Open-rollout motion ratio also improved:
-  - old `open_rollout_target_motion_ratio`: `6.84`
-  - new best `open_rollout_target_motion_ratio`: `4.80`
-
-Interpretation:
-- The causal auxiliary loss is helping redistribute capacity from the first inferred frame toward the second inferred frame.
-- That means the `1 ctx 2 inferred` formulation is not fundamentally broken in this codebase.
-- But self-forcing alone is not enough; rollout quality is still far from the stronger `rf_shift=3` mixed-conditioning run.
-
-Extra small check:
-- Running the same best checkpoint at `infer_steps=32` instead of `50` improved open-rollout MSE slightly:
-  - `infer_steps=50`: `3.5676e-2`
-  - `infer_steps=32`: `3.4943e-2`
-- So the next run should evaluate at `32` steps, not `50`.
-
-Next search direction:
-- Keep the clean `1 ctx 2 inferred` layout.
-- Combine it with the better RF schedule from the mixed run: try `dynamics_rf_shift=3.0` on top of the current self-forcing checkpoint, and validate with `infer_steps=32`.
-
-## Latest Result 2
-
-1 ctx 2 inferred + self-forcing 0.5 + rf_shift 3.0 + infer_steps 32, best checkpoint:
-`outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67/checkpoints/best.pt`
-
-Validated with:
-`source .venv/bin/activate && python scripts/check/open_rollout_demo.py --checkpoint outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67/checkpoints/best.pt --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --device cuda --output-dir outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67/manual_best_open_rollout_check`
-
-learned:
-- This was the first clean `1 ctx -> 2 inferred` run that clearly moved the whole setup into the same regime as the stronger mixed-conditioning experiment.
-- Best checkpoint happened early at step `250`, not at the end.
-- Best open-rollout MSE improved a lot versus the previous clean `1 -> 2` runs:
-  - baseline `1 -> 2`: `3.6188e-2`
-  - `1 -> 2 + self-forcing`: `3.5676e-2`
-  - `1 -> 2 + self-forcing + rf_shift=3`: `2.2398e-2`
-- Teacher-forced quality also improved:
-  - best `next_frame_mse`: `6.6285e-4`
-  - best target-0 MSE: `7.1453e-4`
-  - best target-1 MSE: `6.0542e-4`
-- Open-rollout motion ratio improved strongly:
-  - previous clean self-forcing run: `4.80`
-  - new best: `3.16`
-
-Comparison to the mixed-conditioning rf_shift=3 run:
-- Mixed run still has the best tuned-span open rollout on this clip:
-  - mixed `[1,2]` best `open_rollout_frame_mse`: `2.0849e-2`
-  - clean `1 -> 2` best `open_rollout_frame_mse`: `2.2398e-2`
-- But the clean `1 -> 2` run is now close, while having much better teacher-forced `1 -> 2` metrics than the mixed run.
-
-Interpretation:
-- The main blocker for clean `1 -> 2` was not the chunk layout by itself.
-- The important ingredients were:
-  - causal self-forcing pressure on the second inferred frame
-  - the lower `rf_shift=3` schedule
-  - validating/sampling at `infer_steps=32`
-- The fact that the best checkpoint is at step `250` suggests this leg now wants short polish runs or early-stop-aware sweeps rather than longer full-length finetunes.
-
-Next search direction:
-- Start from the new best checkpoint and run a short low-LR polish leg.
-- Keep the same `1 -> 2`, `self_forcing=0.5`, `rf_shift=3.0`, and `infer_steps=32` settings.
-- Only change optimization pressure next: lower LR and shorter run length.
-
-## Latest Result 3
-
-Short low-LR polish from the clean `1 -> 2` best checkpoint:
-`outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_lr2e5_polish_f48_67/checkpoints/best.pt`
-
-Validated with:
-`source .venv/bin/activate && python scripts/check/open_rollout_demo.py --checkpoint outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_lr2e5_polish_f48_67/checkpoints/best.pt --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --device cuda --output-dir outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_lr2e5_polish_f48_67/manual_best_open_rollout_check`
-
-learned:
-- This polish leg did not beat the parent checkpoint.
-- Best checkpoint in the polish leg was step `400`.
-- Best open-rollout MSE from the polish leg was `2.5395e-2`.
-- That is worse than the parent clean `1 -> 2` best:
-  - parent best `open_rollout_frame_mse`: `2.2398e-2`
-  - polish best `open_rollout_frame_mse`: `2.5395e-2`
-- Teacher-forced `1 -> 2` stayed strong, but rollout got worse again:
-  - polish best `next_frame_mse`: `6.2933e-4`
-  - polish best `next_frame_mse_target_0`: `7.0890e-4`
-  - polish best `next_frame_mse_target_1`: `5.4093e-4`
-
-Interpretation:
-- Once the clean `1 -> 2` run reaches the good `rf_shift=3` regime, more plain low-LR polishing does not help rollout on this span.
-- The objective is still pulling teacher-forced quality and open-loop quality in different directions.
-- So the next search should not be another same-objective polish. The next search needs to change the balance of the objective again.
-
-Next search direction:
-- Keep the best checkpoint from `controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67`.
-- Reduce self-forcing pressure from `0.5` to `0.25` and do a short run with frequent validation.
-- Goal: keep most of the second-frame gain while giving the first inferred frame and rollout a chance to recover.
-
-## Latest Result 4
-
-Short clean `1 -> 2` continuation with lower self-forcing pressure:
-`outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce025_rfshift3_infer32_short_f48_67/checkpoints/best.pt`
-
-learned:
-- This did not help rollout. Best checkpoint was again early at step `250`, but the run landed far behind the parent `self_forcing=0.5` model on open rollout.
-- Best open-rollout MSE regressed badly:
-  - parent clean `1 -> 2` best: `2.2398e-2`
-  - `self_forcing=0.25` short run best: `3.3411e-2`
-- Teacher-forced `1 -> 2` metrics stayed strong:
-  - best `next_frame_mse`: `6.1844e-4`
-  - best target-0 MSE: `6.1040e-4`
-  - best target-1 MSE: `6.2737e-4`
-
-Interpretation:
-- Reducing self-forcing pressure alone is the wrong axis.
-- The model can still score well on teacher-forced `1 -> 2` while rollout gets much worse, so the remaining gap is now more about conditioning semantics than raw loss weight balance.
-- That means the next change should stay with `self_forcing=0.5` and instead attack the teacher-conditioning mismatch versus DreamDojo.
-
-## Latest Code Change 2
-
-2026-04-08:
-Implemented DreamDojo-style tiny conditioning noise for repinned context frames.
-
-Why:
-The local RF teacher had still been pinning conditioned frames perfectly clean during both training and sampling. DreamDojo's action-conditioned configs instead use `sigma_conditional=1e-4`, so their teacher never sees a mathematically exact clean prefix inside the denoising state. After the failed `self_forcing=0.25` run, this looked like the cleanest remaining mismatch to fix without changing the chunk layout or undoing the useful second-target pressure from `self_forcing=0.5`.
-
-What changed:
-- Added `--conditional-frame-sigma` to `world_model_v2.run`.
-- Threaded the flag through `ExperimentConfig`, `WorldModel`, `scripts/check/loop_dynamics_sweep.py`, and `scripts/check/open_rollout_demo.py`.
-- In `RectifiedFlowDynamics`, conditioned frames are now optionally repinned to `x_cond = x_clean + sigma_conditional * v` instead of always using exact clean latents.
-- Applied the same tiny-sigma conditioning path in both teacher training and iterative sampling so rollout semantics match training semantics.
-- Kept checkpoint compatibility: older checkpoints without this field still load with `conditional_frame_sigma=0.0`.
-
-Design decision:
-- I left `conditional_frame_timestep` unchanged at `-1.0` for the next run.
-- Reason: the `self_forcing=0.25` experiment already showed the loss-weight axis was misleading, so the next study should isolate the conditioning-noise change by itself instead of moving two DreamDojo-mimic knobs at once.
-
-Small checks run inside Codex:
-- `source .venv/bin/activate && pytest tests/test_dynamics_transformer.py tests/test_experiment.py tests/test_run.py tests/test_model.py tests/test_loop_dynamics_sweep.py -q`
-- `source .venv/bin/activate && pytest tests/test_experiment_runtime.py tests/test_model_runtime.py -q`
-- Result: `102 passed` across both pytest slices.
-- Compatibility smoke check:
-  - `source .venv/bin/activate && python - <<'PY' ... build_model_from_checkpoint(...) ... PY`
-  - Older best checkpoint `controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67/checkpoints/best.pt` still loads and resolves `conditional_frame_sigma=0.0`.
-
-Recommended next training direction:
-- Start from `outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67/checkpoints/best.pt`.
-- Keep the current best clean recipe:
-  - `1 ctx -> 2 inferred`
-  - `self_forcing=0.5`
-  - `rf_shift=3.0`
-  - `infer_steps=32`
-- Only add `--conditional-frame-sigma 1e-4`.
-- Use a short frequent-validation run again, because the best clean checkpoint has kept appearing around step `250`.
-
-## Latest Result 5
-
-Short continuation from the clean best with DreamDojo-style `conditional_frame_sigma=1e-4`:
-`outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_condsig1e4_short_f48_67/checkpoints/best.pt`
-
-learned:
-- This change did not help the clean `1 -> 2` rollout regime.
-- Best checkpoint was at step `200`.
-- Best open-rollout MSE was worse than both the parent best and even the failed `self_forcing=0.25` short run:
-  - parent clean best: `2.2398e-2`
-  - `self_forcing=0.25` short run: `3.3411e-2`
-  - `conditional_frame_sigma=1e-4` short run: `3.4155e-2`
-- Teacher-forced `1 -> 2` stayed good:
-  - best `next_frame_mse`: `6.3267e-4`
-  - best target-0 MSE: `7.0201e-4`
-  - best target-1 MSE: `5.5563e-4`
-
-Interpretation:
-- Matching DreamDojo's tiny conditional sigma was not the missing ingredient in this smaller setup.
-- The run again improved teacher-forced metrics while hurting open-loop rollout, so the remaining gap still looks like a staging/objective issue rather than a tiny teacher-noise mismatch.
-
-## Latest Code Change 3
-
-2026-04-08:
-Added explicit open-rollout overlap controls and staged self-forcing warmup support.
-
-Why:
-- DreamDojo docs mention chunk overlap during autoregressive inference, so I added a clean way to test overlap directly instead of assuming the current stride-2 rollout is optimal for a `1 -> 2` teacher.
-- The bigger structural difference versus DreamDojo is still warmup first, self-forcing later. The repo had only a constant self-forcing weight from step `0`, so I added a warmup gate to let the model train as a plain teacher for an initial window before enabling the causal auxiliary loss.
-
-What changed:
-- Added `--dynamics-open-rollout-stride-frames` to the model/config/CLI/sweep/demo path.
-- `WorldModel.rollout` can now append fewer frames than one sampled chunk predicts, so overlap experiments are explicit instead of being hard-coded to stride equal to the full target chunk.
-- Added `--dynamics-self-forcing-warmup-steps` so self-forcing can stay off for the first N optimizer steps and then turn on automatically.
-- Validation stats and rollout demo stats now record the effective rollout stride.
-
-Small checks run inside Codex:
-- `source .venv/bin/activate && pytest tests/test_experiment.py tests/test_run.py tests/test_loop_dynamics_sweep.py tests/test_model.py tests/test_dynamics_transformer.py -q`
-- `source .venv/bin/activate && pytest tests/test_experiment_runtime.py tests/test_model_runtime.py -q`
-- Result: `111 passed`.
-
-Focused local rollout check:
-- I ran the parent clean best checkpoint with overlap stride `1` on the same `f48:67` span:
-  - command: `source .venv/bin/activate && python scripts/check/open_rollout_demo.py --checkpoint outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67/checkpoints/best.pt --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --device cuda --dynamics-open-rollout-stride-frames 1 --output-dir outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67/overlap_stride_checks --run-name stride1_f48_67`
-  - result: `open_rollout_frame_mse = 3.5723e-2`
-  - baseline same checkpoint with default stride-2 rollout: `2.2398e-2`
-
-Interpretation:
-- Overlap at inference is not the fix here. This teacher is using its joint `1 -> 2` head effectively when allowed to commit both frames; forcing stride-1 overlap makes rollout much worse on this clip.
-- That leaves staged self-forcing as the cleaner remaining DreamDojo-inspired change to test next.
-
-Recommended next training direction:
-- Start from the clean no-self-forcing checkpoint `outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_f48_67/checkpoints/best.pt`.
-- Keep the good rollout recipe:
-  - `1 ctx -> 2 inferred`
-  - `rf_shift=3.0`
-  - `infer_steps=32`
-  - validation metric `open_rollout_frame_mse`
-- Enable DreamDojo-style staging instead of constant self-forcing from step `0`:
-  - `dynamics_self_forcing_loss_weight=0.5`
-  - `dynamics_self_forcing_warmup_steps=250`
-- Do not use `conditional_frame_sigma` or overlap stride for that run.
-
-## Latest Result 6
-
-Warmup-then-self-forcing run from the clean no-self-forcing `1 -> 2` checkpoint:
-`outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_rfshift3_selfforce05_warm250_infer32_ft_f48_67/checkpoints/best.pt`
-
-Validated with:
-`source .venv/bin/activate && python scripts/check/open_rollout_demo.py --checkpoint outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_rfshift3_selfforce05_warm250_infer32_ft_f48_67/checkpoints/best.pt --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --device cuda --output-dir outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_rfshift3_selfforce05_warm250_infer32_ft_f48_67/manual_best_open_rollout_check`
-
-learned:
-- This staging idea helped a lot versus the original clean no-self-forcing baseline, but it still did not beat the existing best constant-self-forcing recipe.
-- Best checkpoint was exactly step `250`, which is the last pure warmup validation before self-forcing turns on.
-- Best open-rollout MSE improved strongly versus the original clean baseline:
-  - original clean `1 -> 2` baseline: `3.6188e-2`
-  - warmup-best before self-forcing: `2.8402e-2`
-- But it stayed clearly worse than the current best constant-self-forcing run:
-  - constant `self_forcing=0.5` + `rf_shift=3` best: `2.2398e-2`
-  - warmup-best before self-forcing: `2.8402e-2`
-- Teacher-forced metrics at the warmup best looked like the old clean regime, not the stronger second-target regime:
-  - best `next_frame_mse`: `7.9176e-4`
-  - best target-0 MSE: `4.1987e-4`
-  - best target-1 MSE: `1.2050e-3`
-
-Interpretation:
-- The important signal is that the best checkpoint happened exactly before self-forcing started.
-- That means this single-run warmup gate is not enough by itself. The separate teacher-style warmup leg is useful, but turning on self-forcing in-place with the same optimizer state still hurts this setup.
-- This is closer to DreamDojo than before, though: we now have an explicit warmup stage result, and it suggests the next thing to test is a separate second-stage finetune initialized from that warmup-best checkpoint, not a single run that switches objectives midstream.
-
-## Latest Code Change 4
-
-2026-04-08:
-Added self-forcing warmup gating to the training loop and used it to isolate the warmup-stage best checkpoint.
-
-Why:
-- DreamDojo separates warmup and self-forcing into different stages.
-- The repo previously only supported a constant self-forcing weight from step `0`.
-- I added `--dynamics-self-forcing-warmup-steps` so we can train a pure teacher stage first, then enable the auxiliary causal loss later, and measure whether the best checkpoint comes before or after that transition.
-
-What changed:
-- Added `--dynamics-self-forcing-warmup-steps` to the CLI and sweep helper.
-- `Experiment._dynamics_only_training_step` now computes an active self-forcing weight based on `current_step`.
-- Metrics now log `active_self_forcing_loss_weight` so the switch point is visible in training traces.
-
-Small checks run inside Codex:
-- `source .venv/bin/activate && pytest tests/test_experiment.py tests/test_run.py tests/test_loop_dynamics_sweep.py tests/test_model.py tests/test_dynamics_transformer.py -q`
-- `source .venv/bin/activate && pytest tests/test_experiment_runtime.py tests/test_model_runtime.py -q`
-- Result: `111 passed`.
-
-Design decision:
-- I am not removing the constant-self-forcing path, because it still gives the best observed rollout on this clip.
-- The new warmup gate is a research control: it lets us cleanly separate "warmup helps" from "switching to self-forcing helps".
-
-Recommended next training direction:
-- Keep the warmup-best checkpoint from `controller_dreamdojo_progressive_1to2_rfshift3_selfforce05_warm250_infer32_ft_f48_67/checkpoints/best.pt` as the stage-1 result.
-- Start a fresh second-stage finetune from that checkpoint with optimizer reset:
-  - `self_forcing=0.5`
-  - `self_forcing_warmup_steps=0`
-  - lower LR than the warmup leg, because the objective is changing at init
-- This is the closest clean analogue to DreamDojo's explicit warmup stage followed by self-forcing stage.
-
-## Latest Result 7
-
-Separate stage-2 self-forcing finetune from the warmup-best checkpoint:
-`outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_rfshift3_warmbest_selfforce05_lr2e5_short_f48_67/checkpoints/best.pt`
-
-Validated with:
-`source .venv/bin/activate && python scripts/check/open_rollout_demo.py --checkpoint outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_rfshift3_warmbest_selfforce05_lr2e5_short_f48_67/checkpoints/best.pt --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --device cuda --output-dir outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_rfshift3_warmbest_selfforce05_lr2e5_short_f48_67/manual_best_open_rollout_check`
-
-learned:
-- This separate stage-2 run was worse than the warmup-best checkpoint it started from.
-- Best checkpoint happened early at step `200`.
-- Best open-rollout MSE regressed sharply:
-  - warmup-best stage-1 result: `2.8402e-2`
-  - separate stage-2 self-forcing finetune: `4.1677e-2`
-- Teacher-forced metrics shifted only a little:
-  - best `next_frame_mse`: `7.5179e-4`
-  - best target-0 MSE: `6.3968e-4`
-  - best target-1 MSE: `8.7635e-4`
-
-Interpretation:
-- A hard switch into `self_forcing=0.5` is too abrupt, even when done as a separate stage with reset optimizer and lower LR.
-- The failure mode is now consistent across both in-place transition and separate stage-2 transition:
-  - constant self-forcing from a strong `rf_shift=3` run can work,
-  - but switching a warmup-style checkpoint straight to full self-forcing hurts rollout.
-- So the next clean thing to test is not another binary on/off stage split. The next test needs a smooth self-forcing transition.
-
-## Latest Code Change 5
-
-2026-04-08:
-Added linear self-forcing ramp support on top of the existing warmup gate.
-
-Why:
-- The latest stage-2 finetune showed that going directly from warmup-best to full `self_forcing=0.5` is too sharp.
-- The training logic needed one more control: warmup decides when self-forcing is allowed to start, and ramp controls how fast it grows to the target weight once it starts.
-
-What changed:
-- Added `--dynamics-self-forcing-ramp-steps` to `world_model_v2.run` and `scripts/check/loop_dynamics_sweep.py`.
-- `Experiment._active_dynamics_self_forcing_loss_weight()` now supports:
-  - zero weight during warmup,
-  - linear ramp from `0` to `dynamics_self_forcing_loss_weight`,
-  - full weight after the ramp finishes.
-- Added tests for negative-ramp rejection, CLI/sweep wiring, and ramped weight behavior inside `_dynamics_only_training_step`.
-
-Design decision:
-- I kept the warmup and ramp as separate knobs.
-- Reason: they control different things:
-  - warmup = when the auxiliary objective begins,
-  - ramp = how sharply it takes over.
-- Keeping them separate makes the search cleaner than baking one fixed schedule into the trainer.
-
-Small checks run inside Codex:
-- `source .venv/bin/activate && pytest tests/test_experiment.py tests/test_run.py tests/test_loop_dynamics_sweep.py -q`
-- `source .venv/bin/activate && pytest tests/test_experiment_runtime.py tests/test_model_runtime.py -q`
-- Result: `87 passed` across both slices.
-
-Recommended next training direction:
-- Start again from the warmup-best checkpoint `controller_dreamdojo_progressive_1to2_rfshift3_selfforce05_warm250_infer32_ft_f48_67/checkpoints/best.pt`.
-- Keep the same stage-2 setup as the failed run, except replace the abrupt full-weight switch with a ramp:
-  - `self_forcing=0.5`
-  - `self_forcing_warmup_steps=0`
-  - `self_forcing_ramp_steps=250`
-  - `lr=2e-5`
-  - short frequent-validation run
-
-## Latest Code Change 6
-
-2026-04-09:
-Replaced the self-forcing research path with a rollout-aligned option that uses the same context semantics as open-loop inference.
-
-Why:
-- After reading the current trainer carefully, the existing auxiliary loss turned out to be solving the wrong problem for the clean `1 -> 2` case.
-- The old helper improves the second target by feeding back a predicted **expanded prefix** inside the same 3-frame chunk:
-  - train on `1 ctx -> 2 targets`
-  - auxiliary pass on `2 ctx -> 1 target`
-- But open-loop rollout never uses that `2 ctx -> 1 target` pattern. With `conditioning_frame_choices=(1,)`, rollout always reuses a **single** context frame on the next chunk.
-- That mismatch explains the recent pattern in the logs:
-  - teacher-forced `1 -> 2` improved a lot
-  - rollout improved only a little
-- DreamDojo's distillation docs also point in this direction: self-forcing is about the model training on its own autoregressive predictions, not just a stronger within-chunk teacher target.
-
-What changed:
-- Added `--dynamics-self-forcing-mode` with:
-  - `expanded_context` = the old within-chunk prefix expansion path
-  - `rollout` = new same-context rollout auxiliary
-- Added `--dynamics-self-forcing-rollout-chunks` to request extra future chunks for rollout self-forcing.
-- Extended both `TransitionDataset` and `MetaWorldTransitionDataset` so dynamics batches can optionally carry:
-  - `future_target_frames`
-  - `future_actions`
-- In rollout mode, `Experiment._dynamics_self_forcing_loss` now:
-  - reuses the configured `open_rollout_context_frames`,
-  - rolls the model forward on future chunks with the same action-window slicing used by `WorldModel.rollout`,
-  - scores only future target frames from those extra chunks.
-- Kept the old expanded-context path as the default so earlier runs remain reproducible.
-- Threaded the new flags through `world_model_v2.run` and `scripts/check/loop_dynamics_sweep.py`.
-
-Design decision:
-- I intentionally tied rollout self-forcing to `open_rollout_context_frames` instead of adding a third context knob.
-- Reason: the whole point of this study is to remove the training/inference semantic mismatch, so the auxiliary should follow the exact rollout context count that validation and demos already use.
-
-Small checks run inside Codex:
-- `source .venv/bin/activate && pytest tests/test_dataset.py tests/test_metaworld_dataset.py tests/test_experiment.py tests/test_run.py tests/test_loop_dynamics_sweep.py -q`
-- `source .venv/bin/activate && pytest tests/test_dynamics_transformer.py tests/test_model.py tests/test_model_runtime.py tests/test_experiment_runtime.py -q`
-- Result: `136 passed` across both pytest slices.
-- Real-checkpoint smoke run of the new objective path:
-  - `source .venv/bin/activate && python -m world_model_v2.run --mode dynamics_only --dataset-format lerobot_metaworld --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --batch-size 1 --lr 2e-5 --max-steps 1 --validation-interval 1 --checkpoint-interval 0 --log-interval 1 --early-stop-window-size 0 --output-dir outputs/smoke --run-name rollout_self_forcing_smoke_1step --load-encoder-decoder outputs/minimal/metaworld_task0_wan_ae_240/checkpoints/best.pt --load-dynamics outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67/checkpoints/best.pt --dynamics-context-frames 1 --dynamics-target-frames 2 --dynamics-conditioning-frame-choices 1 --dynamics-conditioning-frame-probabilities 1.0 --dynamics-validation-conditioning-frame-choices 1 --dynamics-open-rollout-context-frames 1 --dynamics-self-forcing-loss-weight 0.5 --dynamics-self-forcing-mode rollout --dynamics-self-forcing-rollout-chunks 1 --dynamics-infer-steps 32 --dynamics-rf-shift 3.0 --dynamics-validation-metric open_rollout_frame_mse --device cuda`
-  - Result: completed successfully and logged `latent_rf_self_forcing_rollout_mse_chunk1`, which confirms the new rollout auxiliary path runs end-to-end on real data/checkpoints.
-
-Recommended next training direction:
-- Start from the current best clean checkpoint:
-  - `outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67/checkpoints/best.pt`
-- Keep the known-good recipe fixed:
-  - `1 ctx -> 2 inferred`
-  - `rf_shift=3.0`
-  - `infer_steps=32`
-  - validation metric `open_rollout_frame_mse`
-  - batch size `9`
-- Change only the auxiliary semantics:
-  - `self_forcing_loss_weight=0.5`
-  - `self_forcing_mode=rollout`
-  - `self_forcing_rollout_chunks=1`
-  - short low-LR continuation with frequent validation
-
-Expectation:
-- If this hypothesis is right, teacher-forced metrics may move only slightly, but open-rollout should respond more directly than it did under the old expanded-prefix auxiliary because the training target finally matches the `1 ctx` rollout path.
-
-## Latest Result 8
-
-Rollout-aligned self-forcing run from the clean best checkpoint:
-`outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rollout1_rfshift3_infer32_lr2e5_short_f48_67/checkpoints/best.pt`
-
-Validated with:
-`source .venv/bin/activate && python scripts/check/open_rollout_demo.py --checkpoint outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rollout1_rfshift3_infer32_lr2e5_short_f48_67/checkpoints/best.pt --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --device cuda --output-dir outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rollout1_rfshift3_infer32_lr2e5_short_f48_67/manual_best_open_rollout_check`
-
-learned:
-- The new rollout-aligned auxiliary is real and trainable: the run completed cleanly, the best checkpoint was at step `350`, and the manual rollout check exactly matched the validation metric.
-- It improved a lot over the earlier warmup-style and failed continuation legs, but it did **not** beat the existing best expanded-context self-forcing run.
-- Best open-rollout MSE:
-  - parent clean best with old expanded-context self-forcing: `2.2398e-2`
-  - new rollout-self-forcing best: `2.4004e-2`
-- Teacher-forced quality improved slightly versus the parent best:
-  - parent `next_frame_mse`: `6.6285e-4`
-  - rollout-self-forcing best `next_frame_mse`: `6.5196e-4`
-- The target balance shifted:
-  - parent best target-0 MSE: `7.1453e-4`
-  - rollout-self-forcing best target-0 MSE: `5.9693e-4`
-  - parent best target-1 MSE: `6.0542e-4`
-  - rollout-self-forcing best target-1 MSE: `7.1310e-4`
-- Open-rollout motion ratio improved a little versus the parent best:
-  - parent best motion ratio: `3.16`
-  - rollout-self-forcing best motion ratio: `3.00`
-
-Interpretation:
-- The rollout-aligned auxiliary is not a dead end. It changed behavior in a meaningful DreamDojo-like direction:
-  - rollout motion got slightly more realistic,
-  - teacher-forced average error got slightly better,
-  - the best checkpoint appeared mid-run instead of immediately collapsing.
-- But the loss is currently over-tilting the tradeoff:
-  - it helps the generated sequence behave more like a usable rollout,
-  - while giving back some of the old second-target sharpness that the expanded-context auxiliary had recovered.
-- So the main conclusion is:
-  - the semantic mismatch diagnosis was useful,
-  - but `rollout self-forcing weight = 0.5` is too strong for this tiny setup.
-
-Next search direction:
-- Keep the new rollout auxiliary code.
-- Start from the new rollout best checkpoint, not from scratch.
-- Reduce rollout self-forcing pressure from `0.5` to `0.25` and run another short low-LR continuation.
-- Goal: keep the better rollout motion ratio while recovering some of the open-rollout MSE gap to the parent best.
-
-## Latest Result 9
-
-Short continuation from the rollout-best checkpoint with lower rollout self-forcing pressure:
-`outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce025_rollout1_fromrolloutbest_rfshift3_infer32_lr2e5_short_f48_67/checkpoints/best.pt`
-
-Validated with:
-`source .venv/bin/activate && python scripts/check/open_rollout_demo.py --checkpoint outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce025_rollout1_fromrolloutbest_rfshift3_infer32_lr2e5_short_f48_67/checkpoints/best.pt --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --device cuda --output-dir outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce025_rollout1_fromrolloutbest_rfshift3_infer32_lr2e5_short_f48_67/manual_best_open_rollout_check`
-
-learned:
-- Lowering rollout self-forcing from `0.5` to `0.25` helped teacher-forced metrics again, but it did not recover the rollout gap to the original expanded-context best.
-- Best checkpoint was early at step `200`.
-- Best open-rollout MSE:
-  - rollout-self-forcing `0.5` best: `2.4004e-2`
-  - rollout-self-forcing `0.25` best: `2.5747e-2`
-  - original expanded-context best: `2.2398e-2`
-- Teacher-forced metrics improved further:
-  - rollout-self-forcing `0.5` best `next_frame_mse`: `6.5196e-4`
-  - rollout-self-forcing `0.25` best `next_frame_mse`: `6.2929e-4`
-  - rollout-self-forcing `0.25` best target-0 MSE: `5.4081e-4`
-  - rollout-self-forcing `0.25` best target-1 MSE: `7.2760e-4`
-- Open-rollout motion ratio moved back toward the expanded-context regime:
-  - rollout-self-forcing `0.5` best: `3.00`
-  - rollout-self-forcing `0.25` best: `3.21`
-  - original expanded-context best: `3.16`
-
-Interpretation:
-- This confirms the pattern from the previous run:
-  - smaller rollout weight improves teacher-forced numbers,
-  - larger rollout weight helps rollout more directly.
-- So rollout-only self-forcing is trading against the within-chunk second-target objective instead of replacing it.
-- The clean next move is no longer another rollout-only sweep. The next move should combine both pressures:
-  - keep the strong expanded-context auxiliary that gave the best `1 -> 2` checkpoint,
-  - add a smaller rollout-aligned auxiliary on top.
-
-## Latest Code Change 7
-
-2026-04-09:
-Added an optional rollout self-forcing auxiliary weight on top of the existing primary self-forcing mode.
-
-Why:
-- The experiments now separate cleanly into two behaviors:
-  - expanded-context self-forcing gives the best overall open-rollout MSE and the strongest second-target recovery,
-  - rollout self-forcing improves different rollout-facing signals but cannot beat the parent best by itself.
-- DreamDojo effectively benefits from both kinds of pressure across teacher and student stages.
-- The closest local analogue in this codebase is to keep the current primary auxiliary exactly as-is and add a second rollout-aligned loss with its own weight.
-
-What changed:
-- Added `--dynamics-rollout-self-forcing-loss-weight` to `world_model_v2.run` and `scripts/check/loop_dynamics_sweep.py`.
-- Kept `--dynamics-self-forcing-mode` as the primary auxiliary selector:
-  - `expanded_context` or `rollout`
-- Added hybrid support implicitly:
-  - use `dynamics-self-forcing-mode expanded_context`
-  - keep `dynamics-self-forcing-loss-weight > 0`
-  - add `dynamics-rollout-self-forcing-loss-weight > 0`
-- Both self-forcing losses now share the same warmup/ramp schedule multiplier.
-- Training metrics now report:
-  - `active_rollout_self_forcing_loss_weight`
-  - `latent_rf_rollout_self_forcing_mse`
-  - `latent_rf_rollout_self_forcing_weighted_loss`
-- Added config/CLI/test coverage and a real 1-step CUDA smoke run for the hybrid path.
-
-Design decision:
-- I did not add a separate second warmup/ramp schedule for rollout auxiliary.
-- Reason: the immediate research question is about *loss composition*, not schedule search. Sharing one schedule keeps the next experiment interpretable.
-
-Small checks run inside Codex:
-- `source .venv/bin/activate && pytest tests/test_experiment.py tests/test_experiment_runtime.py tests/test_run.py tests/test_loop_dynamics_sweep.py -q`
-- Result: `89 passed`.
-- Hybrid-path smoke check:
-  - `source .venv/bin/activate && python -m world_model_v2.run ... --dynamics-self-forcing-loss-weight 0.5 --dynamics-rollout-self-forcing-loss-weight 0.25 --dynamics-self-forcing-mode expanded_context --dynamics-self-forcing-rollout-chunks 1 ... --max-steps 1 ...`
-  - Result: completed successfully on CUDA and logged both primary and rollout self-forcing metrics in the same training step.
-
-Recommended next training direction:
-- Start from the original clean best expanded-context checkpoint:
-  - `outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67/checkpoints/best.pt`
-- Keep the known-good core recipe fixed:
-  - `1 ctx -> 2 inferred`
-  - `rf_shift=3.0`
-  - `infer_steps=32`
-  - validation metric `open_rollout_frame_mse`
-  - `lr=2e-5`
-- Run a short hybrid continuation:
-  - expanded-context self-forcing weight `0.5`
-  - rollout self-forcing auxiliary weight `0.25`
-  - rollout chunks `1`
-  - frequent validation
-
-## Latest Result 10
-
-Hybrid continuation from the expanded-context best with both auxiliaries enabled:
-`outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_plusrollout025_rfshift3_infer32_lr2e5_short_f48_67/checkpoints/best.pt`
-
-Validated with:
-`source .venv/bin/activate && python scripts/check/open_rollout_demo.py --checkpoint outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_plusrollout025_rfshift3_infer32_lr2e5_short_f48_67/checkpoints/best.pt --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --device cuda --output-dir outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_plusrollout025_rfshift3_infer32_lr2e5_short_f48_67/manual_best_open_rollout_check_turn4`
-
-learned:
-- The hybrid loss still did not beat the original expanded-context best, and it also did not beat rollout-only `0.5`.
-- Best checkpoint arrived immediately at step `50`, then degraded:
-  - step `50` open-rollout MSE: `2.4634e-2`
-  - step `100` open-rollout MSE: `3.1312e-2`
-  - step `150` open-rollout MSE: `3.8475e-2`
-  - step `200` open-rollout MSE: `6.6179e-2`
-- The direct open-rollout check matched the saved validation exactly:
-  - `input_frame_count=20`
-  - `predicted_frame_count=20`
-  - `decoded_frame_count=20`
-  - `loss_frames=19`
-  - `seed_frames=1`
-  - `open_rollout_frame_mse=2.4633770808577538e-2`
-- Comparison against the relevant baselines:
-  - original expanded-context best: `2.2398e-2`
-  - rollout-only `0.5` best: `2.4004e-2`
-  - hybrid `0.5 + 0.25` best: `2.4634e-2`
-  - rollout-only `0.25` continuation best: `2.5747e-2`
-
-Interpretation:
-- Adding rollout pressure on top of the expanded-context auxiliary is not wrong in principle, but enabling it immediately is too aggressive for a checkpoint that is already near a good teacher-forced optimum.
-- The shape of the run matters more than the raw hybrid composition here:
-  - step `50` is still usable,
-  - later steps drift away,
-  - that is the signature of an auxiliary that should be delayed or ramped separately instead of sharing the primary schedule.
-
-## Latest Code Change 8
-
-2026-04-09:
-Added a separate warmup/ramp schedule for the rollout self-forcing auxiliary.
-
-Why:
-- The previous hybrid implementation made both auxiliaries share one schedule.
-- The hybrid training result showed that the rollout auxiliary is the unstable part:
-  - the best checkpoint appeared at the first validation window,
-  - continued optimization under immediate rollout pressure made rollout quality worse instead of better.
-- So the clean next change is not another weight sweep first. The clean change is to decouple *when* the rollout auxiliary turns on from the already-working expanded-context auxiliary.
-
-What changed:
-- Added rollout-auxiliary-only schedule config fields:
-  - `dynamics_rollout_self_forcing_warmup_steps`
-  - `dynamics_rollout_self_forcing_ramp_steps`
-- Threaded those flags through:
-  - `world_model_v2.run`
-  - `scripts/check/loop_dynamics_sweep.py`
-  - `ExperimentConfig`
-- Refactored the schedule math so both objectives use the same helper but not the same config:
-  - primary self-forcing keeps using `dynamics_self_forcing_warmup_steps` and `dynamics_self_forcing_ramp_steps`
-  - rollout auxiliary now uses its own rollout-specific warmup/ramp pair
-- Added tests for:
-  - negative rollout warmup/ramp validation
-  - CLI parsing
-  - sweep-command forwarding
-  - training-step behavior where the primary auxiliary is active while the rollout auxiliary is still warming up
-  - training-step behavior where the rollout auxiliary ramps independently after warmup
-
-Design decision:
-- I kept the rollout schedule default at zero instead of implicitly inheriting the primary schedule.
-- Reason: the bad behavior only appears when rollout pressure turns on too early. Making the rollout schedule explicit keeps the search space understandable and makes the next run interpretable from the command line.
-
-Small checks run inside Codex:
-- `source .venv/bin/activate && pytest tests/test_experiment.py tests/test_run.py tests/test_loop_dynamics_sweep.py -q`
-  - Result: `85 passed`.
-- `source .venv/bin/activate && pytest tests/test_experiment_runtime.py -q`
-  - Result: `10 passed`.
-- Delayed-rollout CUDA smoke:
-  - `source .venv/bin/activate && python -m world_model_v2.run --mode dynamics_only --dataset-format lerobot_metaworld --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --batch-size 1 --lr 2e-5 --max-steps 1 --validation-interval 1 --checkpoint-interval 0 --log-interval 1 --early-stop-window-size 0 --output-dir outputs/smoke --run-name rollout_aux_schedule_smoke_1step --load-encoder-decoder outputs/minimal/metaworld_task0_wan_ae_240/checkpoints/best.pt --load-dynamics outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67/checkpoints/best.pt --dynamics-context-frames 1 --dynamics-target-frames 2 --dynamics-conditioning-frame-choices 1 --dynamics-conditioning-frame-probabilities 1.0 --dynamics-validation-conditioning-frame-choices 1 --dynamics-open-rollout-context-frames 1 --dynamics-self-forcing-loss-weight 0.5 --dynamics-rollout-self-forcing-loss-weight 0.25 --dynamics-self-forcing-mode expanded_context --dynamics-self-forcing-rollout-chunks 1 --dynamics-rollout-self-forcing-warmup-steps 50 --dynamics-rollout-self-forcing-ramp-steps 100 --dynamics-infer-steps 32 --dynamics-rf-shift 3.0 --dynamics-validation-metric open_rollout_frame_mse --device cuda`
-  - Result: completed successfully and logged `active_self_forcing_loss_weight=0.5` with `active_rollout_self_forcing_loss_weight=0.0` at step `1`, which confirms the rollout auxiliary now stays off during its own warmup window.
-
-## Latest Result 11
-
-Delayed-rollout hybrid continuation from the expanded-context best:
-`outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_plusrollout025_rwarm50_rramp100_rfshift3_infer32_lr2e5_f48_67/checkpoints/best.pt`
-
-Validated with:
-`source .venv/bin/activate && python scripts/check/open_rollout_demo.py --checkpoint outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_plusrollout025_rwarm50_rramp100_rfshift3_infer32_lr2e5_f48_67/checkpoints/best.pt --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --device cuda --output-dir outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_plusrollout025_rwarm50_rramp100_rfshift3_infer32_lr2e5_f48_67/manual_best_open_rollout_check_turn5`
-
-learned:
-- Adding a delayed rollout auxiliary still did not beat the original expanded-context best.
-- Best checkpoint was step `250`, and the direct open-rollout check matched validation:
-  - `input_frame_count=20`
-  - `predicted_frame_count=20`
-  - `decoded_frame_count=20`
-  - `loss_frames=19`
-  - `seed_frames=1`
-  - `open_rollout_frame_mse=2.54498440772295e-2`
-- Validation trajectory:
-  - step `50`: `2.8839e-2`
-  - step `150`: `2.7650e-2`
-  - step `250`: `2.5450e-2`
-  - step `300`: `3.6581e-2`
-- Best teacher-forced metrics were respectable but still not enough to close rollout:
-  - `next_frame_mse=6.4695e-4`
-  - target-0 MSE: `7.3469e-4`
-  - target-1 MSE: `5.4947e-4`
-- Comparison against the relevant baselines:
-  - original expanded-context best: `2.2398e-2`
-  - rollout-only `0.5` best: `2.4004e-2`
-  - immediate hybrid `0.5 + 0.25`: `2.4634e-2`
-  - delayed hybrid `0.5 + 0.25`, rollout warmup/ramp: `2.5450e-2`
-
-Interpretation:
-- The delayed rollout schedule removed the obvious immediate-collapse failure mode, but it still did not create a better policy than the simpler expanded-context objective.
-- That makes the current conclusion pretty clear:
-  - the main bottleneck is probably not *when* rollout pressure turns on,
-  - it is more likely in the model's temporal signal itself.
-- In the current local RF DiT:
-  - there is no learned absolute temporal embedding,
-  - there is no causal attention mask inside the chunk,
-  - frame identity is mostly carried by 3D RoPE plus the binary condition mask and per-frame action conditioning.
-- For `1 ctx -> 2 inferred`, that may be too weak a separator for target-0 versus target-1.
-
-Next search direction:
-- Stop spending more runs on rollout auxiliary variants for now.
-- Keep the best proven training recipe fixed:
-  - `1 ctx -> 2 inferred`
-  - primary expanded-context self-forcing `0.5`
-  - `rf_shift=3.0`
-  - `infer_steps=32`
-- Probe temporal-signal strength directly with the existing RoPE temporal scaling knob:
-  - try `dynamics_rope_t_extrapolation_ratio=0.5`
-- Rationale:
-  - with only three temporal positions per chunk, the default `rope_t_extrapolation_ratio=1.0` may not separate the two inferred positions strongly enough.
-  - lowering the ratio increases temporal phase separation in the current implementation, which is the cleanest no-architecture-change test of the positional-signal hypothesis.
-
-Small check run inside Codex:
-- `source .venv/bin/activate && python -m world_model_v2.run --mode dynamics_only --dataset-format lerobot_metaworld --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --batch-size 1 --lr 2e-5 --max-steps 1 --validation-interval 1 --checkpoint-interval 0 --log-interval 1 --early-stop-window-size 0 --output-dir outputs/smoke --run-name rope_t05_smoke_1step --load-encoder-decoder outputs/minimal/metaworld_task0_wan_ae_240/checkpoints/best.pt --load-dynamics outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67/checkpoints/best.pt --dynamics-context-frames 1 --dynamics-target-frames 2 --dynamics-conditioning-frame-choices 1 --dynamics-conditioning-frame-probabilities 1.0 --dynamics-validation-conditioning-frame-choices 1 --dynamics-open-rollout-context-frames 1 --dynamics-self-forcing-loss-weight 0.5 --dynamics-self-forcing-mode expanded_context --dynamics-self-forcing-warmup-steps 0 --dynamics-self-forcing-ramp-steps 0 --dynamics-infer-steps 32 --dynamics-rf-shift 3.0 --dynamics-rope-t-extrapolation-ratio 0.5 --dynamics-validation-metric open_rollout_frame_mse --device cuda`
-  - Result: completed successfully, so the temporal-RoPE sweep command is ready for a full continuation run.
-
-## Latest Result 12
-
-Continuation from the expanded-context best with stronger temporal RoPE phase separation:
-`outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ropet05_lr2e5_f48_67/checkpoints/best.pt`
-
-Validated with:
-`source .venv/bin/activate && python scripts/check/open_rollout_demo.py --checkpoint outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ropet05_lr2e5_f48_67/checkpoints/best.pt --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --device cuda --output-dir outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ropet05_lr2e5_f48_67/manual_best_open_rollout_check_turn6`
-
-learned:
-- Lowering `dynamics_rope_t_extrapolation_ratio` from `1.0` to `0.5` was a strong negative result.
-- Best checkpoint was step `200`, and the direct open-rollout check matched validation:
-  - `input_frame_count=20`
-  - `predicted_frame_count=20`
-  - `decoded_frame_count=20`
-  - `loss_frames=19`
-  - `seed_frames=1`
-  - `open_rollout_frame_mse=3.5003338009119034e-2`
-- Validation trajectory improved during training but never approached the older baseline:
-  - step `50`: `4.7331e-2`
-  - step `100`: `4.4447e-2`
-  - step `150`: `3.9268e-2`
-  - step `200`: `3.5003e-2`
-  - step `300`: `3.5820e-2`
-- Best teacher-forced numbers were decent, but rollout stayed much worse:
-  - `next_frame_mse=6.3134e-4`
-  - target-0 MSE: `7.0018e-4`
-  - target-1 MSE: `5.5486e-4`
-  - open-rollout motion ratio: `4.13`
-- Comparison against the relevant baselines:
-  - original expanded-context best: `2.2398e-2`
-  - rollout-only `0.5` best: `2.4004e-2`
-  - delayed hybrid best: `2.5450e-2`
-  - `rope_t=0.5` continuation best: `3.5003e-2`
-
-Interpretation:
-- The temporal-signal hypothesis was not wrong in spirit, but the specific directional guess was wrong:
-  - making temporal RoPE *more* aggressive did not help target separation,
-  - it destabilized rollout badly.
-- So the practical conclusion is:
-  - default `rope_t=1.0` is already better than `0.5` for this checkpoint family,
-  - if RoPE scaling matters here, the next sensible direction is the opposite one: a *larger* temporal ratio, not a smaller one.
-
-Next search direction:
-- Keep the best known recipe fixed:
-  - `1 ctx -> 2 inferred`
-  - expanded-context self-forcing `0.5`
-  - `rf_shift=3.0`
-  - `infer_steps=32`
-- Probe the opposite temporal-RoPE direction with:
-  - `dynamics_rope_t_extrapolation_ratio=2.0`
-- Rationale:
-  - `0.5` increased temporal phase separation and clearly hurt,
-  - `2.0` is the clean opposite test using the same checkpoint and architecture,
-  - it is still a no-code, checkpoint-compatible positional-signal experiment.
-
-Small check run inside Codex:
-- `source .venv/bin/activate && python -m world_model_v2.run --mode dynamics_only --dataset-format lerobot_metaworld --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --batch-size 1 --lr 2e-5 --max-steps 1 --validation-interval 1 --checkpoint-interval 0 --log-interval 1 --early-stop-window-size 0 --output-dir outputs/smoke --run-name rope_t20_smoke_1step --load-encoder-decoder outputs/minimal/metaworld_task0_wan_ae_240/checkpoints/best.pt --load-dynamics outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67/checkpoints/best.pt --dynamics-context-frames 1 --dynamics-target-frames 2 --dynamics-conditioning-frame-choices 1 --dynamics-conditioning-frame-probabilities 1.0 --dynamics-validation-conditioning-frame-choices 1 --dynamics-open-rollout-context-frames 1 --dynamics-self-forcing-loss-weight 0.5 --dynamics-self-forcing-mode expanded_context --dynamics-self-forcing-warmup-steps 0 --dynamics-self-forcing-ramp-steps 0 --dynamics-infer-steps 32 --dynamics-rf-shift 3.0 --dynamics-rope-t-extrapolation-ratio 2.0 --dynamics-validation-metric open_rollout_frame_mse --device cuda`
-  - Result: completed successfully, so the opposite-direction temporal-RoPE run is ready.
-
-## Latest Result 13
-
-Continuation from the expanded-context best with weaker temporal RoPE phase separation:
-`outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ropet20_lr2e5_f48_67/checkpoints/best.pt`
-
-Validated with:
-`source .venv/bin/activate && python scripts/check/open_rollout_demo.py --checkpoint outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ropet20_lr2e5_f48_67/checkpoints/best.pt --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --device cuda --output-dir outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ropet20_lr2e5_f48_67/manual_best_open_rollout_check_turn7`
-
-learned:
-- Increasing `dynamics_rope_t_extrapolation_ratio` from `1.0` to `2.0` was also a negative result.
-- Best checkpoint was step `200`, and the direct open-rollout check matched validation:
-  - `input_frame_count=20`
-  - `predicted_frame_count=20`
-  - `decoded_frame_count=20`
-  - `loss_frames=19`
-  - `seed_frames=1`
-  - `open_rollout_frame_mse=3.330322727560997e-2`
-- Validation trajectory:
-  - step `50`: `4.4888e-2`
-  - step `100`: `4.2885e-2`
-  - step `150`: `3.9218e-2`
-  - step `200`: `3.3303e-2`
-  - step `300`: `3.6241e-2`
-- Best teacher-forced metrics were still fine but rollout stayed far from the baseline:
-  - `next_frame_mse=6.3393e-4`
-  - target-0 MSE: `7.0383e-4`
-  - target-1 MSE: `5.5626e-4`
-  - open-rollout motion ratio: `4.06`
-
-Interpretation:
-- Both temporal-RoPE ratio directions were decisively worse than the default:
-  - `rope_t=0.5`: `3.5003e-2`
-  - `rope_t=2.0`: `3.3303e-2`
-  - default `rope_t=1.0` parent best: `2.2398e-2`
-- So the remaining temporal-signal issue is not fixable by simply stretching or compressing the existing RoPE frequencies.
-- The next clean move is architectural:
-  - keep RoPE as-is,
-  - add an explicit learned temporal identity signal on top,
-  - preserve checkpoint compatibility so the current best run can still be reused.
-
-## Latest Code Change 9
-
-2026-04-09:
-Added an optional learned temporal embedding on top of the existing RoPE path, with backward-compatible loading from older dynamics checkpoints.
-
-Why:
-- The strongest remaining hypothesis is still temporal identity weakness inside the `1 ctx -> 2 inferred` chunk.
-- The parameter-only RoPE sweeps gave a clear answer:
-  - `rope_t=0.5` was much worse,
-  - `rope_t=2.0` was also much worse.
-- That means the problem is not just the frequency scale of the current RoPE basis.
-- The next minimal architectural test is to keep the old RoPE path untouched and add a small learned per-frame temporal bias that can specialize target-0 versus target-1.
-
-What changed:
-- Added `use_learned_temporal_embedding` to `DynamicsTransformerConfig`.
-- In `ActionConditionedDynamicsTransformer`, added an optional learned `temporal_pos_embed` tensor with shape:
-  - `(1, max_frames // patch_temporal, 1, 1, model_channels)`
-- The learned temporal embedding is added after patch embedding and before RoPE attention.
-- Added `--dynamics-use-learned-temporal-embedding` to:
-  - `world_model_v2.run`
-  - `scripts/check/loop_dynamics_sweep.py`
-- Threaded the flag through:
-  - `ExperimentConfig`
-  - `WorldModel`
-  - `scripts/check/open_rollout_demo.py`
-- Updated dynamics warm-start loading so older checkpoints can still load when this new parameter is enabled:
-  - strict loading remains in effect for all existing weights,
-  - only `net.temporal_pos_embed` is allowed to be missing from older checkpoints when the new flag is on.
-
-Design decision:
-- The new temporal embedding is zero-initialized.
-- Reason:
-  - the first full run should start exactly from the old best policy,
-  - then learn only the extra temporal identity capacity during continuation,
-  - without corrupting the working checkpoint at load time.
-
-Small checks run inside Codex:
-- `source .venv/bin/activate && pytest tests/test_dynamics_transformer.py tests/test_model.py tests/test_experiment.py tests/test_run.py tests/test_loop_dynamics_sweep.py -q`
-  - Result: `115 passed`.
-- Learned-temporal-embedding CUDA smoke:
-  - `source .venv/bin/activate && python -m world_model_v2.run --mode dynamics_only --dataset-format lerobot_metaworld --data-root data/full --split train --episode 0 --metaworld-task-index 0 --frame-start 48 --frame-end 67 --resolution 240 --batch-size 1 --lr 2e-5 --max-steps 1 --validation-interval 1 --checkpoint-interval 0 --log-interval 1 --early-stop-window-size 0 --output-dir outputs/smoke --run-name learned_temporal_embed_smoke_1step --load-encoder-decoder outputs/minimal/metaworld_task0_wan_ae_240/checkpoints/best.pt --load-dynamics outputs/controller_dreamdojo_progressive/controller_dreamdojo_progressive_1to2_selfforce05_rfshift3_infer32_ft_f48_67/checkpoints/best.pt --dynamics-context-frames 1 --dynamics-target-frames 2 --dynamics-conditioning-frame-choices 1 --dynamics-conditioning-frame-probabilities 1.0 --dynamics-validation-conditioning-frame-choices 1 --dynamics-open-rollout-context-frames 1 --dynamics-self-forcing-loss-weight 0.5 --dynamics-self-forcing-mode expanded_context --dynamics-use-learned-temporal-embedding --dynamics-self-forcing-warmup-steps 0 --dynamics-self-forcing-ramp-steps 0 --dynamics-infer-steps 32 --dynamics-rf-shift 3.0 --dynamics-validation-metric open_rollout_frame_mse --device cuda`
-  - Result: completed successfully, which confirms the old best checkpoint can warm start into the new architecture without load errors.
+Find the best DreamDojo-style dynamics setup for `1 context -> 3 inferred dynamics`, optimizing open-rollout quality and temporal consistency.
+
+## Best Current Saved Checkpoint
+- Checkpoint:
+  - `outputs/controller_dreamdojo_progressive/controller_dreamdojo_ladder_1to3_trainalleps_exval_selfforcehalf_norollaux_lr2e7_resume_newbest_f48_67/checkpoints/best.pt`
+- Best held-out artifact:
+  - `outputs/controller_dreamdojo_progressive/controller_dreamdojo_ladder_1to3_trainalleps_exval_selfforcehalf_norollaux_lr2e7_resume_newbest_f48_67/samples/step_000350/validation_summary.json`
+- Winning recipe:
+  - DreamDojo-style RF DiT
+  - `1 -> 3`
+  - `dynamics_model_channels = 256`
+  - `dynamics_num_blocks = 4`
+  - `dynamics_num_heads = 4`
+  - `dynamics_rf_shift = 3.0`
+  - `dynamics_infer_steps = 32`
+  - `dynamics_self_forcing_mode = expanded_context`
+  - `dynamics_self_forcing_loss_weight = 0.001953125`
+  - `dynamics_rollout_self_forcing_loss_weight = 0.0`
+  - `dynamics_self_forcing_rollout_chunks = 1`
+  - `train_all_episodes = true`
+  - validation episodes `0,1,2` excluded from training
+  - checkpoint selection on `open_rollout_consistency_score`
+  - true-resume polish down to `2e-7`
+- Best held-out metrics on validation episodes `0,1,2`:
+  - `open_rollout_consistency_score = 0.006463473170908107`
+  - `open_rollout_frame_mse = 0.0056601107741395635`
+  - `open_rollout_target_motion_ratio = 1.1674932517402803`
+  - `next_frame_mse = 0.0007324285318202365`
+- Additional unseen held-out check:
+  - episode `3`: `open_rollout_consistency_score = 0.005897744599928022`
+
+## High-Confidence Findings
+- `1 -> 3` is clearly better than `1 -> 1` and `1 -> 2` for this task.
+- The biggest real gain came from switching to all-episodes dynamics training while excluding validation episodes from training.
+- The correct deployment and checkpoint-selection settings remain:
+  - strict `open_rollout_context_frames = 1`
+  - strict non-overlap rollout (`stride = 3` for the `1 -> 3` layout)
+  - `dynamics_infer_steps = 32`
+  - `dynamics_rf_shift = 3.0`
+  - `dynamics_guidance_scale = 0.0`
+- Many nearby tweaks are only near-ties on pixel MSE and lose because motion calibration gets slightly worse. Use `open_rollout_consistency_score`, not raw frame MSE, to rank runs.
+
+## Important Code And Logic Fixes Already Landed
+- Added `open_rollout_consistency_score`.
+- Fixed resume best-metric replay so it only uses checkpoint-visible history.
+- Fixed validation-domain changes on resume so stale best-metric state is not reused.
+- Fixed resumed optimizer LR override so new CLI `--lr` actually applies.
+- Fixed CUDA RNG restore on resume.
+- Added true `--train-all-episodes` support for dynamics training.
+- Fixed validation leakage by excluding validation episodes from training when train and validation come from the same episode pool.
+- Fixed rollout semantics so open rollout stays capped by `open_rollout_context_frames` instead of silently expanding context.
+- Fixed deeper dynamics warm starts so newly added transformer blocks are initialized from the last compatible checkpoint block instead of random init. This makes `256x6`-style continuation probes meaningful again; the previous warm-start path accepted missing tail blocks but started them cold.
+- Fixed deeper dynamics resume loading so architecture-compatible `--resume` runs can expand depth. The old resume path used strict full-model loading and crashed before training whenever new tail blocks were added. Resume now reuses the same compatible dynamics submodule loading path as `--load-dynamics`, seeds new tail blocks from the checkpoint tail block, and skips incompatible optimizer-state restoration when parameter groups change.
+
+## Directions Already Checked And Not Worth Repeating Unchanged
+- Wider `384x6` run was decisively bad:
+  - `open_rollout_consistency_score = 0.09576461897880176`
+  - `open_rollout_target_motion_ratio = 7.004017210951316`
+- Deeper `256x6` warm-start probe from the current best checkpoint was also decisively bad:
+  - `open_rollout_consistency_score = 0.09452341378561042`
+  - `open_rollout_target_motion_ratio = 4.798104359897603`
+- Deeper `256x6` warm-start probe with the fixed resume path is still decisively bad:
+  - step `349`: `open_rollout_consistency_score = 0.044796681056827374`
+  - step `349`: `open_rollout_frame_mse = 0.024622704833745956`
+  - step `349`: `open_rollout_target_motion_ratio = 2.2710540415676648`
+  - it no longer crashes, but it still lands far outside the competitive regime
+- Resume from the best checkpoint with `dynamics_self_forcing_rollout_chunks = 2` did not improve the best run:
+  - best resumed step `347`: `open_rollout_consistency_score = 0.006466587023264699`
+  - same step: `open_rollout_frame_mse = 0.005661928094923496`
+  - same step: `open_rollout_target_motion_ratio = 1.167968109417191`
+  - baseline saved best stayed slightly better at `0.006465271714632969`
+  - later steps drifted steadily worse and early stop triggered at step `351`
+- Resume from the best checkpoint with `dynamics_self_forcing_rollout_chunks = 2` and half rollout auxiliary weight also did not improve the best run:
+  - best resumed step `347`: `open_rollout_consistency_score = 0.006466470833894278`
+  - same step: `open_rollout_frame_mse = 0.0056619153668483095`
+  - same step: `open_rollout_target_motion_ratio = 1.167948433745764`
+  - this was only trivially better than the full rollout-aux chunk-2 retry and still slightly worse than the saved best `0.006465271714632969`
+  - later steps drifted worse again and early stop triggered at step `351`
+- Resume from the best checkpoint with half primary self-forcing weight was the closest near-miss so far, but still did not beat the saved best:
+  - best resumed step `347`: `open_rollout_consistency_score = 0.006465596231862211`
+  - same step: `open_rollout_frame_mse = 0.00566042959690094`
+  - same step: `open_rollout_target_motion_ratio = 1.1679390166512258`
+  - this improved raw open-rollout frame MSE versus the saved best, but motion calibration got slightly worse, so the combined score still lost by about `3.25e-7`
+  - later steps drifted worse again and early stop triggered at step `351`
+- Resume from the best checkpoint with half primary self-forcing weight and half rollout auxiliary weight also did not beat the saved best:
+  - best resumed step `347`: `open_rollout_consistency_score = 0.006465539697803527`
+  - same step: `open_rollout_frame_mse = 0.0056604500859975815`
+  - same step: `open_rollout_target_motion_ratio = 1.167925037688607`
+  - this is another near-miss and is slightly better than the half-self-forcing-only run, but it still stays above the saved best `0.006465271714632969`
+  - later steps drifted worse again and early stop triggered at step `351`
+- Resume from the best checkpoint with half primary self-forcing weight and no rollout auxiliary also did not beat the saved best:
+  - best resumed step `347`: `open_rollout_consistency_score = 0.006465486696852076`
+  - same step: `open_rollout_frame_mse = 0.005660452569524447`
+  - same step: `open_rollout_target_motion_ratio = 1.1679146935193867`
+  - this is slightly better than the half-self-forcing plus half-rollout-aux run, but still slightly worse than the saved best `0.006465271714632969`
+  - later steps drifted worse again and early stop triggered at step `351`
+- Resume from the best checkpoint with `3/4` primary self-forcing weight and no rollout auxiliary was worse than the half-self-forcing no-rollout-aux run:
+  - best resumed step `347`: `open_rollout_consistency_score = 0.006465637375738365`
+  - same step: `open_rollout_frame_mse = 0.005660334199666977`
+  - same step: `open_rollout_target_motion_ratio = 1.1679912445790973`
+  - this confirms the promising basin is on the lower-self-forcing side, not back toward the original full self-forcing weight
+  - later steps drifted worse again and early stop triggered at step `351`
+- Resume from the best checkpoint with `3/8` primary self-forcing weight and no rollout auxiliary was also worse than the half-self-forcing no-rollout-aux run:
+  - best resumed step `347`: `open_rollout_consistency_score = 0.006465475047621275`
+  - same step: `open_rollout_frame_mse = 0.005660463237514098`
+  - same step: `open_rollout_target_motion_ratio = 1.167909621680517`
+  - this stays in the same near-miss basin, but does not improve on the `1/2` self-forcing no-rollout-aux run
+  - later steps drifted worse again and early stop triggered at step `351`
+- Resume from the best checkpoint with half primary self-forcing, no rollout auxiliary, and lower LR `5e-7` produced the new best checkpoint:
+  - best resumed step `347`: `open_rollout_consistency_score = 0.0064649888764799915`
+  - same step: `open_rollout_frame_mse = 0.005662159839024146`
+  - same step: `open_rollout_target_motion_ratio = 1.1675846892000796`
+  - this is the first run in the local polish basin to beat the prior best `0.006465271714632969`
+  - later steps still drifted worse, so this remains an early-checkpoint regime
+- Continuing the new best recipe with lower LR `2e-7` produced another new best checkpoint:
+  - best resumed step `350`: `open_rollout_consistency_score = 0.006463473170908107`
+  - same step: `open_rollout_frame_mse = 0.0056601107741395635`
+  - same step: `open_rollout_target_motion_ratio = 1.1674932517402803`
+  - this is a clear improvement over the previous best `0.0064649888764799915`
+  - the run still degraded after the best step, so this remains an early-checkpoint regime rather than a long stable tail
+- Continuing the same recipe with lower LR `1e-7` did not improve further:
+  - no validation step beat the saved best `0.006463473170908107`
+  - the run drifted worse, confirming that `1e-7` is below the useful polish range for this checkpoint
+- Continuing the same recipe with intermediate LR `3e-7` also did not improve further:
+  - no validation step beat the saved best `0.006463473170908107`
+  - this confirms the current local optimum is centered near `2e-7`, with both `1e-7` and `3e-7` worse
+- Reintroducing a tiny rollout auxiliary on top of the new best `2e-7` recipe also did not help:
+  - no validation step beat the saved best `0.006463473170908107`
+  - the added rollout auxiliary pushed the run back toward the older near-miss regime, so the current best recipe still prefers `dynamics_rollout_self_forcing_loss_weight = 0.0`
+- Keeping the best `2e-7` recipe but removing the self-forcing ramp also did not help:
+  - no validation step beat the saved best `0.006463473170908107`
+  - this confirms the current best recipe does not need schedule simplification; the remaining gains are unlikely to come from tiny local schedule edits
+- Keeping the best `2e-7` recipe but adding a short self-forcing warmup also did not help:
+  - no validation step beat the saved best `0.006463473170908107`
+  - this confirms the current best recipe does not benefit from small late-stage self-forcing schedule perturbations
+- Increasing `dynamics_infer_steps` from `32` to `40` was clearly worse:
+  - no validation step came close to the saved best `0.006463473170908107`
+  - open-rollout consistency regressed into the `~0.00672-0.00673` range with noticeably over-animated motion ratios around `1.21`
+  - the current best recipe still prefers `dynamics_infer_steps = 32`
+- Extending the best `2e-7` run with patience `10` did not reveal a later better checkpoint:
+  - the saved best `0.006463473170908107` still held through step `360`
+  - later validation steps drifted to `0.00651-0.00652`, confirming the optimum is still an early-checkpoint polish result rather than a hidden long-tail improvement
+- Reducing `dynamics_infer_steps` from `32` to `24` was strongly harmful:
+  - open-rollout consistency regressed to roughly `0.00699-0.00701`
+  - motion ratio jumped to roughly `1.25`, showing the sampler became badly over-animated
+  - the current best recipe still clearly prefers `dynamics_infer_steps = 32`
+- Interpolating the polish LR upward from `2e-7` to `2.5e-7` also did not help:
+  - no validation step beat the saved best `0.006463473170908107`
+  - the run stayed in the same basin but was consistently worse than `2e-7`, ending around `0.006487`
+  - this tightens the local optimum around `2e-7` and suggests any remaining gain, if it exists, is more likely on the lower side than the higher side
+- Interpolating the polish LR downward from `2e-7` to `1.5e-7` also did not help:
+  - no validation step beat the saved best `0.006463473170908107`
+  - the run remained near the same local basin but finished worse, around `0.006478`
+  - this brackets the current optimum fairly tightly around `2e-7`; remaining improvement is unlikely to come from simple LR interpolation alone
+- Narrow LR interpolation just above the optimum at `2.125e-7` also did not help:
+  - no validation step beat the saved best `0.006463473170908107`
+  - the run again stayed in the same basin and finished worse, around `0.006484`
+  - this is strong evidence that resume-side LR polish is exhausted and that more gains will need a different compatible knob than simple late-stage LR tuning
+- Nudging `dynamics_rf_shift` from `3.0` down to `2.9` was also harmful:
+  - open-rollout consistency regressed into the `0.00650-0.00651` range
+  - motion ratio increased to roughly `1.18`, so even this small shift change pushed the sampler toward over-animated rollouts
+  - the current best recipe still prefers `dynamics_rf_shift = 3.0`
+- Increasing temporal RoPE extrapolation slightly to `dynamics_rope_t_extrapolation_ratio = 1.1` produced a clear new best:
+  - best metric improved to `open_rollout_consistency_score = 0.0064538995183681626`
+  - visible validation checkpoints in the run reached roughly `0.006456-0.006473`, with lower rollout drift and a better motion ratio around `1.1665-1.1692`
+  - this is the first compatible sampler-side change that beat the old best `0.006463473170908107`, so temporal RoPE scaling is now the most promising axis
+- Increasing temporal RoPE extrapolation further to `dynamics_rope_t_extrapolation_ratio = 1.2` improved again and sets the new best:
+  - best metric improved to `open_rollout_consistency_score = 0.006446493231741654`
+  - representative late checkpoints stayed in the `0.006452-0.006459` range with reduced motion log error and a healthier motion ratio around `1.165-1.167`
+  - this confirms the gain from temporal RoPE scaling is real and was not a one-off at `1.1`
+- Increasing temporal RoPE extrapolation again to `dynamics_rope_t_extrapolation_ratio = 1.3` improved once more and sets the new best:
+  - best metric improved to `open_rollout_consistency_score = 0.0064433326823042925`
+  - the best checkpoint appeared immediately at resumed step `353`, with later checkpoints drifting slightly worse again
+  - open-rollout motion stayed healthier than the older baseline, with motion ratio around `1.1649-1.1672`
+  - temporal RoPE scaling is now the strongest validated improvement axis in the whole sweep
+- Increasing temporal RoPE extrapolation again to `dynamics_rope_t_extrapolation_ratio = 1.4` improved yet again and sets the new best:
+  - best metric improved to `open_rollout_consistency_score = 0.006439871951032458`
+  - the best checkpoint appeared at resumed step `354`, and step `355` remained close at `0.006446747179523656`
+  - open-rollout motion improved further, with motion ratio around `1.1645-1.1657`
+  - the temporal RoPE scaling trend is still improving monotonically from `1.0 -> 1.1 -> 1.2 -> 1.3 -> 1.4`
+- Increasing temporal RoPE extrapolation again to `dynamics_rope_t_extrapolation_ratio = 1.5` improved yet again and sets the new best:
+  - best metric improved to `open_rollout_consistency_score = 0.006436023118455239`
+  - the winning checkpoint appeared immediately at resumed step `355`
+  - open-rollout motion improved again, with motion ratio down to about `1.1641`
+  - the temporal RoPE trend is still monotonic through `1.5`, with no sign of reversal yet
+- Increasing temporal RoPE extrapolation again to `dynamics_rope_t_extrapolation_ratio = 1.6` improved again and sets the new best:
+  - best metric improved to `open_rollout_consistency_score = 0.006429532151429871`
+  - the winning checkpoint again appeared immediately at resumed step `355`
+  - open-rollout motion improved further, with motion ratio down to about `1.1632`
+  - the temporal RoPE trend is still monotonic through `1.6`, so this remains the strongest active tuning axis
+- Increasing temporal RoPE extrapolation more aggressively to `dynamics_rope_t_extrapolation_ratio = 1.8` improved again and sets the new best:
+  - best metric improved to `open_rollout_consistency_score = 0.006418165985887525`
+  - the winning checkpoint again appeared immediately at resumed step `355`
+  - open-rollout motion improved substantially again, with motion ratio down to about `1.1616`
+  - temporal RoPE scaling remains the dominant improvement axis, and the gain from `1.6 -> 1.8` is larger than the previous incremental steps
+- Increasing temporal RoPE extrapolation to `dynamics_rope_t_extrapolation_ratio = 2.0` improved again and sets the new best:
+  - best metric improved to `open_rollout_consistency_score = 0.006408179579009593`
+  - the winning checkpoint again appeared immediately at resumed step `355`
+  - open-rollout motion improved further, with motion ratio down to about `1.1601`
+  - temporal RoPE scaling is still improving monotonically through `2.0`, so this remains the most promising axis by a wide margin
+- Increasing temporal RoPE extrapolation to `dynamics_rope_t_extrapolation_ratio = 2.4` improved again and sets the new best:
+  - best metric improved to `open_rollout_consistency_score = 0.006391809807475851`
+  - the winning checkpoint again appeared immediately at resumed step `355`
+  - open-rollout motion improved substantially again, with motion ratio down to about `1.1577`
+  - temporal RoPE scaling is still improving monotonically through `2.4`, with no sign of peak yet
+- Increasing temporal RoPE extrapolation to `dynamics_rope_t_extrapolation_ratio = 3.0` improved again and sets the new best:
+  - best metric improved to `open_rollout_consistency_score = 0.006373045341227961`
+  - the winning checkpoint again appeared immediately at resumed step `355`
+  - open-rollout motion improved sharply again, with motion ratio down to about `1.1549`
+  - temporal RoPE scaling is still improving monotonically through `3.0`, and remains by far the strongest validated axis in the search
+- Increasing temporal RoPE extrapolation to `dynamics_rope_t_extrapolation_ratio = 4.0` improved again and sets the new best:
+  - best metric improved to `open_rollout_consistency_score = 0.0063511852645253076`
+  - the winning checkpoint again appeared immediately at resumed step `355`
+  - open-rollout motion improved again, with motion ratio down to about `1.1515`
+  - temporal RoPE scaling remained strongly monotonic through `4.0`
+- Increasing temporal RoPE extrapolation to `dynamics_rope_t_extrapolation_ratio = 6.0` improved again and sets the new best:
+  - best metric improved to `open_rollout_consistency_score = 0.006336626550009832`
+  - the winning checkpoint again appeared immediately at resumed step `355`
+  - open-rollout motion improved again, with motion ratio down to about `1.1469`
+  - this confirmed the temporal RoPE trend still had room above `4.0`
+- Increasing temporal RoPE extrapolation to `dynamics_rope_t_extrapolation_ratio = 8.0` produced a small additional improvement and sets the current best:
+  - best metric improved to `open_rollout_consistency_score = 0.006335307318890669`
+  - the winning checkpoint again appeared immediately at resumed step `355`
+  - open-rollout motion improved a bit further, with motion ratio down to about `1.1439`
+  - gains are still monotonic, but the step from `6.0` to `8.0` was much smaller than earlier jumps, so this axis may be approaching diminishing returns
+- Increasing temporal RoPE extrapolation to `dynamics_rope_t_extrapolation_ratio = 10.0` produced another tiny improvement and sets the current best:
+  - best metric improved to `open_rollout_consistency_score = 0.0063350359663550335`
+  - the winning checkpoint again appeared immediately at resumed step `355`
+  - open-rollout motion improved slightly again, with motion ratio down to about `1.1416`
+  - the gain over `8.0` is very small, so this axis is likely close to flattening even though it has not reversed yet
+- Increasing temporal RoPE extrapolation further to `dynamics_rope_t_extrapolation_ratio = 12.0` did not improve:
+  - no validation step beat the saved best `0.0063350359663550335`
+  - the run stayed extremely close, but slightly worse at about `0.006335358261809327`
+  - this is the first sign that the temporal RoPE axis has reached saturation, with the current optimum centered near `10.0`
+- Retuning RF shift under the new `dynamics_rope_t_extrapolation_ratio = 10.0` optimum found a better setting at `dynamics_rf_shift = 2.8`:
+  - best metric improved to `open_rollout_consistency_score = 0.0063217130768655596`
+  - this beat the previous `rope_t = 10.0`, `rf_shift = 3.0` best by a meaningful margin
+  - the combination of strong temporal RoPE scaling and a slightly smaller RF shift is now the best validated recipe
+- Pushing RF shift lower again to `dynamics_rf_shift = 2.6` was harmful:
+  - no validation step beat the saved best `0.0063217130768655596`
+  - open-rollout consistency regressed sharply to about `0.006547021204948387`
+  - this brackets the local RF-shift optimum near `2.8` rather than continuing downward
+- Nudging RF shift upward to `dynamics_rf_shift = 2.9` was also worse:
+  - no validation step beat the saved best `0.0063217130768655596`
+  - open-rollout consistency regressed to about `0.006412507123941982`
+  - this confirms the local optimum is below `2.9`
+- Nudging RF shift to `dynamics_rf_shift = 2.7` was much worse:
+  - no validation step beat the saved best `0.0063217130768655596`
+  - open-rollout consistency collapsed to about `0.006810019054651073` with over-animated rollouts
+  - this tightly brackets the current best around `dynamics_rf_shift = 2.8`
+- Halving the self-forcing weight at the current best settings had no measurable effect:
+  - the run reproduced the exact same best metric `0.0063217130768655596`
+  - at this late resumed step, primary self-forcing weight changes appear effectively inactive
+- Adding a tiny rollout auxiliary at the current best settings also had no measurable effect:
+  - the run again reproduced the exact same best metric `0.0063217130768655596`
+  - rollout auxiliary remains unnecessary in the current best basin
+- Re-bracketing the temporal RoPE optimum under the improved `dynamics_rf_shift = 2.8` setting found a slightly better region below `10.0`:
+  - `dynamics_rope_t_extrapolation_ratio = 9.5` improved to `0.0063209313877971044`
+  - `dynamics_rope_t_extrapolation_ratio = 9.0` improved again to `0.006319910890768103`
+  - `dynamics_rope_t_extrapolation_ratio = 8.5` improved again to `0.006318868807489026`
+  - `dynamics_rope_t_extrapolation_ratio = 8.0` improved again to `0.006318002085059407`
+  - this shows the local optimum shifted materially once `rf_shift` moved from `3.0` to `2.8`
+- Continuing that re-bracket found the current best near `dynamics_rope_t_extrapolation_ratio = 7.5`:
+  - `dynamics_rope_t_extrapolation_ratio = 7.0` improved to `0.006317745274792533`
+  - `dynamics_rope_t_extrapolation_ratio = 7.5` improved again to the current best `0.00631687459594504`
+  - `dynamics_rope_t_extrapolation_ratio = 7.75` was slightly worse at `0.006317525092137691`
+  - this brackets the current local optimum tightly around `dynamics_rope_t_extrapolation_ratio = 7.5`
+- Final local re-bracketing tightened the temporal RoPE optimum further:
+  - `dynamics_rope_t_extrapolation_ratio = 7.25` improved to `0.0063164943117974505`
+  - `dynamics_rope_t_extrapolation_ratio = 7.2` improved again to the current best `0.006316419383750949`
+  - `dynamics_rope_t_extrapolation_ratio = 7.15` was slightly worse at `0.006316517008960993`
+  - `dynamics_rope_t_extrapolation_ratio = 7.3` was also slightly worse at `0.006316609119478595`
+  - this tightly brackets the current temporal RoPE optimum near `dynamics_rope_t_extrapolation_ratio = 7.2`
+- Changing the sampler to `dynamics_infer_steps = 30` on top of the current best was harmful:
+  - no validation step beat the saved best `0.006316419383750949`
+  - open-rollout consistency regressed to about `0.006375779069030536`
+  - this confirms the current best recipe still prefers `dynamics_infer_steps = 32`
+- Re-running the current best recipe with `seed = 13` reproduced the exact same best metric:
+  - `open_rollout_consistency_score = 0.006316419383750949`
+  - the full validation signature matched the seed `7` run, indicating the current resumed setup is deterministic in practice
+  - this increases confidence that the current best is not a seed-specific fluke
+- AdaLN-LoRA rank expansion from `64` to `96` is not a compatible resume path right now:
+  - resuming from the best checkpoint failed immediately with shape mismatches in every AdaLN-LoRA projection
+  - treat AdaLN rank changes as fresh-init architecture branches unless a dedicated weight-migration path is added
+- Mixed teacher conditioning `1,2,3` did not beat the strict `1 -> 3` objective.
+- DreamDojo-style conditional noise with `conditional_frame_timestep = 0.0` and `conditional_frame_sigma = 1e-4` was harmful.
+- Nonzero guidance was strongly harmful.
+- Nearby `rf_shift` changes (`2.5`, `3.5`) were worse.
+- Smaller rollout strides (`1`, `2`) were much worse than strict stride `3`.
+- Nearby self-forcing and rollout-aux weight changes were all slightly worse than the saved best checkpoint.
+
+## Most Promising Next Branches
+1. Primary overnight branch:
+   Stop spending runs on deeper `256x6` variants and pivot to objective changes instead.
+   Why:
+   the fixed resume path proved the old failure was not just a loader bug. Even with a clean warm start, `256x6` is still nowhere close to the saved best.
+
+2. Secondary overnight branch if another long run is available:
+   Keep the new best recipe fixed and stop spending runs on nearby LR-only, small self-forcing schedule tweaks, larger inference-step counts, or incompatible resume-only architecture edits unless another objective change is introduced.
+   Why:
+   `5e-7 -> 2e-7` improved the best checkpoint, but neighboring LR probes, tiny rollout-aux restoration, schedule tweaks, `infer_steps=40`, and incompatible AdaLN-rank resume edits all failed to help. The current recipe looks locally optimized under simple local polish.
+
+3. If the real visual complaint is dense frame-to-frame smoothness under stride `1` rollout:
+   treat that as an objective mismatch, not a model-size problem.
+   The next serious branch should redesign training around denser autoregression rather than simply making the current chunked model bigger.
+
+## Controller Notes
+- Prefer materially different branches over repeated revalidation of the same saved artifact.
+- Do not spend long runs on larger models unless a new warm-start or objective change first makes them competitive in a short local smoke.
+- Update this file only when there is:
+  - a real code fix,
+  - a materially new long-run result,
+  - or a genuinely new search direction.

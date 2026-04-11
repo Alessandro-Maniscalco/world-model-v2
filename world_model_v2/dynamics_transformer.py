@@ -19,8 +19,8 @@ import torch.nn.functional as F
 class DynamicsFrameLayout:
     """Describe the shared context and target frame layout for dynamics training."""
 
-    context_frames: int = 4
-    target_frames: int = 1
+    context_frames: int = 1
+    target_frames: int = 3
 
     @property
     def max_frames(self) -> int:
@@ -45,6 +45,7 @@ class DynamicsFrameLayout:
 
 
 DYNAMICS_FRAME_LAYOUT = DynamicsFrameLayout()
+DREAMDOJO_DYNAMICS_ARCHITECTURE_VERSION = "dreamdojo_torch_small_v1"
 
 
 def _normalize_conditioning_frame_choices(
@@ -147,7 +148,7 @@ class DynamicsTransformerConfig:
     pos_emb_cls: str = "rope3d"
     pos_emb_learnable: bool = False
     pos_emb_interpolation: str = "crop"
-    use_adaln_lora: bool = False
+    use_adaln_lora: bool = True
     adaln_lora_dim: int = 64
     atten_backend: str = "torch"
     extra_per_block_abs_pos_emb: bool = False
@@ -192,9 +193,10 @@ class DynamicsTransformerConfig:
             raise ValueError("max_frames must be divisible by patch_temporal.")
         if self.model_channels % self.num_heads != 0:
             raise ValueError("model_channels must be divisible by num_heads.")
-        if self.action_conditioning_mode not in {"chunk_per_frame", "global_chunk"}:
+        if self.action_conditioning_mode != "chunk_per_frame":
             raise ValueError(
-                "action_conditioning_mode must be 'chunk_per_frame' or 'global_chunk'."
+                "The DreamDojo-mechanics RF DiT only supports "
+                "action_conditioning_mode='chunk_per_frame'."
             )
         if self.pos_emb_cls != "rope3d":
             raise ValueError("The RF DiT only supports pos_emb_cls='rope3d'.")
@@ -202,12 +204,18 @@ class DynamicsTransformerConfig:
             raise ValueError("The RF DiT only supports non-learnable RoPE.")
         if self.pos_emb_interpolation != "crop":
             raise ValueError("The RF DiT only supports crop interpolation.")
+        if not self.use_adaln_lora:
+            raise ValueError("The DreamDojo-mechanics RF DiT requires use_adaln_lora=True.")
         if self.concat_padding_mask:
             raise ValueError("concat_padding_mask is unsupported in the RF DiT.")
         if self.extra_per_block_abs_pos_emb:
             raise ValueError("extra_per_block_abs_pos_emb is unsupported in the RF DiT.")
         if self.atten_backend != "torch":
             raise ValueError("The RF DiT only supports the torch attention backend.")
+        if self.use_learned_temporal_embedding:
+            raise ValueError(
+                "use_learned_temporal_embedding is unsupported in the DreamDojo-mechanics RF DiT."
+            )
         if self.dynamics_infer_steps < 1:
             raise ValueError("dynamics_infer_steps must be positive.")
         if self.dynamics_train_timesteps < 2:
@@ -301,6 +309,7 @@ class DynamicsTransformerConfig:
             self.validation_conditioning_frame_choices
         )
         payload["num_action_per_chunk"] = self.num_action_per_chunk
+        payload["architecture_version"] = self.architecture_version
         return payload
 
     @property
@@ -308,6 +317,12 @@ class DynamicsTransformerConfig:
         """Return the DreamDojo-style number of transition actions in one frame chunk."""
 
         return int(self.max_frames) - 1
+
+    @property
+    def architecture_version(self) -> str:
+        """Return the checkpointed backbone identifier for the DreamDojo-style DiT."""
+
+        return DREAMDOJO_DYNAMICS_ARCHITECTURE_VERSION
 
 
 @dataclass(frozen=True)
@@ -343,11 +358,21 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
+    def reset_parameters(self) -> None:
+        """Reset the learnable scale to the DreamDojo default."""
+
+        nn.init.ones_(self.weight)
+
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the unscaled RMS-normalized activations."""
+
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize the final dimension and rescale it."""
 
-        rms = torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps).to(x.dtype)
-        return x * rms * self.weight
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
 
 
 class Timesteps(nn.Module):
@@ -364,70 +389,68 @@ class Timesteps(nn.Module):
 
         if timesteps.ndim != 2:
             raise ValueError(f"Expected timesteps with shape (B, T), received {tuple(timesteps.shape)}.")
-        flat = timesteps.reshape(-1).float()
+        in_dtype = timesteps.dtype
+        flat = timesteps.flatten().float()
         half_dim = self.dim // 2
         exponent = -math.log(10000.0) * torch.arange(
             half_dim,
-            device=timesteps.device,
             dtype=torch.float32,
-        ) / max(float(half_dim), 1.0)
-        frequencies = torch.exp(exponent)
-        angles = flat[:, None] * frequencies[None, :]
-        embedding = torch.cat([torch.cos(angles), torch.sin(angles)], dim=-1)
-        if self.dim % 2 == 1:
-            embedding = F.pad(embedding, (0, 1))
-        return embedding.view(*timesteps.shape, self.dim).to(dtype=timesteps.dtype)
+            device=timesteps.device,
+        )
+        exponent = exponent / (half_dim - 0.0)
+        embedding = torch.exp(exponent)
+        embedding = flat[:, None] * embedding[None, :]
+        embedding = torch.cat([torch.cos(embedding), torch.sin(embedding)], dim=-1)
+        return rearrange(
+            embedding.to(dtype=in_dtype),
+            "(b t) d -> b t d",
+            b=timesteps.shape[0],
+            t=timesteps.shape[1],
+        )
 
 
 class TimestepEmbedding(nn.Module):
     """Convert sinusoidal timestep features into AdaLN conditioning vectors."""
 
-    def __init__(self, in_dim: int, out_dim: int, use_adaln_lora: bool) -> None:
+    def __init__(self, in_dim: int, out_dim: int, use_adaln_lora: bool = False) -> None:
         """Build the timestep projection MLP."""
 
         super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
         self.use_adaln_lora = use_adaln_lora
-        self.fc1 = nn.Linear(in_dim, out_dim)
-        self.fc2 = nn.Linear(out_dim, out_dim)
+        self.fc1 = nn.Linear(in_dim, out_dim, bias=not use_adaln_lora)
         self.activation = nn.SiLU()
-        self.adaln = (
-            nn.Linear(out_dim, out_dim * 3, bias=False)
-            if use_adaln_lora
-            else None
-        )
-        self.reset_parameters()
+        if use_adaln_lora:
+            self.fc2 = nn.Linear(out_dim, out_dim * 3, bias=False)
+        else:
+            self.fc2 = nn.Linear(out_dim, out_dim, bias=False)
+        self.init_weights()
 
-    def reset_parameters(self) -> None:
+    def init_weights(self) -> None:
         """Initialize the timestep embedding weights."""
 
-        nn.init.trunc_normal_(self.fc1.weight, std=1.0 / math.sqrt(self.fc1.in_features))
-        nn.init.zeros_(self.fc1.bias)
-        nn.init.trunc_normal_(self.fc2.weight, std=1.0 / math.sqrt(self.fc2.in_features))
-        nn.init.zeros_(self.fc2.bias)
-        if self.adaln is not None:
-            nn.init.zeros_(self.adaln.weight)
+        std = 1.0 / math.sqrt(self.in_dim)
+        nn.init.trunc_normal_(self.fc1.weight, std=std, a=-3 * std, b=3 * std)
+        std = 1.0 / math.sqrt(self.out_dim)
+        nn.init.trunc_normal_(self.fc2.weight, std=std, a=-3 * std, b=3 * std)
 
-    def forward(self, embeddings: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, embeddings: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return the timestep embedding and optional AdaLN-LoRA residual."""
 
-        hidden = self.activation(self.fc1(embeddings))
-        projected = self.fc2(hidden)
-        if self.adaln is None:
-            adaln = torch.zeros(
-                (*projected.shape[:-1], projected.shape[-1] * 3),
-                device=projected.device,
-                dtype=projected.dtype,
-            )
-        else:
-            adaln = self.adaln(hidden)
-        return projected, adaln
+        hidden = self.fc1(embeddings)
+        hidden = self.activation(hidden)
+        hidden = self.fc2(hidden)
+        if self.use_adaln_lora:
+            return embeddings, hidden
+        return hidden, None
 
 
-class ActionEmbeddingMLP(nn.Module):
-    """Embed a flattened action window with the DreamDojo MLP structure."""
+class Mlp(nn.Module):
+    """Apply the DreamDojo action MLP used before AdaLN modulation."""
 
     def __init__(self, in_features: int, out_features: int) -> None:
-        """Create the DreamDojo action embedding MLP."""
+        """Create the two-layer action embedder."""
 
         super().__init__()
         hidden_features = out_features * 4
@@ -435,15 +458,6 @@ class ActionEmbeddingMLP(nn.Module):
         self.activation = nn.GELU(approximate="tanh")
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(0.0)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        """Initialize the action MLP with the same fan-in scaling used elsewhere."""
-
-        nn.init.trunc_normal_(self.fc1.weight, std=1.0 / math.sqrt(self.fc1.in_features))
-        nn.init.zeros_(self.fc1.bias)
-        nn.init.trunc_normal_(self.fc2.weight, std=1.0 / math.sqrt(self.fc2.in_features))
-        nn.init.zeros_(self.fc2.bias)
 
     def forward(self, actions: torch.Tensor) -> torch.Tensor:
         """Return one action-conditioning embedding for each batch item."""
@@ -488,12 +502,13 @@ class PatchEmbed(nn.Module):
             nn.Linear(patch_dim, out_channels, bias=False),
         )
         self.patch_dim = patch_dim
-        self.reset_parameters()
+        self.init_weights()
 
-    def reset_parameters(self) -> None:
+    def init_weights(self) -> None:
         """Initialize the patch embedding projection."""
 
-        nn.init.trunc_normal_(self.proj[1].weight, std=1.0 / math.sqrt(self.patch_dim))
+        std = 1.0 / math.sqrt(self.patch_dim)
+        nn.init.trunc_normal_(self.proj[1].weight, std=std, a=-3 * std, b=3 * std)
 
     def forward(self, video: torch.Tensor) -> torch.Tensor:
         """Return patch embeddings with shape `(B, T, H, W, D)`."""
@@ -524,116 +539,214 @@ class VideoRopePosition3DEmb(nn.Module):
         """Store the maximum token-grid sizes and RoPE scaling factors."""
 
         super().__init__()
-        if head_dim % 2 != 0:
-            raise ValueError("RoPE requires an even head dimension.")
-        self.head_dim = head_dim
+        self.register_buffer("seq", torch.arange(max(len_h, len_w, len_t), dtype=torch.float32))
         self.max_h = len_h
         self.max_w = len_w
         self.max_t = len_t
-        self.dim_h = (head_dim // 6) * 2
-        self.dim_w = self.dim_h
-        self.dim_t = head_dim - self.dim_h - self.dim_w
-        self.h_theta = 10000.0 * self._ntk_factor(self.dim_h, h_extrapolation_ratio)
-        self.w_theta = 10000.0 * self._ntk_factor(self.dim_w, w_extrapolation_ratio)
-        self.t_theta = 10000.0 * self._ntk_factor(self.dim_t, t_extrapolation_ratio)
+        dim_h = head_dim // 6 * 2
+        dim_w = dim_h
+        dim_t = head_dim - 2 * dim_h
+        if head_dim != dim_h + dim_w + dim_t:
+            raise ValueError(f"bad dim: {head_dim} != {dim_h} + {dim_w} + {dim_t}")
+        self.register_buffer(
+            "dim_spatial_range",
+            torch.arange(0, dim_h, 2, dtype=torch.float32)[: (dim_h // 2)] / dim_h,
+            persistent=True,
+        )
+        self.register_buffer(
+            "dim_temporal_range",
+            torch.arange(0, dim_t, 2, dtype=torch.float32)[: (dim_t // 2)] / dim_t,
+            persistent=True,
+        )
+        self._dim_h = dim_h
+        self._dim_t = dim_t
+        self.h_ntk_factor = h_extrapolation_ratio ** (dim_h / (dim_h - 2))
+        self.w_ntk_factor = w_extrapolation_ratio ** (dim_w / (dim_w - 2))
+        self.t_ntk_factor = t_extrapolation_ratio ** (dim_t / (dim_t - 2))
+        self.reset_parameters()
 
-    def _ntk_factor(self, dim: int, ratio: float) -> float:
-        """Return the DreamDojo-style NTK extrapolation factor."""
+    def reset_parameters(self) -> None:
+        """Refresh the cached RoPE sequences and frequency ranges."""
 
-        if dim <= 2:
-            return 1.0
-        return ratio ** (dim / (dim - 2))
+        dim_h = self._dim_h
+        dim_t = self._dim_t
+        self.seq = torch.arange(
+            max(self.max_h, self.max_w, self.max_t),
+            dtype=torch.float32,
+            device=self.dim_spatial_range.device,
+        )
+        self.dim_spatial_range = (
+            torch.arange(0, dim_h, 2, dtype=torch.float32, device=self.dim_spatial_range.device)[: (dim_h // 2)]
+            / dim_h
+        )
+        self.dim_temporal_range = (
+            torch.arange(0, dim_t, 2, dtype=torch.float32, device=self.dim_spatial_range.device)[: (dim_t // 2)]
+            / dim_t
+        )
 
-    def _angles(self, size: int, dim: int, theta: float, device: torch.device) -> torch.Tensor:
-        """Return rotary angles for one axis."""
+    def forward(self, x_B_T_H_W_D: torch.Tensor) -> torch.Tensor:
+        """Return DreamDojo-style RoPE frequencies for one embedded token grid."""
 
-        if dim == 0:
-            return torch.zeros(size, 0, device=device)
-        positions = torch.arange(size, device=device, dtype=torch.float32)
-        exponents = torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim
-        frequencies = 1.0 / (theta ** exponents)
-        return torch.outer(positions, frequencies)
-
-    def forward(
-        self,
-        frames: int,
-        height: int,
-        width: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return cosine and sine RoPE tensors for the current token grid."""
-
-        if frames > self.max_t or height > self.max_h or width > self.max_w:
+        if x_B_T_H_W_D.ndim != 5:
+            raise ValueError(
+                f"Expected embedded tokens with shape (B, T, H, W, D), received {tuple(x_B_T_H_W_D.shape)}."
+            )
+        _, frames, height, width, _ = x_B_T_H_W_D.shape
+        if height > self.max_h or width > self.max_w or frames > self.max_t:
             raise ValueError("Requested token grid exceeds the configured RoPE capacity.")
-        angles_t = self._angles(frames, self.dim_t, self.t_theta, device)
-        angles_h = self._angles(height, self.dim_h, self.h_theta, device)
-        angles_w = self._angles(width, self.dim_w, self.w_theta, device)
-        combined = torch.cat(
+        h_theta = 10000.0 * self.h_ntk_factor
+        w_theta = 10000.0 * self.w_ntk_factor
+        t_theta = 10000.0 * self.t_ntk_factor
+        h_spatial_freqs = 1.0 / (h_theta ** self.dim_spatial_range.float())
+        w_spatial_freqs = 1.0 / (w_theta ** self.dim_spatial_range.float())
+        temporal_freqs = 1.0 / (t_theta ** self.dim_temporal_range.float())
+        half_emb_h = torch.outer(self.seq[:height], h_spatial_freqs)
+        half_emb_w = torch.outer(self.seq[:width], w_spatial_freqs)
+        half_emb_t = torch.outer(self.seq[:frames], temporal_freqs)
+        embedding = torch.cat(
             [
-                repeat(angles_t, "t d -> t h w d", h=height, w=width),
-                repeat(angles_h, "h d -> t h w d", t=frames, w=width),
-                repeat(angles_w, "w d -> t h w d", t=frames, h=height),
-            ],
+                repeat(half_emb_t, "t d -> t h w d", h=height, w=width),
+                repeat(half_emb_h, "h d -> t h w d", t=frames, w=width),
+                repeat(half_emb_w, "w d -> t h w d", t=frames, h=height),
+            ]
+            * 2,
             dim=-1,
-        ).reshape(frames * height * width, -1)
-        return combined.cos().to(dtype=dtype), combined.sin().to(dtype=dtype)
+        )
+        return rearrange(embedding, "t h w d -> (t h w) 1 1 d").float()
 
 
 def apply_rotary_position_embedding(
     x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+    rope_emb: torch.Tensor,
 ) -> torch.Tensor:
-    """Rotate query or key heads with 3D RoPE angles."""
+    """Rotate one query or key tensor with DreamDojo-style RoPE frequencies."""
 
-    cos = cos.unsqueeze(0).unsqueeze(0)
-    sin = sin.unsqueeze(0).unsqueeze(0)
-    x_even = x[..., ::2]
-    x_odd = x[..., 1::2]
-    rotated_even = x_even * cos - x_odd * sin
-    rotated_odd = x_even * sin + x_odd * cos
-    return torch.stack([rotated_even, rotated_odd], dim=-1).flatten(-2)
+    if x.ndim != 4:
+        raise ValueError(f"Expected x with shape (B, S, H, D), received {tuple(x.shape)}.")
+    if rope_emb.ndim != 4:
+        raise ValueError(
+            f"Expected rope_emb with shape (S, 1, 1, D) or (1, S, 1, D), received {tuple(rope_emb.shape)}."
+        )
+    if rope_emb.shape[0] == x.shape[1]:
+        rope_emb = rearrange(rope_emb, "s one two d -> one s two d")
+    elif rope_emb.shape[1] != x.shape[1]:
+        raise ValueError(
+            f"RoPE sequence length {rope_emb.shape[:2]} is incompatible with token sequence length {x.shape[1]}."
+        )
+    cos = rope_emb.cos().to(dtype=x.dtype)
+    sin = rope_emb.sin().to(dtype=x.dtype)
+    half_dim = x.shape[-1] // 2
+    rotated = torch.cat([-x[..., half_dim:], x[..., :half_dim]], dim=-1)
+    return x * cos + rotated * sin
 
 
-class SelfAttention(nn.Module):
-    """Apply full self-attention over the flattened latent token grid."""
+def torch_attention_op(
+    q_B_S_H_D: torch.Tensor,
+    k_B_S_H_D: torch.Tensor,
+    v_B_S_H_D: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    flatten_heads: bool = True,
+) -> torch.Tensor:
+    """Apply scaled dot-product attention to `[B, S, H, D]` tensors."""
 
-    def __init__(self, model_channels: int, num_heads: int) -> None:
-        """Build the attention projections for the DiT block."""
+    q_B_H_S_D = rearrange(q_B_S_H_D, "b s h d -> b h s d")
+    k_B_H_S_D = rearrange(k_B_S_H_D, "b s h d -> b h s d")
+    v_B_H_S_D = rearrange(v_B_S_H_D, "b s h d -> b h s d")
+    result_B_H_S_D = F.scaled_dot_product_attention(
+        q_B_H_S_D,
+        k_B_H_S_D,
+        v_B_H_S_D,
+        attn_mask=attn_mask,
+    )
+    if flatten_heads:
+        return rearrange(result_B_H_S_D, "b h s d -> b s (h d)")
+    return rearrange(result_B_H_S_D, "b h s d -> b s h d")
+
+
+class Attention(nn.Module):
+    """Apply DreamDojo-style self-attention over a flattened token sequence."""
+
+    def __init__(self, query_dim: int, n_heads: int, head_dim: int) -> None:
+        """Create the self-attention projections and RMS norms."""
 
         super().__init__()
-        self.model_channels = model_channels
-        self.num_heads = num_heads
-        self.head_dim = model_channels // num_heads
-        self.q_proj = nn.Linear(model_channels, model_channels, bias=False)
-        self.k_proj = nn.Linear(model_channels, model_channels, bias=False)
-        self.v_proj = nn.Linear(model_channels, model_channels, bias=False)
-        self.out_proj = nn.Linear(model_channels, model_channels, bias=False)
-        self.q_norm = RMSNorm(self.head_dim)
-        self.k_norm = RMSNorm(self.head_dim)
-        self.reset_parameters()
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.query_dim = query_dim
+        self.inner_dim = head_dim * n_heads
+        self.q_proj = nn.Linear(query_dim, self.inner_dim, bias=False)
+        self.q_norm = RMSNorm(self.head_dim, eps=1e-6)
+        self.k_proj = nn.Linear(query_dim, self.inner_dim, bias=False)
+        self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
+        self.v_proj = nn.Linear(query_dim, self.inner_dim, bias=False)
+        self.v_norm = nn.Identity()
+        self.output_proj = nn.Linear(self.inner_dim, query_dim, bias=False)
+        self.output_dropout = nn.Identity()
+        self.attn_op = torch_attention_op
 
-    def reset_parameters(self) -> None:
-        """Initialize the attention projections."""
+    def init_weights(self) -> None:
+        """Initialize the attention projections and norm scales."""
 
-        for projection in (self.q_proj, self.k_proj, self.v_proj, self.out_proj):
-            nn.init.trunc_normal_(projection.weight, std=1.0 / math.sqrt(projection.in_features))
+        std = 1.0 / math.sqrt(self.query_dim)
+        nn.init.trunc_normal_(self.q_proj.weight, std=std, a=-3 * std, b=3 * std)
+        nn.init.trunc_normal_(self.k_proj.weight, std=std, a=-3 * std, b=3 * std)
+        nn.init.trunc_normal_(self.v_proj.weight, std=std, a=-3 * std, b=3 * std)
+        std = 1.0 / math.sqrt(self.inner_dim)
+        nn.init.trunc_normal_(self.output_proj.weight, std=std, a=-3 * std, b=3 * std)
+        self.q_norm.reset_parameters()
+        self.k_norm.reset_parameters()
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def compute_qkv(
+        self,
+        x: torch.Tensor,
+        rope_emb: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project one token sequence into normalized Q/K/V tensors."""
+
+        query = self.q_proj(x)
+        key = self.k_proj(x)
+        value = self.v_proj(x)
+        query, key, value = map(
+            lambda tensor: rearrange(
+                tensor,
+                "b s (h d) -> b s h d",
+                h=self.n_heads,
+                d=self.head_dim,
+            ),
+            (query, key, value),
+        )
+        query = self.q_norm(query)
+        key = self.k_norm(key)
+        value = self.v_norm(value)
+        if rope_emb is not None:
+            query = apply_rotary_position_embedding(query, rope_emb)
+            key = apply_rotary_position_embedding(key, rope_emb)
+        return query, key, value
+
+    def compute_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply attention and project the concatenated heads back to model space."""
+
+        attended = self.attn_op(query, key, value)
+        return self.output_dropout(self.output_proj(attended))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Return the attention-updated token sequence."""
 
-        query = rearrange(self.q_proj(x), "b l (h d) -> b h l d", h=self.num_heads)
-        key = rearrange(self.k_proj(x), "b l (h d) -> b h l d", h=self.num_heads)
-        value = rearrange(self.v_proj(x), "b l (h d) -> b h l d", h=self.num_heads)
-        query = apply_rotary_position_embedding(self.q_norm(query), cos, sin)
-        key = apply_rotary_position_embedding(self.k_norm(key), cos, sin)
-        attended = F.scaled_dot_product_attention(query, key, value, is_causal=False)
-        return self.out_proj(rearrange(attended, "b h l d -> b l (h d)"))
+        query, key, value = self.compute_qkv(x, rope_emb=rope_emb)
+        return self.compute_attention(query, key, value)
 
 
-class FeedForward(nn.Module):
-    """Apply the MLP half of one DiT block."""
+class GPT2FeedForward(nn.Module):
+    """Apply the DreamDojo two-layer GELU feed-forward network."""
 
     def __init__(self, model_channels: int, mlp_ratio: float = 4.0) -> None:
         """Create the two-layer feed-forward network."""
@@ -642,14 +755,17 @@ class FeedForward(nn.Module):
         hidden_channels = int(model_channels * mlp_ratio)
         self.fc1 = nn.Linear(model_channels, hidden_channels, bias=False)
         self.fc2 = nn.Linear(hidden_channels, model_channels, bias=False)
-        self.activation = nn.GELU(approximate="tanh")
-        self.reset_parameters()
+        self.activation = nn.GELU()
+        self.model_channels = model_channels
+        self.hidden_channels = hidden_channels
 
-    def reset_parameters(self) -> None:
+    def init_weights(self) -> None:
         """Initialize the feed-forward layers."""
 
-        nn.init.trunc_normal_(self.fc1.weight, std=1.0 / math.sqrt(self.fc1.in_features))
-        nn.init.trunc_normal_(self.fc2.weight, std=1.0 / math.sqrt(self.fc2.in_features))
+        std = 1.0 / math.sqrt(self.model_channels)
+        nn.init.trunc_normal_(self.fc1.weight, std=std, a=-3 * std, b=3 * std)
+        std = 1.0 / math.sqrt(self.hidden_channels)
+        nn.init.trunc_normal_(self.fc2.weight, std=std, a=-3 * std, b=3 * std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Return the MLP update for the token sequence."""
@@ -657,40 +773,97 @@ class FeedForward(nn.Module):
         return self.fc2(self.activation(self.fc1(x)))
 
 
-class AdaLNDiTBlock(nn.Module):
-    """Apply one AdaLN-modulated self-attention plus MLP transformer block."""
+class Block(nn.Module):
+    """Apply one DreamDojo-style AdaLN self-attention plus MLP block."""
 
-    def __init__(self, model_channels: int, num_heads: int) -> None:
+    def __init__(
+        self,
+        model_channels: int,
+        num_heads: int,
+        *,
+        mlp_ratio: float = 4.0,
+        use_adaln_lora: bool,
+        adaln_lora_dim: int,
+    ) -> None:
         """Create the attention, MLP, and modulation paths."""
 
         super().__init__()
         self.model_channels = model_channels
-        self.attn_norm = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
-        self.mlp_norm = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
-        self.attn = SelfAttention(model_channels, num_heads)
-        self.mlp = FeedForward(model_channels)
-        self.attn_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(model_channels, model_channels * 3, bias=False),
+        self.layer_norm_self_attn = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
+        self.self_attn = Attention(
+            model_channels,
+            n_heads=num_heads,
+            head_dim=model_channels // num_heads,
         )
-        self.mlp_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(model_channels, model_channels * 3, bias=False),
-        )
-        self.reset_parameters()
+        self.layer_norm_mlp = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
+        self.mlp = GPT2FeedForward(model_channels, mlp_ratio=mlp_ratio)
+        self.use_adaln_lora = use_adaln_lora
+        self.adaln_lora_dim = adaln_lora_dim
+        if use_adaln_lora:
+            self.adaln_modulation_self_attn = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(model_channels, adaln_lora_dim, bias=False),
+                nn.Linear(adaln_lora_dim, 3 * model_channels, bias=False),
+            )
+            self.adaln_modulation_mlp = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(model_channels, adaln_lora_dim, bias=False),
+                nn.Linear(adaln_lora_dim, 3 * model_channels, bias=False),
+            )
+        else:
+            self.adaln_modulation_self_attn = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(model_channels, 3 * model_channels, bias=False),
+            )
+            self.adaln_modulation_mlp = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(model_channels, 3 * model_channels, bias=False),
+            )
 
     def reset_parameters(self) -> None:
         """Initialize the AdaLN modulation heads."""
 
-        nn.init.zeros_(self.attn_modulation[1].weight)
-        nn.init.zeros_(self.mlp_modulation[1].weight)
+        self.layer_norm_self_attn.reset_parameters()
+        self.layer_norm_mlp.reset_parameters()
+        if self.use_adaln_lora:
+            std = 1.0 / math.sqrt(self.model_channels)
+            nn.init.trunc_normal_(
+                self.adaln_modulation_self_attn[1].weight,
+                std=std,
+                a=-3 * std,
+                b=3 * std,
+            )
+            nn.init.trunc_normal_(
+                self.adaln_modulation_mlp[1].weight,
+                std=std,
+                a=-3 * std,
+                b=3 * std,
+            )
+            nn.init.zeros_(self.adaln_modulation_self_attn[2].weight)
+            nn.init.zeros_(self.adaln_modulation_mlp[2].weight)
+        else:
+            nn.init.zeros_(self.adaln_modulation_self_attn[1].weight)
+            nn.init.zeros_(self.adaln_modulation_mlp[1].weight)
+
+    def init_weights(self) -> None:
+        """Initialize modulation heads plus nested attention and MLP weights."""
+
+        self.reset_parameters()
+        self.self_attn.init_weights()
+        self.mlp.init_weights()
 
     def _broadcast(self, values: torch.Tensor) -> torch.Tensor:
         """Expand one `(B, T, D)` tensor over the spatial token grid."""
 
         return rearrange(values, "b t d -> b t 1 1 d")
 
-    def _modulate(self, x: torch.Tensor, norm: nn.LayerNorm, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    def _modulate(
+        self,
+        x: torch.Tensor,
+        norm: nn.LayerNorm,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
         """Apply AdaLN modulation before one transformer sublayer."""
 
         return norm(x) * (1.0 + self._broadcast(scale)) + self._broadcast(shift)
@@ -699,28 +872,33 @@ class AdaLNDiTBlock(nn.Module):
         self,
         x: torch.Tensor,
         timestep_embedding: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
+        rope_emb: torch.Tensor,
         adaln_lora: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return the transformed token grid for one DiT block."""
 
-        batch_size, frames, height, width, _ = x.shape
-        attn_modulation = self.attn_modulation(timestep_embedding)
+        _, frames, height, width, _ = x.shape
+        attn_modulation = self.adaln_modulation_self_attn(timestep_embedding)
         if adaln_lora is not None:
             attn_modulation = attn_modulation + adaln_lora
         shift_attn, scale_attn, gate_attn = attn_modulation.chunk(3, dim=-1)
-        attn_input = self._modulate(x, self.attn_norm, shift_attn, scale_attn)
+        shift_attn = shift_attn.type_as(x)
+        scale_attn = scale_attn.type_as(x)
+        gate_attn = gate_attn.type_as(x)
+        attn_input = self._modulate(x, self.layer_norm_self_attn, shift_attn, scale_attn)
         attn_input = rearrange(attn_input, "b t h w d -> b (t h w) d")
-        attn_output = self.attn(attn_input, cos, sin)
+        attn_output = self.self_attn(attn_input, rope_emb=rope_emb)
         attn_output = rearrange(attn_output, "b (t h w) d -> b t h w d", t=frames, h=height, w=width)
         x = x + self._broadcast(gate_attn) * attn_output
 
-        mlp_modulation = self.mlp_modulation(timestep_embedding)
+        mlp_modulation = self.adaln_modulation_mlp(timestep_embedding)
         if adaln_lora is not None:
             mlp_modulation = mlp_modulation + adaln_lora
         shift_mlp, scale_mlp, gate_mlp = mlp_modulation.chunk(3, dim=-1)
-        mlp_input = self._modulate(x, self.mlp_norm, shift_mlp, scale_mlp)
+        shift_mlp = shift_mlp.type_as(x)
+        scale_mlp = scale_mlp.type_as(x)
+        gate_mlp = gate_mlp.type_as(x)
+        mlp_input = self._modulate(x, self.layer_norm_mlp, shift_mlp, scale_mlp)
         mlp_output = self.mlp(mlp_input)
         return x + self._broadcast(gate_mlp) * mlp_output
 
@@ -734,6 +912,8 @@ class FinalLayer(nn.Module):
         spatial_patch_size: int,
         temporal_patch_size: int,
         out_channels: int,
+        use_adaln_lora: bool,
+        adaln_lora_dim: int,
     ) -> None:
         """Create the final AdaLN projection to the latent patch space."""
 
@@ -741,20 +921,40 @@ class FinalLayer(nn.Module):
         self.spatial_patch_size = spatial_patch_size
         self.temporal_patch_size = temporal_patch_size
         self.out_channels = out_channels
-        self.norm = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
-        self.modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(model_channels, model_channels * 2, bias=False),
-        )
+        self.model_channels = model_channels
+        self.use_adaln_lora = use_adaln_lora
+        self.adaln_lora_dim = adaln_lora_dim
+        self.layer_norm = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
         patch_dim = spatial_patch_size * spatial_patch_size * temporal_patch_size * out_channels
-        self.proj = nn.Linear(model_channels, patch_dim, bias=False)
-        self.reset_parameters()
+        self.linear = nn.Linear(model_channels, patch_dim, bias=False)
+        if use_adaln_lora:
+            self.adaln_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(model_channels, adaln_lora_dim, bias=False),
+                nn.Linear(adaln_lora_dim, model_channels * 2, bias=False),
+            )
+        else:
+            self.adaln_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(model_channels, model_channels * 2, bias=False),
+            )
 
-    def reset_parameters(self) -> None:
+    def init_weights(self) -> None:
         """Initialize the final AdaLN projection."""
 
-        nn.init.zeros_(self.modulation[1].weight)
-        nn.init.trunc_normal_(self.proj.weight, std=1.0 / math.sqrt(self.proj.in_features))
+        std = 1.0 / math.sqrt(self.model_channels)
+        nn.init.trunc_normal_(self.linear.weight, std=std, a=-3 * std, b=3 * std)
+        if self.use_adaln_lora:
+            nn.init.trunc_normal_(
+                self.adaln_modulation[1].weight,
+                std=std,
+                a=-3 * std,
+                b=3 * std,
+            )
+            nn.init.zeros_(self.adaln_modulation[2].weight)
+        else:
+            nn.init.zeros_(self.adaln_modulation[1].weight)
+        self.layer_norm.reset_parameters()
 
     def forward(
         self,
@@ -764,13 +964,17 @@ class FinalLayer(nn.Module):
     ) -> torch.Tensor:
         """Return per-patch latent predictions."""
 
-        modulation = self.modulation(timestep_embedding)
-        if adaln_lora is not None:
-            modulation = modulation + adaln_lora[..., : modulation.shape[-1]]
+        if self.use_adaln_lora:
+            if adaln_lora is None:
+                raise ValueError("adaln_lora must be provided when use_adaln_lora=True.")
+            modulation = self.adaln_modulation(timestep_embedding) + adaln_lora[:, :, : 2 * self.model_channels]
+        else:
+            modulation = self.adaln_modulation(timestep_embedding)
         shift, scale = modulation.chunk(2, dim=-1)
-        modulated = self.norm(x) * (1.0 + rearrange(scale, "b t d -> b t 1 1 d"))
-        modulated = modulated + rearrange(shift, "b t d -> b t 1 1 d")
-        return self.proj(modulated)
+        shift = rearrange(shift, "b t d -> b t 1 1 d").type_as(x)
+        scale = rearrange(scale, "b t d -> b t 1 1 d").type_as(x)
+        x = self.layer_norm(x) * (1.0 + scale) + shift
+        return self.linear(x)
 
 
 class RectifiedFlowHelper:
@@ -875,66 +1079,89 @@ class ActionConditionedDynamicsTransformer(nn.Module):
 
         super().__init__()
         self.cfg = cfg
+        self._num_action_per_latent_frame = 1
         self.x_embedder = PatchEmbed(
             spatial_patch_size=cfg.patch_spatial,
             temporal_patch_size=cfg.patch_temporal,
             in_channels=cfg.in_channels + 1,
             out_channels=cfg.model_channels,
         )
-        self.temporal_pos_embed = (
-            nn.Parameter(
-                torch.zeros(
-                    1,
-                    cfg.max_frames // cfg.patch_temporal,
-                    1,
-                    1,
-                    cfg.model_channels,
-                )
-            )
-            if cfg.use_learned_temporal_embedding
-            else None
+        self.build_pos_embed()
+        self.t_embedder = nn.Sequential(
+            Timesteps(cfg.model_channels),
+            TimestepEmbedding(
+                cfg.model_channels,
+                cfg.model_channels,
+                use_adaln_lora=cfg.use_adaln_lora,
+            ),
         )
-        self.pos_embedder = VideoRopePosition3DEmb(
-            head_dim=cfg.model_channels // cfg.num_heads,
-            len_h=cfg.max_img_h // cfg.patch_spatial,
-            len_w=cfg.max_img_w // cfg.patch_spatial,
-            len_t=cfg.max_frames // cfg.patch_temporal,
-            h_extrapolation_ratio=cfg.rope_h_extrapolation_ratio,
-            w_extrapolation_ratio=cfg.rope_w_extrapolation_ratio,
-            t_extrapolation_ratio=cfg.rope_t_extrapolation_ratio,
-        )
-        self.timesteps = Timesteps(cfg.model_channels)
-        self.timestep_embedding = TimestepEmbedding(
-            in_dim=cfg.model_channels,
-            out_dim=cfg.model_channels,
-            use_adaln_lora=cfg.use_adaln_lora,
-        )
-        self.t_embedding_norm = RMSNorm(cfg.model_channels)
+        self.t_embedding_norm = RMSNorm(cfg.model_channels, eps=1e-6)
         self.blocks = nn.ModuleList(
-            [AdaLNDiTBlock(cfg.model_channels, cfg.num_heads) for _ in range(cfg.num_blocks)]
+            [
+                Block(
+                    cfg.model_channels,
+                    cfg.num_heads,
+                    mlp_ratio=4.0,
+                    use_adaln_lora=cfg.use_adaln_lora,
+                    adaln_lora_dim=cfg.adaln_lora_dim,
+                )
+                for _ in range(cfg.num_blocks)
+            ]
         )
         self.final_layer = FinalLayer(
             model_channels=cfg.model_channels,
             spatial_patch_size=cfg.patch_spatial,
             temporal_patch_size=cfg.patch_temporal,
             out_channels=cfg.out_channels,
+            use_adaln_lora=cfg.use_adaln_lora,
+            adaln_lora_dim=cfg.adaln_lora_dim,
         )
-        action_embedder_in_features = (
-            cfg.action_dim
-            if cfg.action_conditioning_mode == "chunk_per_frame"
-            else cfg.action_dim * cfg.num_action_per_chunk
-        )
-        self.action_embedder_B_D = ActionEmbeddingMLP(
+        action_embedder_in_features = cfg.action_dim * self._num_action_per_latent_frame
+        self.action_embedder_B_D = Mlp(
             action_embedder_in_features,
             cfg.model_channels,
         )
-        self.action_embedder_B_3D = ActionEmbeddingMLP(
+        self.action_embedder_B_3D = Mlp(
             action_embedder_in_features,
             cfg.model_channels * 3,
         )
-        if cfg.zero_init_action_embedder:
+        self.init_weights()
+
+    def init_weights(self) -> None:
+        """Initialize the DreamDojo-style DiT core and optional zero-init action heads."""
+
+        self.x_embedder.init_weights()
+        self.pos_embedder.reset_parameters()
+        self.t_embedder[1].init_weights()
+        for block in self.blocks:
+            block.init_weights()
+        self.final_layer.init_weights()
+        self.t_embedding_norm.reset_parameters()
+        if self.cfg.zero_init_action_embedder:
             self.action_embedder_B_D.zero_output_projection()
             self.action_embedder_B_3D.zero_output_projection()
+
+    def build_pos_embed(self) -> None:
+        """Create the RoPE embedder used by the DreamDojo-style DiT core."""
+
+        self.pos_embedder = VideoRopePosition3DEmb(
+            head_dim=self.cfg.model_channels // self.cfg.num_heads,
+            len_h=self.cfg.max_img_h // self.cfg.patch_spatial,
+            len_w=self.cfg.max_img_w // self.cfg.patch_spatial,
+            len_t=self.cfg.max_frames // self.cfg.patch_temporal,
+            h_extrapolation_ratio=self.cfg.rope_h_extrapolation_ratio,
+            w_extrapolation_ratio=self.cfg.rope_w_extrapolation_ratio,
+            t_extrapolation_ratio=self.cfg.rope_t_extrapolation_ratio,
+        )
+
+    def prepare_embedded_sequence(
+        self,
+        x_B_C_T_H_W: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Patchify the latent video and build its RoPE frequencies."""
+
+        tokens = self.x_embedder(x_B_C_T_H_W)
+        return tokens, self.pos_embedder(tokens).to(tokens.device)
 
     def unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
         """Restore a patch tensor to `(B, C, T, H, W)` latent-video layout."""
@@ -957,20 +1184,23 @@ class ActionConditionedDynamicsTransformer(nn.Module):
         """Return DreamDojo-style action embeddings for the configured conditioning mode."""
 
         action = action.to(dtype=dtype)
-        if self.cfg.action_conditioning_mode == "chunk_per_frame":
-            action_emb_B_D = self.action_embedder_B_D(action)
-            action_emb_B_3D = self.action_embedder_B_3D(action)
-            zero_pad_action_emb_B_D = torch.zeros_like(action_emb_B_D[:, :1, :])
-            zero_pad_action_emb_B_3D = torch.zeros_like(action_emb_B_3D[:, :1, :])
-            return (
-                torch.cat([zero_pad_action_emb_B_D, action_emb_B_D], dim=1),
-                torch.cat([zero_pad_action_emb_B_3D, action_emb_B_3D], dim=1),
-            )
-
+        num_actions = int(action.shape[1])
         flattened_action = rearrange(action, "b t d -> b 1 (t d)")
+        action = rearrange(
+            flattened_action,
+            "b 1 (t d) -> b t d",
+            t=num_actions // self._num_action_per_latent_frame,
+        )
+        action_emb_B_D = self.action_embedder_B_D(action)
+        action_emb_B_3D = self.action_embedder_B_3D(action)
+        zero_pad_action_emb_B_D = torch.zeros_like(action_emb_B_D[:, :1, :], device=action_emb_B_D.device)
+        zero_pad_action_emb_B_3D = torch.zeros_like(
+            action_emb_B_3D[:, :1, :],
+            device=action_emb_B_3D.device,
+        )
         return (
-            self.action_embedder_B_D(flattened_action),
-            self.action_embedder_B_3D(flattened_action),
+            torch.cat([zero_pad_action_emb_B_D, action_emb_B_D], dim=1),
+            torch.cat([zero_pad_action_emb_B_3D, action_emb_B_3D], dim=1),
         )
 
     def forward(
@@ -1019,31 +1249,23 @@ class ActionConditionedDynamicsTransformer(nn.Module):
                 device=x_B_C_T_H_W.device,
                 dtype=x_B_C_T_H_W.dtype,
             )
-        timesteps_B_T = timesteps_B_T * self.cfg.timestep_scale
         model_input = torch.cat(
             [x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W.to(dtype=x_B_C_T_H_W.dtype)],
             dim=1,
         )
-        tokens = self.x_embedder(model_input)
-        if self.temporal_pos_embed is not None:
-            tokens = tokens + self.temporal_pos_embed[:, : tokens.shape[1]].to(dtype=tokens.dtype)
-        _, token_frames, token_height, token_width, _ = tokens.shape
-        cos, sin = self.pos_embedder(
-            token_frames,
-            token_height,
-            token_width,
-            device=tokens.device,
-            dtype=tokens.dtype,
-        )
+        timesteps_B_T = timesteps_B_T * self.cfg.timestep_scale
+        tokens, rope_emb = self.prepare_embedded_sequence(model_input)
         if timesteps_B_T.ndim == 1:
             timesteps_B_T = timesteps_B_T.unsqueeze(1)
-        timestep_features = self.timesteps(timesteps_B_T)
-        timestep_embedding, adaln_lora = self.timestep_embedding(timestep_features)
+        timestep_embedding, adaln_lora = self.t_embedder(timesteps_B_T)
+        if adaln_lora is None:
+            raise ValueError("The DreamDojo-mechanics RF DiT requires AdaLN-LoRA conditioning.")
         action_emb_B_D, action_emb_B_3D = self._embed_actions(action, dtype=tokens.dtype)
-        timestep_embedding = self.t_embedding_norm(timestep_embedding + action_emb_B_D)
+        timestep_embedding = timestep_embedding + action_emb_B_D
         adaln_lora = adaln_lora + action_emb_B_3D
+        timestep_embedding = self.t_embedding_norm(timestep_embedding)
         for block in self.blocks:
-            tokens = block(tokens, timestep_embedding, cos, sin, adaln_lora=adaln_lora)
+            tokens = block(tokens, timestep_embedding, rope_emb, adaln_lora=adaln_lora)
         patches = self.final_layer(tokens, timestep_embedding, adaln_lora=adaln_lora)
         return self.unpatchify(patches)
 

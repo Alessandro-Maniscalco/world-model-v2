@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from world_model_v2.dynamics_transformer import DYNAMICS_FRAME_LAYOUT
 from world_model_v2.run import build_config, parse_args
 
 
@@ -18,6 +19,7 @@ def test_run_parse_args_uses_expected_defaults() -> None:
     assert config.train_all_episodes is False
     assert config.validation_split == ""
     assert config.validation_episode == 0
+    assert config.validation_episodes is None
     assert config.camera == "camera_1_color"
     assert config.frame_start is None
     assert config.frame_end is None
@@ -42,8 +44,8 @@ def test_run_parse_args_uses_expected_defaults() -> None:
     assert config.dynamics_rollout_self_forcing_warmup_steps == 0
     assert config.dynamics_rollout_self_forcing_ramp_steps == 0
     assert config.dynamics_self_forcing_rollout_chunks == 0
-    assert config.dynamics_context_frames == 4
-    assert config.dynamics_target_frames == 1
+    assert config.dynamics_context_frames == DYNAMICS_FRAME_LAYOUT.context_frames
+    assert config.dynamics_target_frames == DYNAMICS_FRAME_LAYOUT.target_frames
     assert config.dynamics_conditioning_frame_choices is None
     assert config.dynamics_conditioning_frame_probabilities is None
     assert config.dynamics_validation_conditioning_frame_choices is None
@@ -54,7 +56,7 @@ def test_run_parse_args_uses_expected_defaults() -> None:
     assert config.dynamics_num_heads == 4
     assert config.dynamics_action_conditioning_mode == "chunk_per_frame"
     assert config.dynamics_zero_init_action_embedder is False
-    assert config.dynamics_use_adaln_lora is False
+    assert config.dynamics_use_adaln_lora is True
     assert config.dynamics_adaln_lora_dim == 64
     assert config.dynamics_rope_t_extrapolation_ratio == 1.0
     assert config.dynamics_use_learned_temporal_embedding is False
@@ -132,10 +134,8 @@ def test_run_build_config_preserves_rf_dynamics_flags() -> None:
             "6",
             "--dynamics-num-heads",
             "8",
-            "--dynamics-action-conditioning-mode",
-            "global_chunk",
             "--dynamics-zero-init-action-embedder",
-            "--dynamics-use-adaln-lora",
+            "--no-dynamics-use-adaln-lora",
             "--dynamics-adaln-lora-dim",
             "96",
             "--dynamics-rope-t-extrapolation-ratio",
@@ -164,13 +164,20 @@ def test_run_build_config_preserves_rf_dynamics_flags() -> None:
     assert config.dynamics_model_channels == 384
     assert config.dynamics_num_blocks == 6
     assert config.dynamics_num_heads == 8
-    assert config.dynamics_action_conditioning_mode == "global_chunk"
+    assert config.dynamics_action_conditioning_mode == "chunk_per_frame"
     assert config.dynamics_zero_init_action_embedder is True
-    assert config.dynamics_use_adaln_lora is True
+    assert config.dynamics_use_adaln_lora is False
     assert config.dynamics_adaln_lora_dim == 96
     assert config.dynamics_rope_t_extrapolation_ratio == 1.5
     assert config.dynamics_use_learned_temporal_embedding is True
     assert config.dynamics_validation_metric == "open_rollout_frame_mse"
+
+
+def test_run_rejects_removed_global_chunk_action_mode() -> None:
+    """The parser should reject the removed global-chunk action mode."""
+
+    with pytest.raises(SystemExit):
+        parse_args(["--dynamics-action-conditioning-mode", "global_chunk"])
 
 
 def test_run_build_config_preserves_custom_dynamics_layout_flags() -> None:
@@ -202,6 +209,14 @@ def test_run_build_config_preserves_custom_dynamics_layout_flags() -> None:
     assert config.dynamics_validation_conditioning_frame_choices == (1,)
     assert config.dynamics_open_rollout_context_frames == 1
     assert config.dynamics_open_rollout_stride_frames == 1
+
+
+def test_run_build_config_preserves_rollout_consistency_validation_metric() -> None:
+    """The config builder should accept the motion-aware open-rollout metric."""
+
+    args = parse_args(["--dynamics-validation-metric", "open_rollout_consistency_score"])
+    config = build_config(args)
+    assert config.dynamics_validation_metric == "open_rollout_consistency_score"
 
 
 def test_run_build_config_preserves_kl_flag() -> None:
@@ -279,6 +294,16 @@ def test_run_build_config_preserves_all_episode_training_flags() -> None:
     assert config.validation_episode == 3
 
 
+def test_run_build_config_preserves_multiple_validation_episodes() -> None:
+    """The config builder should keep explicit multi-episode validation selection."""
+
+    args = parse_args(["--validation-episodes", "0,2,4"])
+    config = build_config(args)
+
+    assert config.validation_episode == 0
+    assert config.validation_episodes == (0, 2, 4)
+
+
 def test_run_build_config_preserves_metaworld_flags() -> None:
     """The config builder should keep the requested MetaWorld dataset settings."""
 
@@ -296,6 +321,60 @@ def test_run_build_config_preserves_metaworld_flags() -> None:
     assert config.dataset_format == "lerobot_metaworld"
     assert config.metaworld_task_index == 24
     assert config.metaworld_cache_dir == "data/metaworld_cache"
+
+
+def test_run_build_config_preserves_aloha_flags() -> None:
+    """The config builder should keep the requested ALOHA dataset settings."""
+
+    args = parse_args(
+        [
+            "--dataset-format",
+            "lerobot_aloha_sim_transfer_cube_scripted",
+            "--aloha-cache-dir",
+            "data/aloha_cache",
+        ]
+    )
+    config = build_config(args)
+    assert config.dataset_format == "lerobot_aloha_sim_transfer_cube_scripted"
+    assert config.aloha_cache_dir == "data/aloha_cache"
+
+
+def test_run_build_config_preserves_maniskill_flags() -> None:
+    """The config builder should keep the requested ManiSkill dataset settings."""
+
+    args = parse_args(
+        [
+            "--dataset-format",
+            "maniskill_replay",
+            "--data-root",
+            "data/maniskill_raw/PickCube-v1/motionplanning",
+            "--maniskill-traj-h5",
+            "trajectory.rgb.pd_joint_pos.physx_cpu.h5",
+            "--maniskill-camera",
+            "base_camera",
+        ]
+    )
+    config = build_config(args)
+    assert config.dataset_format == "maniskill_replay"
+    assert config.data_root == "data/maniskill_raw/PickCube-v1/motionplanning"
+    assert config.maniskill_traj_h5 == "trajectory.rgb.pd_joint_pos.physx_cpu.h5"
+    assert config.maniskill_camera == "base_camera"
+
+
+def test_run_build_config_preserves_lerobot_so101_base_sim_pickplace_format() -> None:
+    """The config builder should keep the requested SO-101 sim dataset format."""
+
+    args = parse_args(
+        [
+            "--dataset-format",
+            "lerobot_so101_base_sim_pickplace",
+            "--data-root",
+            "data/so101_base_sim_pickplace_cache",
+        ]
+    )
+    config = build_config(args)
+    assert config.dataset_format == "lerobot_so101_base_sim_pickplace"
+    assert config.data_root == "data/so101_base_sim_pickplace_cache"
 
 
 def test_run_rejects_removed_joint_mode() -> None:

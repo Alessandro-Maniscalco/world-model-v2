@@ -4,18 +4,26 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import random
 
+import numpy as np
 import pytest
 import torch
 
 from world_model_v2.experiment import (
     Experiment,
     ExperimentConfig,
+    _normalized_rng_state_tensor,
     checkpoint_ae_backend,
     checkpoint_dynamics_backend,
+    compute_motion_ratio,
     load_training_checkpoint,
+    motion_ratio_log_error,
+    open_rollout_consistency_score,
     reconstruction_loss_terms,
+    restore_rng_state,
     save_training_checkpoint,
+    validation_metric_value_from_stats,
 )
 from world_model_v2.dynamics_transformer import DynamicsTrainingInputs
 from world_model_v2.model import WorldModel
@@ -106,14 +114,14 @@ def test_experiment_dynamics_only_requires_encoder_decoder_checkpoint(
         )
 
 
-def test_experiment_dynamics_only_requires_at_least_five_frames(
+def test_experiment_dynamics_only_requires_at_least_four_frames(
     fake_long_dataset_root: Path,
     saved_world_model_ae_checkpoint: Path,
     tmp_path: Path,
 ) -> None:
-    """Dynamics-only mode should reject a four-frame clip with no valid 5-frame window."""
+    """Dynamics-only mode should reject a three-frame clip with no valid 4-frame window."""
 
-    with pytest.raises(ValueError, match="at least 5 frames"):
+    with pytest.raises(ValueError, match="at least 4 frames"):
         Experiment(
             ExperimentConfig(
                 mode="dynamics_only",
@@ -121,7 +129,7 @@ def test_experiment_dynamics_only_requires_at_least_five_frames(
                 output_dir=str(tmp_path / "outputs"),
                 run_name="single_frame_dyn",
                 frame_start=111,
-                frame_end=114,
+                frame_end=113,
                 load_encoder_decoder=str(saved_world_model_ae_checkpoint),
                 device="cpu",
             )
@@ -165,6 +173,128 @@ def test_experiment_supports_custom_dynamics_layout_controls(
     assert experiment.model.dynamics.cfg.open_rollout_context_frames == 1
     assert experiment.model.dynamics.cfg.open_rollout_stride_frames == 1
     assert len(experiment.train_dataset) == 1
+
+
+def test_open_rollout_consistency_score_penalizes_motion_ratio_mismatch() -> None:
+    """The rollout-consistency metric should worsen symmetrically away from ratio 1."""
+
+    base_score = open_rollout_consistency_score(0.01, 1.0)
+    under_motion_score = open_rollout_consistency_score(0.01, 0.5)
+    over_motion_score = open_rollout_consistency_score(0.01, 2.0)
+
+    assert base_score == pytest.approx(0.01)
+    assert under_motion_score == pytest.approx(over_motion_score)
+    assert under_motion_score > base_score
+    assert motion_ratio_log_error(1.0) == pytest.approx(0.0)
+    assert compute_motion_ratio(0.0, 0.0) == pytest.approx(1.0)
+
+
+def test_validation_metric_value_from_stats_can_derive_rollout_consistency() -> None:
+    """Compatibility metric restoration should derive consistency from older rollout stats."""
+
+    stats = {
+        "open_rollout_frame_mse": 0.01,
+        "open_rollout_target_motion_ratio": 2.0,
+    }
+
+    derived = validation_metric_value_from_stats("open_rollout_consistency_score", stats)
+
+    assert derived == pytest.approx(open_rollout_consistency_score(0.01, 2.0))
+
+
+def test_normalized_rng_state_tensor_returns_cpu_uint8_tensor() -> None:
+    """RNG-state normalization should coerce tensors into PyTorch's expected format."""
+
+    raw_state = torch.arange(16, dtype=torch.int64)[::2]
+
+    normalized_state = _normalized_rng_state_tensor(raw_state)
+
+    assert normalized_state.device.type == "cpu"
+    assert normalized_state.dtype == torch.uint8
+    assert normalized_state.is_contiguous()
+    assert normalized_state.tolist() == [0, 2, 4, 6, 8, 10, 12, 14]
+
+
+def test_restore_rng_state_normalizes_torch_and_cuda_rng_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RNG restore should feed CPU uint8 tensors into the PyTorch RNG setters."""
+
+    observed: dict[str, object] = {}
+
+    def fake_set_rng_state(state: torch.Tensor) -> None:
+        """Capture the normalized CPU RNG state."""
+
+        observed["torch"] = state
+
+    def fake_cuda_is_available() -> bool:
+        """Pretend CUDA is available so the CUDA restore path runs."""
+
+        return True
+
+    def fake_set_rng_state_all(states: list[torch.Tensor]) -> None:
+        """Capture the normalized CUDA RNG states."""
+
+        observed["torch_cuda"] = states
+
+    monkeypatch.setattr(torch, "set_rng_state", fake_set_rng_state)
+    monkeypatch.setattr(torch.cuda, "is_available", fake_cuda_is_available)
+    monkeypatch.setattr(torch.cuda, "set_rng_state_all", fake_set_rng_state_all)
+
+    restore_rng_state(
+        {
+            "torch": torch.arange(8, dtype=torch.int64),
+            "torch_cuda": [torch.arange(4, dtype=torch.int16)],
+        }
+    )
+
+    torch_state = observed["torch"]
+    assert isinstance(torch_state, torch.Tensor)
+    assert torch_state.device.type == "cpu"
+    assert torch_state.dtype == torch.uint8
+    assert torch_state.tolist() == list(range(8))
+
+    cuda_states = observed["torch_cuda"]
+    assert isinstance(cuda_states, list)
+    assert len(cuda_states) == 1
+    assert cuda_states[0].device.type == "cpu"
+    assert cuda_states[0].dtype == torch.uint8
+    assert cuda_states[0].tolist() == list(range(4))
+
+
+def test_experiment_auto_batch_size_uses_requested_ceiling_for_metaworld() -> None:
+    """MetaWorld auto-batch probing should honor the requested batch-size ceiling."""
+
+    class DummyDataset:
+        """Expose a fixed dataset length for batch-size resolution tests."""
+
+        def __len__(self) -> int:
+            """Return the synthetic dataset length."""
+
+            return 100
+
+    experiment = object.__new__(Experiment)
+    experiment.cfg = ExperimentConfig(
+        batch_size=64,
+        auto_batch_size=True,
+        dataset_format="lerobot_metaworld",
+        device="cuda",
+    )
+    experiment.device = torch.device("cuda")
+    captured: dict[str, int] = {}
+
+    def fake_probe(dataset: DummyDataset, max_batch_size: int) -> int:
+        """Capture the probe ceiling and return a synthetic fit result."""
+
+        captured["max_batch_size"] = max_batch_size
+        return 17
+
+    experiment._probe_cuda_batch_size = fake_probe  # type: ignore[method-assign]
+
+    resolved_batch_size = experiment._resolve_train_batch_size(DummyDataset())
+
+    assert resolved_batch_size == 17
+    assert captured["max_batch_size"] == 64
 
 
 def test_experiment_rejects_negative_self_forcing_weight(
@@ -1188,7 +1318,7 @@ def test_experiment_supports_metaworld_ae_training(
     fake_metaworld_dataset_root: Path,
     tmp_path: Path,
 ) -> None:
-    """AE-only mode should build the MT50 lazy frame dataset and validation clip loader."""
+    """AE-only mode should exclude validation episodes from MT50 all-episode training."""
 
     experiment = Experiment(
         ExperimentConfig(
@@ -1207,20 +1337,237 @@ def test_experiment_supports_metaworld_ae_training(
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 8
+    assert len(experiment.train_dataset) == 3
     train_batch = next(iter(experiment.train_loader))
     validation_batch = next(iter(experiment.val_loader))
     assert train_batch["frame"].shape == (2, 3, 8, 8)
+    assert train_batch["episode_idx"].reshape(-1)[0].item() == 1
     assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
     assert validation_batch["frames"].shape[1:] == (5, 3, 8, 8)
 
 
-def test_experiment_auto_batch_size_uses_full_clip_on_cpu(
+def test_experiment_supports_aloha_ae_training(
+    fake_aloha_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """AE-only mode should exclude validation episodes from ALOHA all-episode training."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            dataset_format="lerobot_aloha_sim_transfer_cube_scripted",
+            data_root=str(fake_aloha_dataset_root),
+            split="train",
+            train_all_episodes=True,
+            validation_split="val",
+            validation_episode=0,
+            batch_size=2,
+            resolution=8,
+            output_dir=str(tmp_path / "outputs"),
+            run_name="aloha_ae",
+            device="cpu",
+        )
+    )
+    assert len(experiment.train_dataset) == 3
+    assert experiment.model.dynamics.cfg.action_dim == 14
+    train_batch = next(iter(experiment.train_loader))
+    validation_batch = next(iter(experiment.val_loader))
+    assert train_batch["frame"].shape == (2, 3, 8, 8)
+    assert train_batch["episode_idx"].reshape(-1)[0].item() == 1
+    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
+    assert validation_batch["frames"].shape[1:] == (5, 3, 8, 8)
+
+
+def test_experiment_supports_maniskill_ae_training(
+    fake_maniskill_replay_root: Path,
+    tmp_path: Path,
+) -> None:
+    """AE-only mode should exclude validation episodes from ManiSkill all-episode training."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            dataset_format="maniskill_replay",
+            data_root=str(fake_maniskill_replay_root),
+            split="train",
+            train_all_episodes=True,
+            validation_split="val",
+            validation_episode=0,
+            batch_size=2,
+            resolution=8,
+            output_dir=str(tmp_path / "outputs"),
+            run_name="maniskill_ae",
+            device="cpu",
+        )
+    )
+    assert len(experiment.train_dataset) == 3
+    assert experiment.model.dynamics.cfg.action_dim == 8
+    train_batch = next(iter(experiment.train_loader))
+    validation_batch = next(iter(experiment.val_loader))
+    assert train_batch["frame"].shape == (2, 3, 8, 8)
+    assert train_batch["episode_idx"].reshape(-1)[0].item() == 1
+    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
+    assert validation_batch["frames"].shape[1:] == (5, 3, 8, 8)
+
+
+def test_experiment_supports_lerobot_so101_base_sim_pickplace_ae_training(
+    fake_lerobot_so101_base_sim_pickplace_root: Path,
+    tmp_path: Path,
+) -> None:
+    """AE-only mode should exclude validation episodes from SO-101 all-episode training."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            dataset_format="lerobot_so101_base_sim_pickplace",
+            data_root=str(fake_lerobot_so101_base_sim_pickplace_root),
+            split="train",
+            train_all_episodes=True,
+            validation_split="val",
+            validation_episode=0,
+            batch_size=2,
+            resolution=8,
+            output_dir=str(tmp_path / "outputs"),
+            run_name="lerobot_so101_base_sim_pickplace_ae",
+            device="cpu",
+        )
+    )
+    assert len(experiment.train_dataset) == 3
+    assert experiment.model.dynamics.cfg.action_dim == 6
+    train_batch = next(iter(experiment.train_loader))
+    validation_batch = next(iter(experiment.val_loader))
+    assert train_batch["frame"].shape == (2, 3, 8, 8)
+    assert train_batch["episode_idx"].reshape(-1)[0].item() == 1
+    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
+    assert validation_batch["frames"].shape[1:] == (5, 3, 8, 8)
+
+
+def test_experiment_dynamics_only_can_train_all_episodes_with_separate_validation_clip(
+    fake_multi_episode_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Dynamics-only mode should flatten valid windows across the full train split."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_multi_episode_dataset_root),
+            split="train",
+            train_all_episodes=True,
+            validation_split="val",
+            validation_episode=0,
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="all_episodes_dynamics",
+            device="cpu",
+        )
+    )
+    assert len(experiment.train_dataset) == 239
+    assert experiment.train_dataset[127]["episode_idx"].item() == 1
+    validation_batch = next(iter(experiment.val_loader))
+    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
+    assert validation_batch["frames"].shape[1] == 130
+
+
+def test_experiment_supports_metaworld_dynamics_training_across_all_episodes(
+    fake_metaworld_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Dynamics-only mode should exclude validation episodes from MT50 training."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            dataset_format="lerobot_metaworld",
+            data_root=str(fake_metaworld_dataset_root),
+            split="train",
+            train_all_episodes=True,
+            validation_split="val",
+            validation_episode=0,
+            metaworld_task_index=0,
+            batch_size=2,
+            resolution=8,
+            dynamics_context_frames=1,
+            dynamics_target_frames=1,
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="metaworld_dynamics_all_episodes",
+            device="cpu",
+        )
+    )
+    assert len(experiment.train_dataset) == 2
+    assert experiment.train_dataset[0]["episode_idx"].item() == 1
+    train_batch = next(iter(experiment.train_loader))
+    validation_batch = next(iter(experiment.val_loader))
+    assert train_batch["context_frames"].shape[1:] == (1, 3, 8, 8)
+    assert train_batch["episode_idx"].reshape(-1)[0].item() == 1
+    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
+    assert validation_batch["frames"].shape[1:] == (5, 3, 8, 8)
+
+
+def test_experiment_excludes_validation_episodes_from_same_split_all_episode_training(
+    fake_multi_episode_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Dynamics all-episode training should exclude validation episodes when sharing a split."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_multi_episode_dataset_root),
+            split="train",
+            train_all_episodes=True,
+            validation_split="train",
+            validation_episodes=(0,),
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="all_episodes_excluding_validation",
+            device="cpu",
+        )
+    )
+    assert len(experiment.train_dataset) == 112
+    assert experiment.train_dataset[0]["episode_idx"].item() == 1
+
+
+def test_experiment_excludes_metaworld_validation_episodes_from_all_episode_training(
+    fake_metaworld_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """MetaWorld all-episode dynamics training should exclude selected validation episodes."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            dataset_format="lerobot_metaworld",
+            data_root=str(fake_metaworld_dataset_root),
+            split="train",
+            train_all_episodes=True,
+            validation_episodes=(0,),
+            metaworld_task_index=0,
+            batch_size=2,
+            resolution=8,
+            dynamics_context_frames=1,
+            dynamics_target_frames=1,
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="metaworld_excluding_validation",
+            device="cpu",
+        )
+    )
+    assert len(experiment.train_dataset) == 2
+    assert experiment.train_dataset[0]["episode_idx"].item() == 1
+
+
+def test_experiment_auto_batch_size_uses_requested_ceiling_on_cpu(
     fake_long_dataset_root: Path,
     saved_world_model_ae_checkpoint: Path,
     tmp_path: Path,
 ) -> None:
-    """Auto batch sizing should resolve to the full episode size on CPU."""
+    """CPU auto batch sizing should respect the requested batch-size ceiling."""
 
     ae_experiment = Experiment(
         ExperimentConfig(
@@ -1243,10 +1590,10 @@ def test_experiment_auto_batch_size_uses_full_clip_on_cpu(
             device="cpu",
         )
     )
-    assert ae_experiment.cfg.batch_size == 130
-    assert ae_experiment.train_loader.batch_size == 130
-    assert dyn_experiment.cfg.batch_size == 126
-    assert dyn_experiment.train_loader.batch_size == 126
+    assert ae_experiment.cfg.batch_size == 32
+    assert ae_experiment.train_loader.batch_size == 32
+    assert dyn_experiment.cfg.batch_size == 32
+    assert dyn_experiment.train_loader.batch_size == 32
 
 
 def test_checkpoint_round_trip(tmp_path: Path, fake_long_dataset_root: Path) -> None:
@@ -1277,8 +1624,140 @@ def test_checkpoint_round_trip(tmp_path: Path, fake_long_dataset_root: Path) -> 
     assert checkpoint["step"] == 3
     assert checkpoint["mode"] == "ae_only"
     assert checkpoint["clip_metadata"]["frame_start"] is None
+    assert set(checkpoint["rng_state"]) >= {"python", "numpy", "torch"}
     assert checkpoint_ae_backend(checkpoint) == "wan"
     assert checkpoint_dynamics_backend(checkpoint) == "rf_dit"
+
+
+def test_experiment_resume_restores_rng_state(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Resumes should restore saved RNG state instead of resetting to the CLI seed."""
+
+    checkpoint_path = tmp_path / "resume_rng.pt"
+    config = ExperimentConfig(
+        mode="ae_only",
+        data_root=str(fake_long_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="resume_rng_source",
+        ae_backend="wan",
+        device="cpu",
+    )
+    source_experiment = Experiment(config)
+
+    random.seed(11)
+    np.random.seed(11)
+    torch.manual_seed(11)
+    save_training_checkpoint(
+        path=checkpoint_path,
+        model=source_experiment.model,
+        optimizer=source_experiment.optimizer,
+        scheduler=None,
+        step=3,
+        config=config.to_dict(),
+        mode=config.mode,
+        clip_metadata=config.clip_metadata(),
+        best_metric=0.5,
+    )
+    expected_python = random.random()
+    expected_numpy = float(np.random.rand())
+    expected_torch = float(torch.rand(1).item())
+
+    random.seed(999)
+    np.random.seed(999)
+    torch.manual_seed(999)
+    Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="resume_rng_target",
+            device="cpu",
+            resume=str(checkpoint_path),
+        )
+    )
+
+    assert random.random() == pytest.approx(expected_python)
+    assert float(np.random.rand()) == pytest.approx(expected_numpy)
+    assert float(torch.rand(1).item()) == pytest.approx(expected_torch)
+
+
+def test_validate_records_non_best_checkpoint_metadata(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validation artifacts should mark non-improving steps without overwriting best-path metadata."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="non_best_validation_metadata",
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            device="cpu",
+        )
+    )
+
+    def fake_validate_dynamics_one_step(
+        frames: torch.Tensor,
+        actions: torch.Tensor | None = None,
+        num_conditional_frames: int = 1,
+    ) -> tuple[torch.Tensor, dict[str, float | int | str]]:
+        """Return stable teacher-forced validation outputs for metadata checks."""
+
+        del actions, num_conditional_frames
+        return frames.clone(), {
+            "input_frame_count": int(frames.shape[0]),
+            "decoded_frame_count": int(frames.shape[0]),
+            "predicted_frame_count": int(frames.shape[0]),
+            "seed_frames": 1,
+            "loss_frames": int(frames.shape[0]) - 1,
+            "next_frame_mse": 0.02,
+            "next_latent_mse": 0.03,
+            "validation_style": "teacher_forced_1_context_3_target",
+        }
+
+    def fake_validate_dynamics_open_rollout(
+        frames: torch.Tensor,
+        actions: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float | int | str | None]]:
+        """Return stable open-rollout validation outputs for metadata checks."""
+
+        del actions
+        return frames.clone(), {
+            "open_rollout_seed_frames": 1,
+            "open_rollout_loss_frames": int(frames.shape[0]) - 1,
+            "open_rollout_stride_frames": None,
+            "open_rollout_initial_stride_frames": 3,
+            "open_rollout_decoded_frame_count": int(frames.shape[0]),
+            "open_rollout_predicted_frame_count": int(frames.shape[0]),
+            "open_rollout_frame_mse": 0.02,
+            "open_rollout_frame_l1": 0.04,
+            "open_rollout_validation_style": "open_rollout_autoregressive",
+        }
+
+    monkeypatch.setattr(experiment, "_validate_dynamics_one_step", fake_validate_dynamics_one_step)
+    monkeypatch.setattr(experiment, "_validate_dynamics_open_rollout", fake_validate_dynamics_open_rollout)
+
+    experiment.best_metric = 0.01
+    experiment._save_checkpoint(experiment.checkpoints_dir / "best.pt", step=0)
+
+    stats = experiment._validate(step=1)
+    saved_stats = json.loads(
+        (experiment.run_dir / "samples" / "step_000001" / "episode_0_stats.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert stats["is_best_checkpoint"] is False
+    assert stats["checkpoint"] == str(experiment.checkpoints_dir / "last.pt")
+    assert stats["best_checkpoint"] == str(experiment.checkpoints_dir / "best.pt")
+    assert saved_stats["is_best_checkpoint"] is False
+    assert (experiment.checkpoints_dir / "best.pt").exists()
 
 
 def test_checkpoint_backend_falls_back_to_autoencoder_metadata() -> None:
@@ -1364,12 +1843,73 @@ def test_experiment_can_partial_load_dynamics(
     assert torch.allclose(encoder_weight, torch.full_like(encoder_weight, 0.25))
 
 
-def test_experiment_accepts_compatible_dynamics_checkpoint_without_action_conditioning_metadata(
+def test_experiment_can_warm_start_deeper_dynamics_with_tail_blocks(
     fake_long_dataset_root: Path,
     saved_world_model_ae_checkpoint: Path,
     tmp_path: Path,
 ) -> None:
-    """Missing action-conditioning metadata should not block compatible RF-DiT warm starts."""
+    """Loading dynamics into a deeper same-width model should seed tail blocks from the checkpoint tail."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="load_deeper_dynamics",
+            **DEBUG_FRAME_KWARGS,
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            load_dynamics=str(saved_world_model_ae_checkpoint),
+            dynamics_num_blocks=6,
+            device="cpu",
+        )
+    )
+
+    loaded_block_weight = experiment.model.dynamics.net.blocks[0].self_attn.q_proj.weight
+    source_tail_weight = experiment.model.dynamics.net.blocks[3].self_attn.q_proj.weight
+    tail_block_weight = experiment.model.dynamics.net.blocks[5].self_attn.q_proj.weight
+
+    assert torch.allclose(loaded_block_weight, torch.full_like(loaded_block_weight, 0.75))
+    assert torch.allclose(source_tail_weight, torch.full_like(source_tail_weight, 0.75))
+    assert torch.allclose(tail_block_weight, source_tail_weight)
+
+
+def test_experiment_can_resume_deeper_dynamics_with_tail_blocks(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Resuming into a deeper same-width model should also seed tail blocks from the checkpoint tail."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="resume_deeper_dynamics",
+            **DEBUG_FRAME_KWARGS,
+            resume=str(saved_world_model_ae_checkpoint),
+            dynamics_num_blocks=6,
+            lr=1e-6,
+            device="cpu",
+        )
+    )
+
+    assert experiment.current_step == 5
+    loaded_block_weight = experiment.model.dynamics.net.blocks[0].self_attn.q_proj.weight
+    source_tail_weight = experiment.model.dynamics.net.blocks[3].self_attn.q_proj.weight
+    tail_block_weight = experiment.model.dynamics.net.blocks[5].self_attn.q_proj.weight
+
+    assert torch.allclose(loaded_block_weight, torch.full_like(loaded_block_weight, 0.75))
+    assert torch.allclose(source_tail_weight, torch.full_like(source_tail_weight, 0.75))
+    assert torch.allclose(tail_block_weight, source_tail_weight)
+
+
+def test_experiment_rejects_missing_action_conditioning_metadata(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Missing action-conditioning metadata should fail fast for the new backbone."""
 
     compatible_path = tmp_path / "legacy_action_metadata_checkpoint.pt"
     checkpoint = load_training_checkpoint(saved_world_model_ae_checkpoint, device="cpu")
@@ -1377,47 +1917,42 @@ def test_experiment_accepts_compatible_dynamics_checkpoint_without_action_condit
     checkpoint["dynamics"]["config"]["conditioning_frame_choices"] = None
     torch.save(checkpoint, compatible_path)
 
-    experiment = Experiment(
-        ExperimentConfig(
-            mode="dynamics_only",
-            data_root=str(fake_long_dataset_root),
-            output_dir=str(tmp_path / "outputs"),
-            run_name="legacy_action_metadata",
-            **DEBUG_FRAME_KWARGS,
-            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
-            load_dynamics=str(compatible_path),
-            device="cpu",
+    with pytest.raises(ValueError, match="action_conditioning_mode=None"):
+        Experiment(
+            ExperimentConfig(
+                mode="dynamics_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="legacy_action_metadata",
+                **DEBUG_FRAME_KWARGS,
+                load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+                load_dynamics=str(compatible_path),
+                device="cpu",
+            )
         )
-    )
-
-    dynamics_weight = next(experiment.model.dynamics.parameters())
-    assert torch.allclose(dynamics_weight, torch.full_like(dynamics_weight, 0.75))
 
 
-def test_experiment_accepts_older_dynamics_checkpoint_with_new_temporal_embedding_enabled(
+def test_experiment_rejects_unsupported_learned_temporal_embedding_flag(
     fake_long_dataset_root: Path,
     saved_world_model_ae_checkpoint: Path,
     tmp_path: Path,
 ) -> None:
-    """Older RF-DiT checkpoints should warm start when the learned temporal embedding is newly enabled."""
+    """The experiment should fail fast on the removed learned temporal embedding flag."""
 
-    experiment = Experiment(
-        ExperimentConfig(
-            mode="dynamics_only",
-            data_root=str(fake_long_dataset_root),
-            output_dir=str(tmp_path / "outputs"),
-            run_name="temporal_embedding_warm_start",
-            **DEBUG_FRAME_KWARGS,
-            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
-            load_dynamics=str(saved_world_model_ae_checkpoint),
-            dynamics_use_learned_temporal_embedding=True,
-            device="cpu",
+    with pytest.raises(ValueError, match="dynamics_use_learned_temporal_embedding"):
+        Experiment(
+            ExperimentConfig(
+                mode="dynamics_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="temporal_embedding_removed",
+                **DEBUG_FRAME_KWARGS,
+                load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+                load_dynamics=str(saved_world_model_ae_checkpoint),
+                dynamics_use_learned_temporal_embedding=True,
+                device="cpu",
+            )
         )
-    )
-
-    assert experiment.model.dynamics.cfg.use_learned_temporal_embedding is True
-    assert experiment.model.dynamics.net.temporal_pos_embed is not None
-    assert torch.count_nonzero(experiment.model.dynamics.net.temporal_pos_embed) == 0
 
 
 def test_experiment_rejects_explicitly_mismatched_action_conditioning_mode(
@@ -1447,58 +1982,52 @@ def test_experiment_rejects_explicitly_mismatched_action_conditioning_mode(
         )
 
 
-def test_experiment_accepts_global_chunk_action_checkpoint_when_requested(
+def test_experiment_rejects_missing_dynamics_architecture_version(
     fake_long_dataset_root: Path,
     saved_world_model_ae_checkpoint: Path,
     tmp_path: Path,
 ) -> None:
-    """DreamDojo-style global-chunk checkpoints should load when the run requests them."""
+    """Old checkpoints missing the DreamDojo architecture tag should fail clearly."""
 
-    compatible_path = tmp_path / "global_chunk_action_checkpoint.pt"
+    compatible_path = tmp_path / "missing_architecture_version_checkpoint.pt"
     checkpoint = load_training_checkpoint(saved_world_model_ae_checkpoint, device="cpu")
-    checkpoint["dynamics"]["config"]["action_conditioning_mode"] = "global_chunk"
-    checkpoint["model_state"]["dynamics.net.action_embedder_B_D.fc1.weight"] = torch.zeros(1024, 16)
-    checkpoint["model_state"]["dynamics.net.action_embedder_B_3D.fc1.weight"] = torch.zeros(3072, 16)
+    checkpoint["dynamics"]["config"].pop("architecture_version", None)
     torch.save(checkpoint, compatible_path)
 
-    experiment = Experiment(
-        ExperimentConfig(
-            mode="dynamics_only",
-            data_root=str(fake_long_dataset_root),
-            output_dir=str(tmp_path / "outputs"),
-            run_name="global_chunk_action_dynamics",
-            **DEBUG_FRAME_KWARGS,
-            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
-            load_dynamics=str(compatible_path),
-            dynamics_action_conditioning_mode="global_chunk",
-            device="cpu",
-        )
-    )
-
-    assert experiment.model.dynamics.cfg.action_conditioning_mode == "global_chunk"
-
-
-def test_experiment_rejects_legacy_global_chunk_action_checkpoint_without_metadata(
-    fake_long_dataset_root: Path,
-    saved_world_model_ae_checkpoint: Path,
-    tmp_path: Path,
-) -> None:
-    """Old flattened-action checkpoints should fail clearly even when metadata is missing."""
-
-    incompatible_path = tmp_path / "legacy_global_chunk_action_checkpoint.pt"
-    checkpoint = load_training_checkpoint(saved_world_model_ae_checkpoint, device="cpu")
-    checkpoint["dynamics"]["config"]["action_conditioning_mode"] = None
-    checkpoint["model_state"]["dynamics.net.action_embedder_B_D.fc1.weight"] = torch.zeros(1024, 16)
-    checkpoint["model_state"]["dynamics.net.action_embedder_B_3D.fc1.weight"] = torch.zeros(3072, 16)
-    torch.save(checkpoint, incompatible_path)
-
-    with pytest.raises(ValueError, match="action_conditioning_mode=global_chunk"):
+    with pytest.raises(ValueError, match="architecture_version"):
         Experiment(
             ExperimentConfig(
                 mode="dynamics_only",
                 data_root=str(fake_long_dataset_root),
                 output_dir=str(tmp_path / "outputs"),
-                run_name="legacy_global_chunk_action_dynamics",
+                run_name="missing_architecture_version",
+                **DEBUG_FRAME_KWARGS,
+                load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+                load_dynamics=str(compatible_path),
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_rejects_incompatible_dynamics_architecture_version(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Checkpoints from older DiT backbones should fail with a clear architecture error."""
+
+    incompatible_path = tmp_path / "old_architecture_checkpoint.pt"
+    checkpoint = load_training_checkpoint(saved_world_model_ae_checkpoint, device="cpu")
+    checkpoint["dynamics"]["config"]["architecture_version"] = "dreamdojo_torch_small_v0"
+    torch.save(checkpoint, incompatible_path)
+
+    with pytest.raises(ValueError, match="architecture_version"):
+        Experiment(
+            ExperimentConfig(
+                mode="dynamics_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="old_architecture_version",
                 **DEBUG_FRAME_KWARGS,
                 load_encoder_decoder=str(saved_world_model_ae_checkpoint),
                 load_dynamics=str(incompatible_path),

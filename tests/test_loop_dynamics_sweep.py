@@ -30,7 +30,12 @@ def test_extract_selection_metric_uses_worst_case_next_frame_mse() -> None:
     """The default sweep ranking should penalize the weaker teacher-forced horizon."""
 
     score = loop_dynamics_sweep._extract_selection_metric(
-        {"next_frame_mse": 0.001, "next_frame_mse_4to1": 0.004},
+        {
+            "next_frame_mse": 0.001,
+            "next_frame_mse_1to1": 0.002,
+            "next_frame_mse_1to2": 0.003,
+            "next_frame_mse_1to3": 0.004,
+        },
         loop_dynamics_sweep.DEFAULT_SELECTION_METRIC,
     )
     assert score == 0.004
@@ -44,6 +49,16 @@ def test_extract_selection_metric_can_use_open_rollout_frame_mse() -> None:
         "open_rollout_frame_mse",
     )
     assert score == 0.02
+
+
+def test_extract_selection_metric_can_use_open_rollout_consistency_score() -> None:
+    """Sweep ranking should optionally optimize the motion-aware rollout score."""
+
+    score = loop_dynamics_sweep._extract_selection_metric(
+        {"open_rollout_consistency_score": 0.013},
+        loop_dynamics_sweep.OPEN_ROLLOUT_CONSISTENCY_SELECTION_METRIC,
+    )
+    assert score == 0.013
 
 
 def test_extract_selection_metric_can_use_eval_open_rollout_frame_mse() -> None:
@@ -87,7 +102,7 @@ def test_maybe_update_best_run_replaces_only_with_better_success() -> None:
             "best_checkpoint": "/tmp/run_a/checkpoints/best.pt",
             "run_dir": "/tmp/run_a",
             "next_frame_mse": 0.005,
-            "next_frame_mse_4to1": 0.004,
+            "next_frame_mse_1to3": 0.004,
         },
         selection_metric=loop_dynamics_sweep.DEFAULT_SELECTION_METRIC,
     )
@@ -103,7 +118,7 @@ def test_maybe_update_best_run_replaces_only_with_better_success() -> None:
             "best_checkpoint": "/tmp/run_b/checkpoints/best.pt",
             "run_dir": "/tmp/run_b",
             "next_frame_mse": 0.006,
-            "next_frame_mse_4to1": 0.003,
+            "next_frame_mse_1to3": 0.003,
         },
         selection_metric=loop_dynamics_sweep.DEFAULT_SELECTION_METRIC,
     )
@@ -117,7 +132,7 @@ def test_maybe_update_best_run_replaces_only_with_better_success() -> None:
             "best_checkpoint": "/tmp/run_c/checkpoints/best.pt",
             "run_dir": "/tmp/run_c",
             "next_frame_mse": 0.002,
-            "next_frame_mse_4to1": 0.0025,
+            "next_frame_mse_1to3": 0.0025,
         },
         selection_metric=loop_dynamics_sweep.DEFAULT_SELECTION_METRIC,
     )
@@ -344,6 +359,28 @@ def test_build_command_preserves_learned_temporal_embedding_flag() -> None:
     assert "--dynamics-use-learned-temporal-embedding" in command
 
 
+def test_build_command_can_disable_adaln_lora_explicitly() -> None:
+    """The sweep helper should forward an explicit AdaLN-LoRA disable flag when requested."""
+
+    with patch.object(sys, "argv", ["loop_dynamics_sweep.py"]):
+        args = loop_dynamics_sweep.parse_args()
+    args.dynamics_use_adaln_lora = False
+    command = loop_dynamics_sweep.build_command(
+        args=args,
+        spec=loop_dynamics_sweep.SweepSpec(
+            frame_start=48,
+            frame_end=67,
+            infer_steps=32,
+            batch_size=1,
+            max_steps=10,
+            lr=1e-4,
+        ),
+        run_name="smoke",
+        load_dynamics=None,
+    )
+    assert "--no-dynamics-use-adaln-lora" in command
+
+
 def test_build_command_preserves_self_forcing_warmup_steps() -> None:
     """The sweep helper should forward self-forcing warmup steps explicitly."""
 
@@ -565,6 +602,7 @@ def test_evaluate_open_rollout_aggregates_multiple_spans() -> None:
                         "device": "cpu",
                         "validation_style": "open_rollout_autoregressive",
                         "open_rollout_frame_mse": 0.02,
+                        "open_rollout_consistency_score": 0.03,
                     }
                 ),
                 stderr="",
@@ -578,6 +616,7 @@ def test_evaluate_open_rollout_aggregates_multiple_spans() -> None:
                         "device": "cpu",
                         "validation_style": "open_rollout_autoregressive",
                         "open_rollout_frame_mse": 0.01,
+                        "open_rollout_consistency_score": 0.02,
                     }
                 ),
                 stderr="",
@@ -592,8 +631,13 @@ def test_evaluate_open_rollout_aggregates_multiple_spans() -> None:
     assert evaluation["eval_open_rollout_frame_mse"] == 0.015
     assert evaluation["eval_open_rollout_frame_mse_mean"] == 0.015
     assert evaluation["eval_open_rollout_frame_mse_max"] == 0.02
+    assert evaluation["eval_open_rollout_consistency_score"] == 0.025
+    assert evaluation["eval_open_rollout_consistency_score_mean"] == 0.025
+    assert evaluation["eval_open_rollout_consistency_score_max"] == 0.03
     assert evaluation["eval_open_rollout_f0_19_open_rollout_frame_mse"] == 0.02
+    assert evaluation["eval_open_rollout_f0_19_open_rollout_consistency_score"] == 0.03
     assert evaluation["eval_open_rollout_f48_67_open_rollout_frame_mse"] == 0.01
+    assert evaluation["eval_open_rollout_f48_67_open_rollout_consistency_score"] == 0.02
 
 
 def test_build_sweep_specs_clamps_metaworld_frame_end_to_episode_length() -> None:

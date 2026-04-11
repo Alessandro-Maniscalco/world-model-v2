@@ -168,15 +168,19 @@ class FrameDataset(Dataset[dict[str, Any]]):
         height: int | None = None,
         width: int | None = None,
         all_episodes: bool = False,
+        exclude_episodes: tuple[int, ...] = (),
     ) -> None:
         """Cache one clip or all split clips for reconstruction training."""
 
         self.all_episodes = all_episodes
+        excluded_episodes = set(int(episode_index) for episode_index in exclude_episodes)
         if all_episodes:
             self.clips = []
             self.cumulative_lengths: list[int] = []
             running_total = 0
             for episode_idx in list_episode_indices(data_root=data_root, task=task, split=split):
+                if episode_idx in excluded_episodes:
+                    continue
                 try:
                     clip = load_clip(
                         data_root=data_root,
@@ -261,9 +265,13 @@ class TransitionDataset(Dataset[dict[str, Any]]):
         frame_layout: DynamicsFrameLayout = DYNAMICS_FRAME_LAYOUT,
         rollout_context_frames: int | None = None,
         rollout_chunks: int = 0,
+        all_episodes: bool = False,
+        exclude_episodes: tuple[int, ...] = (),
     ) -> None:
-        """Cache the requested clip for the configured dynamics training windows."""
+        """Cache one clip or flatten all split clips for dynamics training windows."""
 
+        self.all_episodes = all_episodes
+        excluded_episodes = set(int(episode_index) for episode_index in exclude_episodes)
         self.frame_layout = frame_layout
         self.rollout_context_frames = (
             frame_layout.context_frames
@@ -277,23 +285,84 @@ class TransitionDataset(Dataset[dict[str, Any]]):
         self.rollout_chunks = int(rollout_chunks)
         self.rollout_target_frames = self.frame_layout.max_frames - self.rollout_context_frames
         self.required_frames = self.frame_layout.max_frames + self.rollout_chunks * self.rollout_target_frames
-        self.clip = load_clip(
-            data_root=data_root,
-            task=task,
-            split=split,
-            episode=episode,
-            camera=camera,
-            frame_start=frame_start,
-            frame_end=frame_end,
-            resolution=resolution,
-            height=height,
-            width=width,
-            load_actions=True,
-        )
+        if all_episodes:
+            self.clips = []
+            self.cumulative_lengths: list[int] = []
+            running_total = 0
+            for episode_idx in list_episode_indices(data_root=data_root, task=task, split=split):
+                if episode_idx in excluded_episodes:
+                    continue
+                try:
+                    clip = load_clip(
+                        data_root=data_root,
+                        task=task,
+                        split=split,
+                        episode=episode_idx,
+                        camera=camera,
+                        frame_start=frame_start,
+                        frame_end=frame_end,
+                        resolution=resolution,
+                        height=height,
+                        width=width,
+                        load_actions=True,
+                        clamp_frame_end=True,
+                    )
+                except ValueError:
+                    continue
+                available_windows = max(
+                    int(clip["frames"].shape[0]) - self.required_frames + 1,
+                    0,
+                )
+                if available_windows < 1:
+                    continue
+                self.clips.append(clip)
+                running_total += available_windows
+                self.cumulative_lengths.append(running_total)
+            if not self.clips:
+                raise ValueError(
+                    "No episodes in the requested split contain any valid dynamics windows "
+                    "for the requested range."
+                )
+        else:
+            self.clip = load_clip(
+                data_root=data_root,
+                task=task,
+                split=split,
+                episode=episode,
+                camera=camera,
+                frame_start=frame_start,
+                frame_end=frame_end,
+                resolution=resolution,
+                height=height,
+                width=width,
+                load_actions=True,
+            )
+
+    def _sample_from_clip(self, clip: dict[str, Any], index: int) -> dict[str, Any]:
+        """Return one configured `(context, target)` training sample from one cached clip."""
+
+        context_stop = index + self.frame_layout.context_frames
+        target_stop = context_stop + self.frame_layout.target_frames
+        future_target_stop = target_stop + self.rollout_chunks * self.rollout_target_frames
+        action_stop = index + self.frame_layout.num_action_per_chunk
+        future_action_stop = action_stop + self.rollout_chunks * self.rollout_target_frames
+        return {
+            "context_frames": clip["frames"][index:context_stop],
+            "target_frames": clip["frames"][context_stop:target_stop],
+            "future_target_frames": clip["frames"][target_stop:future_target_stop],
+            "actions": clip["actions"][index:action_stop],
+            "future_actions": clip["actions"][action_stop:future_action_stop],
+            "context_frame_idx": clip["frame_idx"][index:context_stop],
+            "target_frame_idx": clip["frame_idx"][context_stop:target_stop],
+            "future_target_frame_idx": clip["frame_idx"][target_stop:future_target_stop],
+            "episode_idx": clip["episode_idx"],
+        }
 
     def __len__(self) -> int:
         """Return the number of available dynamics windows for the configured layout."""
 
+        if self.all_episodes:
+            return self.cumulative_lengths[-1]
         return max(
             int(self.clip["frames"].shape[0]) - self.required_frames + 1,
             0,
@@ -302,22 +371,14 @@ class TransitionDataset(Dataset[dict[str, Any]]):
     def __getitem__(self, index: int) -> dict[str, Any]:
         """Return one configured `(context, target)` training sample."""
 
-        context_stop = index + self.frame_layout.context_frames
-        target_stop = context_stop + self.frame_layout.target_frames
-        future_target_stop = target_stop + self.rollout_chunks * self.rollout_target_frames
-        action_stop = index + self.frame_layout.num_action_per_chunk
-        future_action_stop = action_stop + self.rollout_chunks * self.rollout_target_frames
-        return {
-            "context_frames": self.clip["frames"][index:context_stop],
-            "target_frames": self.clip["frames"][context_stop:target_stop],
-            "future_target_frames": self.clip["frames"][target_stop:future_target_stop],
-            "actions": self.clip["actions"][index:action_stop],
-            "future_actions": self.clip["actions"][action_stop:future_action_stop],
-            "context_frame_idx": self.clip["frame_idx"][index:context_stop],
-            "target_frame_idx": self.clip["frame_idx"][context_stop:target_stop],
-            "future_target_frame_idx": self.clip["frame_idx"][target_stop:future_target_stop],
-            "episode_idx": self.clip["episode_idx"],
-        }
+        if self.all_episodes:
+            if index < 0 or index >= len(self):
+                raise IndexError("TransitionDataset index out of range.")
+            clip_index = bisect_right(self.cumulative_lengths, index)
+            clip_start = 0 if clip_index == 0 else self.cumulative_lengths[clip_index - 1]
+            window_index = index - clip_start
+            return self._sample_from_clip(self.clips[clip_index], window_index)
+        return self._sample_from_clip(self.clip, index)
 
 
 class ValidationClipDataset(Dataset[dict[str, Any]]):

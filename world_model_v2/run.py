@@ -8,6 +8,7 @@ import sys
 
 import torch
 
+from world_model_v2.dynamics_transformer import DYNAMICS_FRAME_LAYOUT
 from world_model_v2.experiment import Experiment, ExperimentConfig
 
 
@@ -40,7 +41,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mode", choices=["ae_only", "dynamics_only"], default="ae_only")
     parser.add_argument(
         "--dataset-format",
-        choices=["interactive_world_sim", "lerobot_metaworld"],
+        choices=[
+            "interactive_world_sim",
+            "lerobot_metaworld",
+            "lerobot_aloha_sim_transfer_cube_scripted",
+            "lerobot_so101_base_sim_pickplace",
+            "maniskill_replay",
+        ],
         default="interactive_world_sim",
     )
     parser.add_argument("--data-root", default="data/full")
@@ -48,11 +55,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--metaworld-task-index", type=int, default=None)
     parser.add_argument("--metaworld-repo-id", default="lerobot/metaworld_mt50")
     parser.add_argument("--metaworld-cache-dir", default="")
+    parser.add_argument(
+        "--aloha-repo-id",
+        default="lerobot/aloha_sim_transfer_cube_scripted",
+    )
+    parser.add_argument("--aloha-cache-dir", default="")
+    parser.add_argument("--maniskill-traj-h5", default="trajectory.rgb.pd_joint_pos.physx_cpu.h5")
+    parser.add_argument("--maniskill-traj-json", default="trajectory.rgb.pd_joint_pos.physx_cpu.json")
+    parser.add_argument("--maniskill-camera", default="base_camera")
     parser.add_argument("--split", default="val")
     parser.add_argument("--episode", type=int, default=0)
     parser.add_argument("--train-all-episodes", action="store_true")
     parser.add_argument("--validation-split", default="")
     parser.add_argument("--validation-episode", type=int, default=0)
+    parser.add_argument("--validation-episodes", default=None)
     parser.add_argument("--camera", default="camera_1_color")
     parser.add_argument("--frame-start", type=int, default=None)
     parser.add_argument("--frame-end", type=int, default=None)
@@ -80,8 +96,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dynamics-rollout-self-forcing-warmup-steps", type=int, default=0)
     parser.add_argument("--dynamics-rollout-self-forcing-ramp-steps", type=int, default=0)
     parser.add_argument("--dynamics-self-forcing-rollout-chunks", type=int, default=0)
-    parser.add_argument("--dynamics-context-frames", type=int, default=4)
-    parser.add_argument("--dynamics-target-frames", type=int, default=1)
+    parser.add_argument(
+        "--dynamics-context-frames",
+        type=int,
+        default=DYNAMICS_FRAME_LAYOUT.context_frames,
+    )
+    parser.add_argument(
+        "--dynamics-target-frames",
+        type=int,
+        default=DYNAMICS_FRAME_LAYOUT.target_frames,
+    )
     parser.add_argument("--dynamics-conditioning-frame-choices", default=None)
     parser.add_argument("--dynamics-conditioning-frame-probabilities", default=None)
     parser.add_argument("--dynamics-validation-conditioning-frame-choices", default=None)
@@ -92,17 +116,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dynamics-num-heads", type=int, default=4)
     parser.add_argument(
         "--dynamics-action-conditioning-mode",
-        choices=["chunk_per_frame", "global_chunk"],
+        choices=["chunk_per_frame"],
         default="chunk_per_frame",
     )
     parser.add_argument("--dynamics-zero-init-action-embedder", action="store_true")
-    parser.add_argument("--dynamics-use-adaln-lora", action="store_true")
+    parser.add_argument(
+        "--dynamics-use-adaln-lora",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--dynamics-adaln-lora-dim", type=int, default=64)
     parser.add_argument("--dynamics-rope-t-extrapolation-ratio", type=float, default=1.0)
-    parser.add_argument("--dynamics-use-learned-temporal-embedding", action="store_true")
+    parser.add_argument(
+        "--dynamics-use-learned-temporal-embedding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument(
         "--dynamics-validation-metric",
-        choices=["next_frame_mse", "open_rollout_frame_mse"],
+        choices=[
+            "next_frame_mse",
+            "open_rollout_frame_mse",
+            "open_rollout_consistency_score",
+        ],
         default="next_frame_mse",
     )
     parser.add_argument("--kl-beta", type=float, default=1e-4)
@@ -141,11 +177,17 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         metaworld_task_index=args.metaworld_task_index,
         metaworld_repo_id=args.metaworld_repo_id,
         metaworld_cache_dir=args.metaworld_cache_dir,
+        aloha_repo_id=args.aloha_repo_id,
+        aloha_cache_dir=args.aloha_cache_dir,
+        maniskill_traj_h5=args.maniskill_traj_h5,
+        maniskill_traj_json=args.maniskill_traj_json,
+        maniskill_camera=args.maniskill_camera,
         split=args.split,
         episode=args.episode,
         train_all_episodes=args.train_all_episodes,
         validation_split=args.validation_split,
         validation_episode=args.validation_episode,
+        validation_episodes=parse_int_csv(args.validation_episodes),
         camera=args.camera,
         frame_start=args.frame_start,
         frame_end=args.frame_end,

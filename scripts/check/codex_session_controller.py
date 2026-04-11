@@ -88,6 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompt", default="")
     parser.add_argument("--prompt-file", default="")
+    parser.add_argument("--goal", default="")
     parser.add_argument(
         "--max-iterations",
         type=int,
@@ -122,11 +123,13 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.max_iterations < 1:
         raise ValueError("`--max-iterations` must be at least 1.")
+    if not str(args.goal).strip():
+        raise ValueError("Provide a goal with `--goal`.")
     return args
 
 
-def read_goal(args: argparse.Namespace) -> str:
-    """Load the user goal from CLI text or a file path."""
+def read_controller_prompt(args: argparse.Namespace) -> str:
+    """Load the controller instructions from CLI text or a file path."""
 
     if args.prompt and args.prompt_file:
         raise ValueError("Use either `--prompt` or `--prompt-file`, not both.")
@@ -134,7 +137,16 @@ def read_goal(args: argparse.Namespace) -> str:
         return Path(args.prompt_file).read_text(encoding="utf-8").strip()
     if args.prompt:
         return str(args.prompt).strip()
-    raise ValueError("Provide a goal with `--prompt` or `--prompt-file`.")
+    raise ValueError("Provide controller instructions with `--prompt` or `--prompt-file`.")
+
+
+def read_goal(args: argparse.Namespace) -> str:
+    """Load the high-level session goal from CLI text."""
+
+    goal = str(args.goal).strip()
+    if not goal:
+        raise ValueError("Provide a goal with `--goal`.")
+    return goal
 
 
 def timestamp_slug() -> str:
@@ -173,7 +185,7 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def build_controller_prompt(goal: str) -> str:
+def build_controller_prompt(prompt: str, goal: str) -> str:
     """Compose the initial prompt sent to the first Codex turn."""
 
     return (
@@ -194,7 +206,9 @@ def build_controller_prompt(goal: str) -> str:
         "- A failed `training_command` is not automatically fatal. Inspect it on the next Codex turn and only "
         "set `fatal: true` if the run is genuinely unrecoverable.\n"
         "The controller will continue looping until `--max-iterations` is reached unless you set `fatal: true`.\n"
-        "User goal:\n"
+        "Session instructions:\n"
+        f"{prompt}\n"
+        "Remember the goal:\n"
         f"{goal}\n"
     )
 
@@ -285,6 +299,7 @@ def build_resume_prompt(
     repo_changes: list[str],
     max_output_chars: int,
     iteration: int,
+    goal: str,
 ) -> str:
     """Compose the prompt used to resume Codex after one training command completes."""
 
@@ -294,39 +309,52 @@ def build_resume_prompt(
         )
     else:
         repo_change_status = "Controller-observed repo changes from your previous turn: none."
-    if result is None:
-        return (
-            f"Resume turn {iteration}.\n"
-            "No external training command was run after the previous turn.\n"
-            f"{repo_change_status}\n"
-            "Continue inspecting or editing the repo and reply with JSON only.\n"
+    training_command_summary = ""
+    exit_code: int | None = None
+    duration_seconds: float | None = None
+    stdout_path = ""
+    stderr_path = ""
+    stdout_text = "[empty]"
+    stderr_text = "[empty]"
+    status_line = "No external training command was run after the previous turn."
+    failure_guidance = ""
+    if result is not None:
+        training_command_summary = summarize_training_command(result.training_command)
+        exit_code = result.exit_code
+        duration_seconds = result.duration_seconds
+        stdout_path = result.stdout_path
+        stderr_path = result.stderr_path
+        stdout_text = summarize_output_for_prompt(result.stdout, max_chars=max_output_chars, max_lines=12)
+        stderr_text = summarize_output_for_prompt(
+            result.stderr,
+            max_chars=max(800, max_output_chars // 3),
+            max_lines=8,
         )
-    stdout_text = summarize_output_for_prompt(result.stdout, max_chars=max_output_chars, max_lines=12)
-    stderr_text = summarize_output_for_prompt(result.stderr, max_chars=max(800, max_output_chars // 3), max_lines=8)
-    if result.exit_code == 0:
-        status_line = "The external training command finished successfully."
-        failure_guidance = ""
-    else:
-        status_line = "The external training command failed."
-        failure_guidance = (
-            "This failure is not automatically fatal. Diagnose it and decide on the next step unless "
-            "recovery is impossible.\n"
-        )
+        if result.exit_code == 0:
+            status_line = "The external training command finished successfully."
+        else:
+            status_line = "The external training command failed."
+            failure_guidance = (
+                "This failure is not automatically fatal. Diagnose it and decide on the next step unless "
+                "recovery is impossible.\n"
+            )
     return (
         f"Resume turn {iteration}.\n"
+        "Remember the goal:\n"
+        f"{goal}\n"
         f"{status_line}\n"
-        f"Training command summary: `{summarize_training_command(result.training_command)}`\n"
-        f"Exit code: {result.exit_code}\n"
-        f"Duration seconds: {result.duration_seconds:.2f}\n"
-        f"Stdout log: {result.stdout_path}\n"
-        f"Stderr log: {result.stderr_path}\n"
+        f'Training command summary: {json.dumps(training_command_summary)}\n'
+        f"Exit code: {json.dumps(exit_code)}\n"
+        f"Duration seconds: {json.dumps(duration_seconds)}\n"
+        f'Stdout log: {json.dumps(stdout_path)}\n'
+        f'Stderr log: {json.dumps(stderr_path)}\n'
         f"{repo_change_status}\n"
         f"{failure_guidance}"
         "Stdout excerpt:\n"
         f"```\n{stdout_text}\n```\n\n"
         "Stderr excerpt:\n"
         f"```\n{stderr_text}\n```\n\n"
-        "Validate the result, inspect or edit the repo again if needed, and reply with JSON only.\n"
+        "Validate the result, inspect or edit the repo again if needed. Changing branch is fine. Reply with JSON only containind new training_command to test.\n"
     )
 
 
@@ -603,13 +631,14 @@ def main() -> None:
     """Run the Codex session controller until completion or iteration exhaustion."""
 
     args = parse_args()
+    controller_prompt = read_controller_prompt(args)
     goal = read_goal(args)
     output_dir = resolve_output_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
     schema_path = output_dir / "response_schema.json"
     write_json(schema_path, RESPONSE_SCHEMA)
 
-    prompt = build_controller_prompt(goal=goal)
+    prompt = build_controller_prompt(prompt=controller_prompt, goal=goal)
     summary_path = output_dir / "summary.jsonl"
     thread_id: str | None = None
     printed_resume_command = False
@@ -698,6 +727,7 @@ def main() -> None:
             repo_changes=repo_changes,
             max_output_chars=args.max_output_chars,
             iteration=iteration + 1,
+            goal=goal,
         )
 
     append_jsonl(

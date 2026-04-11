@@ -13,12 +13,12 @@ import torch.nn.functional as F
 class WanVAEConfig:
     """Configure the Wan-style VAE backend."""
 
-    dim: int = 64
+    dim: int = 96
     z_dim: int = 16
-    dim_mult: tuple[int, ...] = (1, 2, 4, 4)
+    dim_mult: tuple[int, ...] = (1, 2, 4)
     num_res_blocks: int = 1
     attn_scales: tuple[float, ...] = ()
-    temperal_downsample: tuple[bool, ...] = (False, False, False)
+    temperal_downsample: tuple[bool, ...] = (False, False)
     dropout: float = 0.0
 
     def __post_init__(self) -> None:

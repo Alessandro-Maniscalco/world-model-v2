@@ -93,14 +93,14 @@ def test_wan_world_model_autoencode_reports_kl_statistics() -> None:
 
 
 def test_wan_world_model_rollout_includes_seed_frame() -> None:
-    """Autoregressive rollout should return the seed context plus predictions."""
+    """Autoregressive rollout should return the seed context plus the requested steps."""
 
     model = WorldModel(resolution=128)
     seed = torch.rand(1, DYNAMICS_FRAME_LAYOUT.context_frames, 3, 128, 128)
     rollout = model.rollout(seed, steps=2)
     assert rollout.shape == (
         1,
-        DYNAMICS_FRAME_LAYOUT.context_frames + 2 * DYNAMICS_FRAME_LAYOUT.target_frames,
+        DYNAMICS_FRAME_LAYOUT.context_frames + 2,
         3,
         128,
         128,

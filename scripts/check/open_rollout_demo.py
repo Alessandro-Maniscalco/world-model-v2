@@ -15,7 +15,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from world_model_v2.experiment import load_training_checkpoint
+from world_model_v2.experiment import (
+    compute_motion_ratio,
+    load_training_checkpoint,
+    motion_ratio_log_error,
+    open_rollout_consistency_score,
+)
+from world_model_v2.dynamics_transformer import (
+    DREAMDOJO_DYNAMICS_ARCHITECTURE_VERSION,
+    DYNAMICS_FRAME_LAYOUT,
+)
 from world_model_v2.metaworld_dataset import load_metaworld_clip
 from world_model_v2.model import WorldModel
 from world_model_v2.utils.checkpointing import save_json
@@ -59,6 +68,13 @@ def build_model_from_checkpoint(
     dynamics_config = dynamics_bundle.get("config") if isinstance(dynamics_bundle, dict) else {}
     if not isinstance(dynamics_config, dict):
         dynamics_config = {}
+    checkpoint_architecture_version = dynamics_config.get("architecture_version")
+    if checkpoint_architecture_version != DREAMDOJO_DYNAMICS_ARCHITECTURE_VERSION:
+        raise ValueError(
+            "Checkpoint dynamics backbone is not compatible with this DreamDojo-mechanics open-rollout demo. "
+            f"Expected architecture_version={DREAMDOJO_DYNAMICS_ARCHITECTURE_VERSION!r}, received "
+            f"{checkpoint_architecture_version!r}."
+        )
     model = WorldModel(
         latent_channels=int(config.get("latent_channels", 16)),
         hidden_channels=int(config.get("hidden_channels", 64)),
@@ -93,10 +109,16 @@ def build_model_from_checkpoint(
             dynamics_config.get("dynamics_guidance_scale", config.get("dynamics_guidance_scale", 0.0))
         ),
         dynamics_context_frames=int(
-            dynamics_config.get("context_frames", config.get("dynamics_context_frames", 4))
+            dynamics_config.get(
+                "context_frames",
+                config.get("dynamics_context_frames", DYNAMICS_FRAME_LAYOUT.context_frames),
+            )
         ),
         dynamics_target_frames=int(
-            dynamics_config.get("target_frames", config.get("dynamics_target_frames", 1))
+            dynamics_config.get(
+                "target_frames",
+                config.get("dynamics_target_frames", DYNAMICS_FRAME_LAYOUT.target_frames),
+            )
         ),
         dynamics_conditioning_frame_choices=dynamics_config.get(
             "conditioning_frame_choices",
@@ -140,7 +162,7 @@ def build_model_from_checkpoint(
             )
         ),
         dynamics_use_adaln_lora=bool(
-            dynamics_config.get("use_adaln_lora", config.get("dynamics_use_adaln_lora", False))
+            dynamics_config.get("use_adaln_lora", config.get("dynamics_use_adaln_lora", True))
         ),
         dynamics_adaln_lora_dim=int(
             dynamics_config.get("adaln_lora_dim", config.get("dynamics_adaln_lora_dim", 64))
@@ -171,6 +193,60 @@ def resolve_output_dir(args: argparse.Namespace) -> Path:
     return Path(args.output_dir) / (
         f"ep{args.episode}_task{args.metaworld_task_index}_f{args.frame_start}_{args.frame_end}"
     )
+
+
+def build_rollout_stats(
+    *,
+    checkpoint_path: str | Path,
+    device: torch.device,
+    infer_steps: int,
+    input_frame_count: int,
+    decoded_frame_count: int,
+    seed_frames: int,
+    stride_frames: int | None,
+    initial_stride_frames: int,
+    frame_mse: float,
+    frame_l1: float,
+    motion_ratio: float | None,
+    predicted_motion_l1: float,
+    ground_truth_motion_l1: float,
+) -> dict[str, Any]:
+    """Return rollout metrics with the same boundary fields used by validation."""
+
+    predicted_frame_count = int(decoded_frame_count)
+    loss_frames = int(input_frame_count) - int(seed_frames)
+    stats: dict[str, Any] = {
+        "checkpoint": str(Path(checkpoint_path).resolve()),
+        "device": str(device),
+        "input_frame_count": int(input_frame_count),
+        "decoded_frame_count": int(decoded_frame_count),
+        "predicted_frame_count": predicted_frame_count,
+        "exported_video_frame_count": predicted_frame_count,
+        "seed_frames": int(seed_frames),
+        "loss_frames": int(loss_frames),
+        "open_rollout_context_frames": int(seed_frames),
+        "open_rollout_seed_frames": int(seed_frames),
+        "open_rollout_loss_frames": int(loss_frames),
+        "open_rollout_decoded_frame_count": predicted_frame_count,
+        "open_rollout_predicted_frame_count": predicted_frame_count,
+        "open_rollout_stride_frames": stride_frames,
+        "open_rollout_initial_stride_frames": int(initial_stride_frames),
+        "open_rollout_frame_mse": float(frame_mse),
+        "open_rollout_frame_l1": float(frame_l1),
+        "open_rollout_consistency_score": open_rollout_consistency_score(
+            frame_mse,
+            motion_ratio,
+        ),
+        "dynamics_infer_steps": int(infer_steps),
+        "validation_style": "open_rollout_autoregressive",
+        "open_rollout_validation_style": "open_rollout_autoregressive",
+    }
+    if motion_ratio is not None:
+        stats["open_rollout_predicted_target_motion_l1"] = float(predicted_motion_l1)
+        stats["open_rollout_ground_truth_target_motion_l1"] = float(ground_truth_motion_l1)
+        stats["open_rollout_target_motion_ratio"] = float(motion_ratio)
+        stats["open_rollout_motion_log_error"] = motion_ratio_log_error(motion_ratio)
+    return stats
 
 
 def main() -> None:
@@ -216,24 +292,43 @@ def main() -> None:
     predicted = rollout[0].detach().cpu()
     predicted_only = predicted[seed_context_frames:]
     target_only = original[seed_context_frames:]
-    stats = {
-        "checkpoint": str(Path(args.checkpoint).resolve()),
-        "device": str(device),
-        "input_frame_count": int(original.shape[0]),
-        "decoded_frame_count": int(predicted.shape[0]),
-        "predicted_frame_count": int(predicted.shape[0]),
-        "seed_frames": int(seed_context_frames),
-        "loss_frames": int(rollout_steps),
-        "open_rollout_stride_frames": (
+    frame_mse = float(F.mse_loss(predicted_only, target_only).item())
+    frame_l1 = float(F.l1_loss(predicted_only, target_only).item())
+    motion_ratio: float | None = None
+    predicted_motion_l1 = 0.0
+    ground_truth_motion_l1 = 0.0
+    if predicted_only.shape[0] > 1:
+        predicted_motion_l1 = float(
+            torch.abs(predicted_only[1:] - predicted_only[:-1]).mean().item()
+        )
+        ground_truth_motion_l1 = float(
+            torch.abs(target_only[1:] - target_only[:-1]).mean().item()
+        )
+        motion_ratio = compute_motion_ratio(predicted_motion_l1, ground_truth_motion_l1)
+    stats = build_rollout_stats(
+        checkpoint_path=args.checkpoint,
+        device=device,
+        infer_steps=int(model.dynamics.cfg.dynamics_infer_steps),
+        input_frame_count=int(original.shape[0]),
+        decoded_frame_count=int(predicted.shape[0]),
+        seed_frames=int(seed_context_frames),
+        stride_frames=(
             model.dynamics.cfg.open_rollout_stride_frames
             if args.dynamics_open_rollout_stride_frames is None
             else int(args.dynamics_open_rollout_stride_frames)
         ),
-        "open_rollout_frame_mse": float(F.mse_loss(predicted_only, target_only).item()),
-        "open_rollout_frame_l1": float(F.l1_loss(predicted_only, target_only).item()),
-        "dynamics_infer_steps": int(model.dynamics.cfg.dynamics_infer_steps),
-        "validation_style": "open_rollout_autoregressive",
-    }
+        initial_stride_frames=int(
+            model.resolved_rollout_stride_frames(
+                seed_context_frames,
+                stride_frames=args.dynamics_open_rollout_stride_frames,
+            )
+        ),
+        frame_mse=frame_mse,
+        frame_l1=frame_l1,
+        motion_ratio=motion_ratio,
+        predicted_motion_l1=predicted_motion_l1,
+        ground_truth_motion_l1=ground_truth_motion_l1,
+    )
     output_dir = resolve_output_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
     build_side_by_side_grid(

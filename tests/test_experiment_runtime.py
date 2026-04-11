@@ -14,6 +14,7 @@ from world_model_v2.experiment import (
     Experiment,
     ExperimentConfig,
     load_training_checkpoint,
+    validation_metric_value_from_stats,
 )
 
 
@@ -140,6 +141,12 @@ def test_wan_experiment_run_writes_artifacts_for_each_mode(
     ]
     validation_record = next(record for record in metrics_records if "validation" in record)
     assert validation_record["validation"]["elapsed_run_seconds"] >= 0.0
+    assert saved_stats["checkpoint"] == str(run_dir / "checkpoints" / "last.pt")
+    assert saved_stats["best_checkpoint"] == str(run_dir / "checkpoints" / "best.pt")
+    assert saved_stats["is_best_checkpoint"] is True
+    assert validation_record["validation"]["best_checkpoint"] == str(
+        run_dir / "checkpoints" / "best.pt"
+    )
     assert '"elapsed_run_seconds"' in captured.out
     if mode == "ae_only":
         assert '"kl_loss"' in payload
@@ -157,9 +164,12 @@ def test_wan_experiment_run_writes_artifacts_for_each_mode(
             saved_stats["input_frame_count"] - DYNAMICS_FRAME_LAYOUT.context_frames
         )
         assert saved_stats["open_rollout_validation_style"] == "open_rollout_autoregressive"
-        assert saved_stats["validation_style"] == "teacher_forced_3_context_2_target"
-        assert "next_frame_mse_4to1" in saved_stats
-        assert saved_stats["validation_style_4to1"] == "teacher_forced_4_context_1_target"
+        assert saved_stats["validation_style"] == "teacher_forced_1_context_3_target"
+        assert "next_frame_mse_1to3" in saved_stats
+        assert saved_stats["validation_style_1to3"] == "teacher_forced_1_context_3_target"
+        assert saved_stats["worst_case_next_frame_mse"] == pytest.approx(
+            saved_stats["next_frame_mse_1to3"]
+        )
         assert stats["dynamics_backend"] == "rf_dit"
 
 
@@ -191,6 +201,64 @@ def test_dynamics_run_can_select_best_checkpoint_by_open_rollout_metric(
         (run_dir / "samples" / "step_000001" / "episode_0_stats.json").read_text(encoding="utf-8")
     )
     assert checkpoint["best_metric"] == pytest.approx(saved_stats["open_rollout_frame_mse"])
+
+
+def test_dynamics_run_can_average_validation_across_multiple_episodes(
+    fake_multi_episode_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Dynamics validation should aggregate checkpoint selection across multiple episodes."""
+
+    config = ExperimentConfig(
+        mode="dynamics_only",
+        data_root=str(fake_multi_episode_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="smoke_dynamics_multi_validation",
+        split="train",
+        validation_split="train",
+        validation_episodes=(0, 1),
+        frame_start=100,
+        frame_end=104,
+        max_steps=1,
+        validation_interval=1,
+        checkpoint_interval=1,
+        log_interval=1,
+        device="cpu",
+        load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+    )
+    experiment = Experiment(config)
+    experiment.run()
+
+    run_dir = tmp_path / "outputs" / "smoke_dynamics_multi_validation"
+    checkpoint = load_training_checkpoint(run_dir / "checkpoints" / "best.pt", device="cpu")
+    episode_0_stats = json.loads(
+        (run_dir / "samples" / "step_000001" / "episode_0_stats.json").read_text(encoding="utf-8")
+    )
+    episode_1_stats = json.loads(
+        (run_dir / "samples" / "step_000001" / "episode_1_stats.json").read_text(encoding="utf-8")
+    )
+    summary_stats = json.loads(
+        (run_dir / "samples" / "step_000001" / "validation_summary.json").read_text(encoding="utf-8")
+    )
+    metrics_records = [
+        json.loads(line)
+        for line in (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    validation_record = next(record for record in metrics_records if "validation" in record)
+
+    assert summary_stats["validation_episode_count"] == 2
+    assert summary_stats["validation_episodes"] == [0, 1]
+    assert validation_record["validation"]["validation_episode_count"] == 2
+    assert validation_record["validation"]["validation_episodes"] == [0, 1]
+    assert summary_stats["next_frame_mse"] == pytest.approx(
+        (episode_0_stats["next_frame_mse"] + episode_1_stats["next_frame_mse"]) / 2.0
+    )
+    assert summary_stats["open_rollout_frame_mse"] == pytest.approx(
+        (episode_0_stats["open_rollout_frame_mse"] + episode_1_stats["open_rollout_frame_mse"])
+        / 2.0
+    )
+    assert checkpoint["best_metric"] == pytest.approx(summary_stats["next_frame_mse"])
 
 
 @pytest.mark.parametrize(
@@ -254,6 +322,45 @@ def test_dynamics_run_supports_one_context_layouts(
     assert saved_stats["validation_conditioning_frame_choices"] == [1]
     assert saved_stats["open_rollout_context_frames"] == 1
     assert saved_stats["open_rollout_stride_frames"] == 1
+    assert saved_stats["open_rollout_initial_stride_frames"] == 1
+
+
+def test_runtime_records_initial_default_open_rollout_stride(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Validation stats should expose the implicit first rollout stride for default chunking."""
+
+    config = ExperimentConfig(
+        mode="dynamics_only",
+        data_root=str(fake_long_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="default_rollout_stride",
+        **DEBUG_FRAME_KWARGS,
+        max_steps=1,
+        validation_interval=1,
+        checkpoint_interval=1,
+        batch_size=1,
+        device="cpu",
+        load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+        dynamics_context_frames=1,
+        dynamics_target_frames=3,
+        dynamics_conditioning_frame_choices=(1,),
+        dynamics_conditioning_frame_probabilities=(1.0,),
+        dynamics_validation_conditioning_frame_choices=(1,),
+        dynamics_open_rollout_context_frames=1,
+    )
+    experiment = Experiment(config)
+    experiment.run()
+
+    run_dir = tmp_path / "outputs" / "default_rollout_stride"
+    saved_stats = json.loads(
+        (run_dir / "samples" / "step_000001" / "episode_0_stats.json").read_text(encoding="utf-8")
+    )
+
+    assert saved_stats["open_rollout_stride_frames"] is None
+    assert saved_stats["open_rollout_initial_stride_frames"] == 3
 
 
 def test_resume_rebuilds_best_metric_for_changed_dynamics_validation_metric(
@@ -296,6 +403,247 @@ def test_resume_rebuilds_best_metric_for_changed_dynamics_validation_metric(
     )
 
     assert resumed_experiment.best_metric == pytest.approx(saved_stats["open_rollout_frame_mse"])
+
+
+def test_resume_rebuilds_derived_rollout_consistency_metric_from_older_logs(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Resumes should derive rollout consistency from older logs that predate the new metric."""
+
+    initial_config = ExperimentConfig(
+        mode="dynamics_only",
+        data_root=str(fake_long_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="resume_consistency_source",
+        **DYNAMICS_FIVE_FRAME_KWARGS,
+        max_steps=1,
+        validation_interval=1,
+        checkpoint_interval=1,
+        device="cpu",
+        load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+    )
+    initial_experiment = Experiment(initial_config)
+    initial_experiment.run()
+    source_run_dir = tmp_path / "outputs" / "resume_consistency_source"
+    stats_path = source_run_dir / "samples" / "step_000001" / "episode_0_stats.json"
+    saved_stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    expected_consistency = validation_metric_value_from_stats(
+        "open_rollout_consistency_score",
+        saved_stats,
+    )
+    assert expected_consistency is not None
+
+    metrics_path = source_run_dir / "metrics.jsonl"
+    patched_records = []
+    for line in metrics_path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        validation = record.get("validation")
+        if isinstance(validation, dict):
+            validation.pop("open_rollout_consistency_score", None)
+            validation.pop("open_rollout_motion_log_error", None)
+        patched_records.append(record)
+    metrics_path.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in patched_records),
+        encoding="utf-8",
+    )
+
+    resumed_experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="resume_consistency_target",
+            **DYNAMICS_FIVE_FRAME_KWARGS,
+            device="cpu",
+            resume=str(source_run_dir / "checkpoints" / "best.pt"),
+            dynamics_validation_metric="open_rollout_consistency_score",
+        )
+    )
+
+    assert resumed_experiment.best_metric == pytest.approx(expected_consistency)
+
+
+def test_resume_applies_requested_learning_rate_override(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Resumes should honor the current config learning rate instead of the checkpoint's one."""
+
+    initial_config = ExperimentConfig(
+        mode="dynamics_only",
+        data_root=str(fake_long_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="resume_lr_source",
+        **DYNAMICS_FIVE_FRAME_KWARGS,
+        max_steps=1,
+        validation_interval=1,
+        checkpoint_interval=1,
+        device="cpu",
+        lr=2e-5,
+        load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+    )
+    initial_experiment = Experiment(initial_config)
+    initial_experiment.run()
+    source_run_dir = tmp_path / "outputs" / "resume_lr_source"
+
+    resumed_experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="resume_lr_target",
+            **DYNAMICS_FIVE_FRAME_KWARGS,
+            device="cpu",
+            lr=1e-5,
+            resume=str(source_run_dir / "checkpoints" / "best.pt"),
+        )
+    )
+
+    assert all(group["lr"] == pytest.approx(1e-5) for group in resumed_experiment.optimizer.param_groups)
+
+
+def test_resume_best_metric_ignores_future_source_validation_records(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Resume state should only replay validation history up to the checkpoint step."""
+
+    initial_config = ExperimentConfig(
+        mode="dynamics_only",
+        data_root=str(fake_long_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="resume_cutoff_source",
+        **DYNAMICS_FIVE_FRAME_KWARGS,
+        max_steps=1,
+        validation_interval=1,
+        checkpoint_interval=1,
+        device="cpu",
+        load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+    )
+    initial_experiment = Experiment(initial_config)
+    initial_experiment.run()
+    source_run_dir = tmp_path / "outputs" / "resume_cutoff_source"
+    stats_path = source_run_dir / "samples" / "step_000001" / "episode_0_stats.json"
+    saved_stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    expected_consistency = validation_metric_value_from_stats(
+        "open_rollout_consistency_score",
+        saved_stats,
+    )
+    assert expected_consistency is not None
+
+    metrics_path = source_run_dir / "metrics.jsonl"
+    patched_records = []
+    for line in metrics_path.read_text(encoding="utf-8").splitlines():
+        patched_records.append(json.loads(line))
+    synthetic_validation = dict(saved_stats)
+    synthetic_validation.pop("open_rollout_consistency_score", None)
+    synthetic_validation.pop("open_rollout_motion_log_error", None)
+    synthetic_validation["open_rollout_frame_mse"] = float(saved_stats["open_rollout_frame_mse"]) * 0.5
+    synthetic_validation["open_rollout_target_motion_ratio"] = 1.0
+    derived_future_consistency = validation_metric_value_from_stats(
+        "open_rollout_consistency_score",
+        synthetic_validation,
+    )
+    assert derived_future_consistency is not None
+    assert derived_future_consistency < expected_consistency
+    synthetic_validation["open_rollout_consistency_score"] = derived_future_consistency
+    patched_records.append({"step": 2, "validation": synthetic_validation})
+    metrics_path.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in patched_records),
+        encoding="utf-8",
+    )
+
+    resumed_run_dir = tmp_path / "outputs" / "resume_cutoff_target"
+    resumed_experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="resume_cutoff_target",
+            **DYNAMICS_FIVE_FRAME_KWARGS,
+            device="cpu",
+            resume=str(source_run_dir / "checkpoints" / "best.pt"),
+            dynamics_validation_metric="open_rollout_consistency_score",
+        )
+    )
+
+    assert resumed_experiment.best_metric == pytest.approx(expected_consistency)
+    resumed_best_checkpoint = load_training_checkpoint(
+        resumed_run_dir / "checkpoints" / "best.pt",
+        device="cpu",
+    )
+    assert int(resumed_best_checkpoint["step"]) == 1
+    assert float(resumed_best_checkpoint["best_metric"]) == pytest.approx(expected_consistency)
+
+
+def test_resume_resets_best_metric_when_validation_episodes_change(
+    fake_multi_episode_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Resume should not inherit best-checkpoint state across a changed validation domain."""
+
+    initial_config = ExperimentConfig(
+        mode="dynamics_only",
+        data_root=str(fake_multi_episode_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="resume_multi_source",
+        split="train",
+        validation_split="train",
+        validation_episode=0,
+        frame_start=100,
+        frame_end=104,
+        max_steps=1,
+        validation_interval=1,
+        checkpoint_interval=1,
+        device="cpu",
+        load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+    )
+    initial_experiment = Experiment(initial_config)
+    initial_experiment.run()
+    source_run_dir = tmp_path / "outputs" / "resume_multi_source"
+
+    resumed_experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_multi_episode_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="resume_multi_target",
+            split="train",
+            validation_split="train",
+            validation_episodes=(0, 1),
+            frame_start=100,
+            frame_end=104,
+            max_steps=1,
+            validation_interval=1,
+            checkpoint_interval=1,
+            device="cpu",
+            resume=str(source_run_dir / "checkpoints" / "best.pt"),
+        )
+    )
+
+    assert resumed_experiment.best_metric is None
+
+    resumed_experiment.run()
+    resumed_run_dir = tmp_path / "outputs" / "resume_multi_target"
+    summary_stats = json.loads(
+        (resumed_run_dir / "samples" / "step_000001" / "validation_summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    resumed_best_checkpoint = load_training_checkpoint(
+        resumed_run_dir / "checkpoints" / "best.pt",
+        device="cpu",
+    )
+
+    assert summary_stats["validation_episode_count"] == 2
+    assert float(resumed_best_checkpoint["best_metric"]) == pytest.approx(
+        summary_stats["next_frame_mse"]
+    )
 
 
 def test_wan_experiment_auto_batch_size_cleans_up_and_retries_after_oom(

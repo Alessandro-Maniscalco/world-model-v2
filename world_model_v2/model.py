@@ -62,9 +62,10 @@ class WorldModel(nn.Module):
         dynamics_model_channels: int = 256,
         dynamics_num_blocks: int = 4,
         dynamics_num_heads: int = 4,
+        dynamics_action_dim: int = 4,
         dynamics_action_conditioning_mode: str = "chunk_per_frame",
         dynamics_zero_init_action_embedder: bool = False,
-        dynamics_use_adaln_lora: bool = False,
+        dynamics_use_adaln_lora: bool = True,
         dynamics_adaln_lora_dim: int = 64,
         dynamics_rope_t_extrapolation_ratio: float = 1.0,
         dynamics_use_learned_temporal_embedding: bool = False,
@@ -136,7 +137,7 @@ class WorldModel(nn.Module):
                 rope_w_extrapolation_ratio=1.0,
                 rope_t_extrapolation_ratio=dynamics_rope_t_extrapolation_ratio,
                 use_learned_temporal_embedding=dynamics_use_learned_temporal_embedding,
-                action_dim=4,
+                action_dim=dynamics_action_dim,
                 action_conditioning_mode=dynamics_action_conditioning_mode,
                 zero_init_action_embedder=dynamics_zero_init_action_embedder,
                 conditional_frame_timestep=conditional_frame_timestep,
@@ -331,6 +332,28 @@ class WorldModel(nn.Module):
         )
         return self.decode_frame_sequence(next_latents)
 
+    def resolved_rollout_stride_frames(
+        self,
+        context_frames: int,
+        stride_frames: int | None = None,
+    ) -> int:
+        """Resolve how many newly predicted frames a rollout chunk should append."""
+
+        if context_frames < 1 or context_frames >= self.dynamics.cfg.max_frames:
+            raise ValueError(
+                "context_frames must stay within "
+                f"[1, {self.dynamics.cfg.max_frames - 1}], received {context_frames}."
+            )
+        resolved_stride_frames = (
+            self.dynamics.cfg.open_rollout_stride_frames
+            if stride_frames is None
+            else int(stride_frames)
+        )
+        if resolved_stride_frames is not None and resolved_stride_frames < 1:
+            raise ValueError("stride_frames must be positive when provided.")
+        chunk_target_capacity = self.dynamics.cfg.max_frames - context_frames
+        return chunk_target_capacity if resolved_stride_frames is None else resolved_stride_frames
+
     def rollout(
         self,
         seed_frames: torch.Tensor,
@@ -372,13 +395,6 @@ class WorldModel(nn.Module):
                 raise ValueError(
                     f"Expected rollout action dim {self.dynamics.cfg.action_dim}, received {actions.shape[2]}."
                 )
-        resolved_stride_frames = (
-            self.dynamics.cfg.open_rollout_stride_frames
-            if stride_frames is None
-            else int(stride_frames)
-        )
-        if resolved_stride_frames is not None and resolved_stride_frames < 1:
-            raise ValueError("stride_frames must be positive when provided.")
         predicted_frames = [seed_frames[:, frame_index] for frame_index in range(seed_frames.shape[1])]
         full_rollout_latents = self.encode_context_frames(seed_frames, deterministic=True)
         generated_frames = 0
@@ -386,14 +402,22 @@ class WorldModel(nn.Module):
         generator.manual_seed(0)
         while generated_frames < steps:
             available_frames = int(full_rollout_latents.shape[2])
+            rollout_context_limit = min(
+                available_frames,
+                int(self.dynamics.cfg.open_rollout_context_frames),
+            )
             current_context_frames = max(
                 conditioning_frames
                 for conditioning_frames in self.dynamics.cfg.conditioning_frame_choices
-                if conditioning_frames <= available_frames
+                if conditioning_frames <= rollout_context_limit
             )
             current_latents = full_rollout_latents[:, :, -current_context_frames:]
             chunk_target_capacity = self.dynamics.cfg.max_frames - current_context_frames
-            stride = chunk_target_capacity if resolved_stride_frames is None else resolved_stride_frames
+            stride = WorldModel.resolved_rollout_stride_frames(
+                self,
+                current_context_frames,
+                stride_frames=stride_frames,
+            )
             chunk_target_frames = min(chunk_target_capacity, stride, steps - generated_frames)
             action_window = None
             if actions is not None:

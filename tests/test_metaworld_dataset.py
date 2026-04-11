@@ -62,10 +62,32 @@ def test_metaworld_frame_dataset_flattens_all_task_episodes(
     assert sorted(list(sampler)) == list(range(len(dataset)))
 
 
+def test_metaworld_frame_dataset_can_exclude_selected_task_episodes(
+    fake_metaworld_dataset_root: Path,
+) -> None:
+    """All-episode MT50 frame training should exclude selected task episodes."""
+
+    dataset = MetaWorldFrameDataset(
+        data_root=str(fake_metaworld_dataset_root),
+        split="train",
+        task_index=0,
+        resolution=8,
+        all_episodes=True,
+        exclude_episodes=(0,),
+    )
+    assert len(dataset) == 3
+    first = dataset[0]
+    last = dataset[2]
+    assert first["episode_idx"].item() == 1
+    assert first["frame_idx"].item() == 0
+    assert last["episode_idx"].item() == 1
+    assert last["frame_idx"].item() == 2
+
+
 def test_metaworld_transition_dataset_returns_consecutive_pairs(
     fake_metaworld_dataset_root: Path,
 ) -> None:
-    """The MT50 transition dataset should expose sliding 5-frame windows."""
+    """The MT50 transition dataset should expose sliding canonical dynamics windows."""
 
     dataset = MetaWorldTransitionDataset(
         data_root=str(fake_metaworld_dataset_root),
@@ -75,7 +97,7 @@ def test_metaworld_transition_dataset_returns_consecutive_pairs(
         resolution=8,
     )
     sample = dataset[0]
-    assert len(dataset) == 1
+    assert len(dataset) == 5 - DYNAMICS_FRAME_LAYOUT.max_frames + 1
     assert sample["context_frames"].shape == (DYNAMICS_FRAME_LAYOUT.context_frames, 3, 8, 8)
     assert sample["target_frames"].shape == (DYNAMICS_FRAME_LAYOUT.target_frames, 3, 8, 8)
     assert sample["actions"].shape == (DYNAMICS_FRAME_LAYOUT.num_action_per_chunk, 4)
@@ -172,6 +194,60 @@ def test_metaworld_transition_dataset_exposes_future_rollout_targets_when_reques
             ]
         ),
     )
+
+
+def test_metaworld_transition_dataset_flattens_all_task_episodes(
+    fake_metaworld_dataset_root: Path,
+) -> None:
+    """All-episode MT50 dynamics training should flatten valid windows across one task."""
+
+    dataset = MetaWorldTransitionDataset(
+        data_root=str(fake_metaworld_dataset_root),
+        split="train",
+        task_index=0,
+        resolution=8,
+        frame_layout=DynamicsFrameLayout(context_frames=1, target_frames=1),
+        all_episodes=True,
+    )
+    assert len(dataset) == 6
+    first = dataset[0]
+    second_episode_first = dataset[4]
+    last = dataset[5]
+    assert first["episode_idx"].item() == 0
+    assert first["context_frame_idx"].tolist() == [0]
+    assert first["target_frame_idx"].tolist() == [1]
+    assert second_episode_first["episode_idx"].item() == 1
+    assert second_episode_first["context_frame_idx"].tolist() == [0]
+    assert second_episode_first["target_frame_idx"].tolist() == [1]
+    assert last["episode_idx"].item() == 1
+    assert last["context_frame_idx"].tolist() == [1]
+    assert last["target_frame_idx"].tolist() == [2]
+    sampler = dataset.training_sampler()
+    assert sampler is not None
+    assert sorted(list(sampler)) == list(range(len(dataset)))
+
+
+def test_metaworld_transition_dataset_can_exclude_selected_task_episodes(
+    fake_metaworld_dataset_root: Path,
+) -> None:
+    """All-episode MT50 dynamics training should exclude selected task episodes."""
+
+    dataset = MetaWorldTransitionDataset(
+        data_root=str(fake_metaworld_dataset_root),
+        split="train",
+        task_index=0,
+        resolution=8,
+        frame_layout=DynamicsFrameLayout(context_frames=1, target_frames=1),
+        all_episodes=True,
+        exclude_episodes=(0,),
+    )
+    assert len(dataset) == 2
+    first = dataset[0]
+    last = dataset[1]
+    assert first["episode_idx"].item() == 1
+    assert first["context_frame_idx"].tolist() == [0]
+    assert last["episode_idx"].item() == 1
+    assert last["context_frame_idx"].tolist() == [1]
 
 
 def test_resolve_metaworld_split_maps_val_to_train() -> None:

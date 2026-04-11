@@ -30,7 +30,7 @@ def test_frame_dataset_defaults_to_full_episode(fake_long_dataset_root: Path) ->
 def test_transition_dataset_defaults_to_full_episode_pairs(
     fake_long_dataset_root: Path,
 ) -> None:
-    """The transition dataset should default to all 5-frame training windows."""
+    """The transition dataset should default to all canonical dynamics windows."""
 
     dataset = TransitionDataset(data_root=str(fake_long_dataset_root))
     assert len(dataset) == 130 - DYNAMICS_FRAME_LAYOUT.max_frames + 1
@@ -43,10 +43,8 @@ def test_transition_dataset_defaults_to_full_episode_pairs(
         first["actions"],
         torch.tensor(
             [
-                [0.0, 1.0, 2.0, 3.0],
-                [1.0, 2.0, 3.0, 4.0],
-                [2.0, 3.0, 4.0, 5.0],
-                [3.0, 4.0, 5.0, 6.0],
+                [float(action_index + offset) for offset in range(4)]
+                for action_index in range(DYNAMICS_FRAME_LAYOUT.num_action_per_chunk)
             ]
         ),
     )
@@ -117,10 +115,8 @@ def test_datasets_preserve_explicit_frame_slice(fake_long_dataset_root: Path) ->
         transition_dataset[0]["actions"],
         torch.tensor(
             [
-                [111.0, 112.0, 113.0, 114.0],
-                [112.0, 113.0, 114.0, 115.0],
-                [113.0, 114.0, 115.0, 116.0],
-                [114.0, 115.0, 116.0, 117.0],
+                [float(111 + action_index + offset) for offset in range(4)]
+                for action_index in range(DYNAMICS_FRAME_LAYOUT.num_action_per_chunk)
             ]
         ),
     )
@@ -191,6 +187,51 @@ def test_transition_dataset_exposes_future_rollout_targets_when_requested(
     )
 
 
+def test_transition_dataset_can_span_all_episodes(
+    fake_multi_episode_dataset_root: Path,
+) -> None:
+    """The dynamics dataset should flatten valid windows across all episodes."""
+
+    dataset = TransitionDataset(
+        data_root=str(fake_multi_episode_dataset_root),
+        split="train",
+        all_episodes=True,
+    )
+    assert len(dataset) == 239
+    first = dataset[0]
+    second_episode_first = dataset[127]
+    last = dataset[238]
+    assert first["episode_idx"].item() == 0
+    assert first["context_frame_idx"].tolist() == [0]
+    assert first["target_frame_idx"].tolist() == [1, 2, 3]
+    assert second_episode_first["episode_idx"].item() == 1
+    assert second_episode_first["context_frame_idx"].tolist() == [0]
+    assert second_episode_first["target_frame_idx"].tolist() == [1, 2, 3]
+    assert last["episode_idx"].item() == 1
+    assert last["context_frame_idx"].tolist() == [111]
+    assert last["target_frame_idx"].tolist() == [112, 113, 114]
+
+
+def test_transition_dataset_can_exclude_episodes_from_all_episode_training(
+    fake_multi_episode_dataset_root: Path,
+) -> None:
+    """The dynamics dataset should exclude selected episodes from all-episode training."""
+
+    dataset = TransitionDataset(
+        data_root=str(fake_multi_episode_dataset_root),
+        split="train",
+        all_episodes=True,
+        exclude_episodes=(0,),
+    )
+    assert len(dataset) == 112
+    first = dataset[0]
+    last = dataset[111]
+    assert first["episode_idx"].item() == 1
+    assert first["context_frame_idx"].tolist() == [0]
+    assert last["episode_idx"].item() == 1
+    assert last["context_frame_idx"].tolist() == [111]
+
+
 def test_list_episode_indices_returns_sorted_episode_numbers(
     fake_multi_episode_dataset_root: Path,
 ) -> None:
@@ -221,5 +262,25 @@ def test_frame_dataset_can_span_all_episodes(
     assert first["frame_idx"].item() == 0
     assert second_episode_first["episode_idx"].item() == 1
     assert second_episode_first["frame_idx"].item() == 0
+    assert last["episode_idx"].item() == 1
+    assert last["frame_idx"].item() == 114
+
+
+def test_frame_dataset_can_exclude_episodes_from_all_episode_training(
+    fake_multi_episode_dataset_root: Path,
+) -> None:
+    """The AE dataset should exclude selected episodes from all-episode training."""
+
+    dataset = FrameDataset(
+        data_root=str(fake_multi_episode_dataset_root),
+        split="train",
+        all_episodes=True,
+        exclude_episodes=(0,),
+    )
+    assert len(dataset) == 115
+    first = dataset[0]
+    last = dataset[114]
+    assert first["episode_idx"].item() == 1
+    assert first["frame_idx"].item() == 0
     assert last["episode_idx"].item() == 1
     assert last["frame_idx"].item() == 114

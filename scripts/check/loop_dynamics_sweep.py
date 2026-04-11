@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -37,7 +38,7 @@ if str(REPO_ROOT) not in sys.path:
 from world_model_v2.dynamics_transformer import DYNAMICS_FRAME_LAYOUT
 from world_model_v2.metaworld_dataset import MetaWorldRepository
 
-DEFAULT_VAE_CHECKPOINT = REPO_ROOT / "outputs" / "metaworld_task0_wan_ae_240" / "checkpoints" / "best.pt"
+DEFAULT_VAE_CHECKPOINT = REPO_ROOT / "outputs" / "best_vae" / "checkpoints" / "best.pt"
 LEGACY_DEFAULT_VAE_CHECKPOINT = (
     REPO_ROOT / "outputs" / "minimal" / "metaworld_task0_wan_ae_240" / "checkpoints" / "best.pt"
 )
@@ -47,14 +48,30 @@ DEFAULT_SELECTION_METRIC = "worst_case_next_frame_mse"
 EVAL_OPEN_ROLLOUT_SELECTION_METRIC = "eval_open_rollout_frame_mse"
 EVAL_OPEN_ROLLOUT_MEAN_SELECTION_METRIC = "eval_open_rollout_frame_mse_mean"
 EVAL_OPEN_ROLLOUT_MAX_SELECTION_METRIC = "eval_open_rollout_frame_mse_max"
+OPEN_ROLLOUT_CONSISTENCY_SELECTION_METRIC = "open_rollout_consistency_score"
+EVAL_OPEN_ROLLOUT_CONSISTENCY_SELECTION_METRIC = "eval_open_rollout_consistency_score"
+EVAL_OPEN_ROLLOUT_CONSISTENCY_MEAN_SELECTION_METRIC = (
+    "eval_open_rollout_consistency_score_mean"
+)
+EVAL_OPEN_ROLLOUT_CONSISTENCY_MAX_SELECTION_METRIC = (
+    "eval_open_rollout_consistency_score_max"
+)
+_TEACHER_FORCED_NEXT_FRAME_MSE_PATTERN = re.compile(r"^next_frame_mse(?:_\d+to\d+)?$")
 SELECTION_METRIC_CHOICES = (
     DEFAULT_SELECTION_METRIC,
     "next_frame_mse",
+    "next_frame_mse_1to1",
+    "next_frame_mse_1to2",
+    "next_frame_mse_1to3",
     "next_frame_mse_4to1",
     "open_rollout_frame_mse",
+    OPEN_ROLLOUT_CONSISTENCY_SELECTION_METRIC,
     EVAL_OPEN_ROLLOUT_SELECTION_METRIC,
     EVAL_OPEN_ROLLOUT_MEAN_SELECTION_METRIC,
     EVAL_OPEN_ROLLOUT_MAX_SELECTION_METRIC,
+    EVAL_OPEN_ROLLOUT_CONSISTENCY_SELECTION_METRIC,
+    EVAL_OPEN_ROLLOUT_CONSISTENCY_MEAN_SELECTION_METRIC,
+    EVAL_OPEN_ROLLOUT_CONSISTENCY_MAX_SELECTION_METRIC,
 )
 
 
@@ -82,7 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vae-checkpoint", default=str(DEFAULT_VAE_CHECKPOINT))
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
-    parser.add_argument("--run-prefix", default="loop_rf_dit_action_teacher_4to1")
+    parser.add_argument("--run-prefix", default="loop_rf_dit_action_teacher_1to3")
     parser.add_argument("--dataset-format", default="lerobot_metaworld", choices=["lerobot_metaworld", "interactive_world_sim"])
     parser.add_argument("--data-root", default="data/full")
     parser.add_argument("--split", default="train")
@@ -121,13 +138,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dynamics-action-conditioning-mode",
         default="chunk_per_frame",
-        choices=["chunk_per_frame", "global_chunk"],
+        choices=["chunk_per_frame"],
     )
     parser.add_argument("--dynamics-zero-init-action-embedder", action="store_true")
-    parser.add_argument("--dynamics-use-adaln-lora", action="store_true")
+    parser.add_argument(
+        "--dynamics-use-adaln-lora",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--dynamics-adaln-lora-dim", type=int, default=64)
     parser.add_argument("--dynamics-rope-t-extrapolation-ratio", type=float, default=1.0)
-    parser.add_argument("--dynamics-use-learned-temporal-embedding", action="store_true")
+    parser.add_argument(
+        "--dynamics-use-learned-temporal-embedding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument(
         "--conditional-frame-timestep",
         type=float,
@@ -191,7 +216,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dynamics-validation-metric",
         default="next_frame_mse",
-        choices=["next_frame_mse", "open_rollout_frame_mse"],
+        choices=[
+            "next_frame_mse",
+            "open_rollout_frame_mse",
+            "open_rollout_consistency_score",
+        ],
     )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
@@ -457,6 +486,8 @@ def build_command(
         command.append("--dynamics-zero-init-action-embedder")
     if args.dynamics_use_adaln_lora:
         command.append("--dynamics-use-adaln-lora")
+    else:
+        command.append("--no-dynamics-use-adaln-lora")
     if args.dataset_format == "lerobot_metaworld":
         command.extend(["--metaworld-task-index", str(args.metaworld_task_index)])
     else:
@@ -606,10 +637,29 @@ def _extract_selection_metric(stats: dict[str, Any], metric_name: str) -> float:
     """Return the numeric score used to rank successful dynamics runs."""
 
     if metric_name == DEFAULT_SELECTION_METRIC:
-        primary = float(stats.get("next_frame_mse", math.inf))
-        auxiliary = float(stats.get("next_frame_mse_4to1", primary))
-        return max(primary, auxiliary)
+        return _worst_case_teacher_forced_next_frame_mse(stats)
     return float(stats.get(metric_name, math.inf))
+
+
+def _teacher_forced_next_frame_mse_values(stats: dict[str, Any]) -> list[float]:
+    """Return all aggregate teacher-forced next-frame MSE values found in one stats blob."""
+
+    values: list[float] = []
+    for key, value in stats.items():
+        if not _TEACHER_FORCED_NEXT_FRAME_MSE_PATTERN.fullmatch(key):
+            continue
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+    return values
+
+
+def _worst_case_teacher_forced_next_frame_mse(stats: dict[str, Any]) -> float:
+    """Return the worst aggregate teacher-forced next-frame MSE across validated layouts."""
+
+    values = _teacher_forced_next_frame_mse_values(stats)
+    if not values:
+        return math.inf
+    return max(values)
 
 
 def evaluate_run(run_dir: Path, max_next_frame_mse: float) -> dict[str, Any]:
@@ -622,7 +672,7 @@ def evaluate_run(run_dir: Path, max_next_frame_mse: float) -> dict[str, Any]:
     grid_summary = summarize_grid_image(grid_path) if grid_path.exists() else {}
     ffprobe_frame_count = probe_mp4_frame_count(video_path) if video_path.exists() else None
     next_frame_mse = float(stats.get("next_frame_mse", math.inf))
-    next_frame_mse_4to1 = float(stats.get("next_frame_mse_4to1", next_frame_mse))
+    worst_case_next_frame_mse = _worst_case_teacher_forced_next_frame_mse(stats)
 
     issues: list[str] = []
     if not video_path.exists():
@@ -637,12 +687,12 @@ def evaluate_run(run_dir: Path, max_next_frame_mse: float) -> dict[str, Any]:
         issues.append("ffprobe_frame_count_mismatch")
     if not math.isfinite(next_frame_mse):
         issues.append("non_finite_next_frame_mse")
-    if not math.isfinite(next_frame_mse_4to1):
-        issues.append("non_finite_next_frame_mse_4to1")
+    if not math.isfinite(worst_case_next_frame_mse):
+        issues.append("non_finite_worst_case_next_frame_mse")
     if next_frame_mse > max_next_frame_mse:
         issues.append("next_frame_mse_above_threshold")
-    if next_frame_mse_4to1 > max_next_frame_mse:
-        issues.append("next_frame_mse_4to1_above_threshold")
+    if worst_case_next_frame_mse > max_next_frame_mse:
+        issues.append("worst_case_next_frame_mse_above_threshold")
 
     best_checkpoint = run_dir / "checkpoints" / "best.pt"
     return {
@@ -655,6 +705,7 @@ def evaluate_run(run_dir: Path, max_next_frame_mse: float) -> dict[str, Any]:
         "ffprobe_frame_count": ffprobe_frame_count,
         "issues": issues,
         "passed": not issues,
+        "worst_case_next_frame_mse": worst_case_next_frame_mse,
         **grid_summary,
         **stats,
     }
@@ -676,6 +727,7 @@ def evaluate_open_rollout(
     output_dir = run_dir / "open_rollout_eval"
     merged: dict[str, Any] = dict(evaluation)
     span_scores: list[float] = []
+    span_consistency_scores: list[float] = []
     span_issue = False
     for frame_start, frame_end in eval_spans:
         command = build_open_rollout_eval_command(
@@ -705,6 +757,8 @@ def evaluate_open_rollout(
         payload = json.loads(completed.stdout.strip().splitlines()[-1])
         if payload.get("open_rollout_frame_mse") is not None:
             span_scores.append(float(payload["open_rollout_frame_mse"]))
+        if payload.get("open_rollout_consistency_score") is not None:
+            span_consistency_scores.append(float(payload["open_rollout_consistency_score"]))
         if len(eval_spans) == 1:
             prefixed_payload = {
                 f"eval_{key}": value
@@ -739,6 +793,13 @@ def evaluate_open_rollout(
         merged["eval_open_rollout_frame_mse_max"] = max_score
         if len(eval_spans) > 1:
             merged["eval_open_rollout_frame_mse"] = mean_score
+    if span_consistency_scores:
+        mean_score = float(sum(span_consistency_scores) / len(span_consistency_scores))
+        max_score = float(max(span_consistency_scores))
+        merged["eval_open_rollout_consistency_score_mean"] = mean_score
+        merged["eval_open_rollout_consistency_score_max"] = max_score
+        if len(eval_spans) > 1:
+            merged["eval_open_rollout_consistency_score"] = mean_score
     if span_issue:
         merged["issues"] = [*list(merged.get("issues", [])), "eval_open_rollout_failed"]
         merged["passed"] = False

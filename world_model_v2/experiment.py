@@ -6,7 +6,10 @@ from collections import deque
 from dataclasses import asdict, dataclass
 import gc
 import json
+import math
+from numbers import Integral, Real
 import random
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -14,7 +17,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torch.utils.data._utils.collate import default_collate
 
 from world_model_v2.dataset import (
@@ -22,10 +25,38 @@ from world_model_v2.dataset import (
     TransitionDataset,
     ValidationClipDataset,
 )
-from world_model_v2.dynamics_transformer import DYNAMICS_FRAME_LAYOUT, DynamicsFrameLayout
+from world_model_v2.dynamics_transformer import (
+    DREAMDOJO_DYNAMICS_ARCHITECTURE_VERSION,
+    DYNAMICS_FRAME_LAYOUT,
+    DynamicsFrameLayout,
+)
 from world_model_v2.dynamics_transformer import DynamicsTrainingInputs
+from world_model_v2.lerobot_video_dataset import (
+    LeRobotVideoFrameDataset,
+    LeRobotVideoTransitionDataset,
+    LeRobotVideoValidationClipDataset,
+    SO101_BASE_SIM_PICKPLACE_ACTION_DIM,
+    SO101_BASE_SIM_PICKPLACE_DATASET_ID,
+    SO101_BASE_SIM_PICKPLACE_IMAGE_COLUMN,
+)
+from world_model_v2.maniskill_dataset import (
+    MANISKILL_DEFAULT_ACTION_DIM,
+    MANISKILL_DEFAULT_CAMERA,
+    MANISKILL_DEFAULT_TRAJ_H5,
+    MANISKILL_DEFAULT_TRAJ_JSON,
+    ManiSkillFrameDataset,
+    ManiSkillTransitionDataset,
+    ManiSkillValidationClipDataset,
+)
 from world_model_v2.metaworld_dataset import (
+    ALOHA_SIM_TRANSFER_CUBE_SCRIPTED_ACTION_DIM,
+    ALOHA_SIM_TRANSFER_CUBE_SCRIPTED_DATASET_ID,
+    ALOHA_SIM_TRANSFER_CUBE_SCRIPTED_IMAGE_COLUMN,
+    AlohaFrameDataset,
+    AlohaTransitionDataset,
+    AlohaValidationClipDataset,
     METAWORLD_DATASET_ID,
+    METAWORLD_ACTION_DIM,
     MetaWorldFrameDataset,
     MetaWorldTransitionDataset,
     MetaWorldValidationClipDataset,
@@ -43,6 +74,7 @@ LEGACY_WORLD_MODEL_CHECKPOINT_KINDS = frozenset(
     }
 )
 AUTO_BATCH_SIZE_BACKOFF_DIVISOR = 2
+_TEACHER_FORCED_NEXT_FRAME_MSE_PATTERN = re.compile(r"^next_frame_mse(?:_\d+to\d+)?$")
 
 
 @dataclass
@@ -56,11 +88,17 @@ class ExperimentConfig:
     metaworld_task_index: int | None = None
     metaworld_repo_id: str = METAWORLD_DATASET_ID
     metaworld_cache_dir: str = ""
+    aloha_repo_id: str = ALOHA_SIM_TRANSFER_CUBE_SCRIPTED_DATASET_ID
+    aloha_cache_dir: str = ""
+    maniskill_traj_h5: str = MANISKILL_DEFAULT_TRAJ_H5
+    maniskill_traj_json: str = MANISKILL_DEFAULT_TRAJ_JSON
+    maniskill_camera: str = MANISKILL_DEFAULT_CAMERA
     split: str = "val"
     episode: int = 0
     train_all_episodes: bool = False
     validation_split: str = ""
     validation_episode: int = 0
+    validation_episodes: tuple[int, ...] | None = None
     camera: str = "camera_1_color"
     frame_start: int | None = None
     frame_end: int | None = None
@@ -97,7 +135,7 @@ class ExperimentConfig:
     dynamics_num_heads: int = 4
     dynamics_action_conditioning_mode: str = "chunk_per_frame"
     dynamics_zero_init_action_embedder: bool = False
-    dynamics_use_adaln_lora: bool = False
+    dynamics_use_adaln_lora: bool = True
     dynamics_adaln_lora_dim: int = 64
     dynamics_rope_t_extrapolation_ratio: float = 1.0
     dynamics_use_learned_temporal_embedding: bool = False
@@ -138,6 +176,9 @@ class ExperimentConfig:
             "task": self.task,
             "metaworld_task_index": self.metaworld_task_index,
             "metaworld_repo_id": self.metaworld_repo_id,
+            "aloha_repo_id": self.aloha_repo_id,
+            "maniskill_traj_h5": self.maniskill_traj_h5,
+            "maniskill_traj_json": self.maniskill_traj_json,
             "split": self.resolved_split(),
             "episode": self.episode,
             "camera": self.resolved_camera(),
@@ -151,22 +192,45 @@ class ExperimentConfig:
     def resolved_split(self) -> str:
         """Return the effective training split for the selected dataset format."""
 
-        if self.dataset_format == "lerobot_metaworld":
+        if self.dataset_format in {
+            "lerobot_metaworld",
+            "lerobot_aloha_sim_transfer_cube_scripted",
+            "lerobot_so101_base_sim_pickplace",
+            "maniskill_replay",
+        }:
             return "train"
         return self.split
 
     def resolved_validation_split(self) -> str:
         """Return the validation split after applying the optional override."""
 
-        if self.dataset_format == "lerobot_metaworld":
+        if self.dataset_format in {
+            "lerobot_metaworld",
+            "lerobot_aloha_sim_transfer_cube_scripted",
+            "lerobot_so101_base_sim_pickplace",
+            "maniskill_replay",
+        }:
             return "train"
         return self.validation_split or self.split
+
+    def resolved_validation_episodes(self) -> tuple[int, ...]:
+        """Return the ordered validation episodes used for checkpoint selection."""
+
+        if self.validation_episodes is None:
+            return (self.validation_episode,)
+        return self.validation_episodes
 
     def resolved_camera(self) -> str:
         """Return the effective image stream key for the selected dataset format."""
 
         if self.dataset_format == "lerobot_metaworld":
             return "observation.image"
+        if self.dataset_format == "lerobot_aloha_sim_transfer_cube_scripted":
+            return ALOHA_SIM_TRANSFER_CUBE_SCRIPTED_IMAGE_COLUMN
+        if self.dataset_format == "lerobot_so101_base_sim_pickplace":
+            return SO101_BASE_SIM_PICKPLACE_IMAGE_COLUMN
+        if self.dataset_format == "maniskill_replay":
+            return self.maniskill_camera
         return self.camera
 
     def resolved_height(self) -> int:
@@ -231,6 +295,89 @@ def reconstruction_loss_terms(
     }
 
 
+def teacher_forced_next_frame_mse_stats(stats: dict[str, Any]) -> dict[str, float]:
+    """Return aggregate teacher-forced frame MSEs keyed by validated layout suffix."""
+
+    collected: dict[str, float] = {}
+    for key, value in stats.items():
+        if not _TEACHER_FORCED_NEXT_FRAME_MSE_PATTERN.fullmatch(key):
+            continue
+        if isinstance(value, (int, float)):
+            collected[key] = float(value)
+    return collected
+
+
+def compute_motion_ratio(predicted_motion_l1: float, ground_truth_motion_l1: float) -> float:
+    """Return a stable predicted/ground-truth motion ratio."""
+
+    if ground_truth_motion_l1 <= 1e-12:
+        if predicted_motion_l1 <= 1e-12:
+            return 1.0
+        return math.inf
+    return predicted_motion_l1 / ground_truth_motion_l1
+
+
+def motion_ratio_log_error(motion_ratio: float) -> float:
+    """Return a symmetric log-domain penalty for motion ratios away from `1.0`."""
+
+    if not math.isfinite(motion_ratio) or motion_ratio <= 0.0:
+        return math.inf
+    return abs(math.log(motion_ratio))
+
+
+def open_rollout_consistency_score(
+    frame_mse: float,
+    motion_ratio: float | None,
+) -> float:
+    """Combine open-rollout pixel error with a symmetric motion-ratio penalty."""
+
+    if not math.isfinite(frame_mse):
+        return math.inf
+    if motion_ratio is None:
+        return float(frame_mse)
+    log_error = motion_ratio_log_error(float(motion_ratio))
+    if not math.isfinite(log_error):
+        return math.inf
+    return float(frame_mse) * (1.0 + log_error)
+
+
+def validation_metric_value_from_stats(
+    metric_name: str,
+    stats: dict[str, Any],
+) -> float | None:
+    """Return one validation metric value, deriving compatibility metrics when possible."""
+
+    raw_value = stats.get(metric_name)
+    if isinstance(raw_value, (int, float)):
+        return float(raw_value)
+    if metric_name != "open_rollout_consistency_score":
+        return None
+    raw_frame_mse = stats.get("open_rollout_frame_mse")
+    if not isinstance(raw_frame_mse, (int, float)):
+        return None
+    raw_motion_ratio = stats.get("open_rollout_target_motion_ratio")
+    if raw_motion_ratio is None:
+        return float(raw_frame_mse)
+    if not isinstance(raw_motion_ratio, (int, float)):
+        return None
+    return open_rollout_consistency_score(
+        float(raw_frame_mse),
+        float(raw_motion_ratio),
+    )
+
+
+def _normalized_optional_int_tuple(value: Any) -> tuple[int, ...] | None:
+    """Normalize one optional integer or integer-sequence config value."""
+
+    if value is None:
+        return None
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        return (int(value),)
+    if isinstance(value, (list, tuple)):
+        return tuple(int(item) for item in value)
+    raise TypeError(f"Expected an integer sequence, received {type(value).__name__}.")
+
+
 def save_training_checkpoint(
     path: str | Path,
     model: WorldModel,
@@ -251,6 +398,7 @@ def save_training_checkpoint(
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict() if optimizer is not None else None,
         "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+        "rng_state": capture_rng_state(),
         "step": step,
         "config": config,
         "mode": mode,
@@ -272,6 +420,48 @@ def load_training_checkpoint(path: str | Path, device: torch.device | str) -> di
     if checkpoint.get("kind") not in accepted_kinds:
         raise ValueError(f"{path} is not a supported world-model checkpoint.")
     return checkpoint
+
+
+def capture_rng_state() -> dict[str, Any]:
+    """Capture Python, NumPy, and torch RNG state for deterministic resumes."""
+
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _normalized_rng_state_tensor(state: Any) -> torch.Tensor:
+    """Return one RNG-state tensor in the CPU `uint8` format PyTorch expects."""
+
+    if isinstance(state, torch.Tensor):
+        return state.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+    return torch.as_tensor(state, dtype=torch.uint8, device="cpu").contiguous()
+
+
+def restore_rng_state(state: Any) -> None:
+    """Restore a previously captured RNG state when checkpoint metadata provides it."""
+
+    if not isinstance(state, dict):
+        return
+    python_state = state.get("python")
+    if python_state is not None:
+        random.setstate(python_state)
+    numpy_state = state.get("numpy")
+    if numpy_state is not None:
+        np.random.set_state(numpy_state)
+    torch_state = state.get("torch")
+    if torch_state is not None:
+        torch.set_rng_state(_normalized_rng_state_tensor(torch_state))
+    cuda_states = state.get("torch_cuda")
+    if cuda_states is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(
+            [_normalized_rng_state_tensor(cuda_state) for cuda_state in cuda_states]
+        )
 
 
 def checkpoint_ae_backend(checkpoint: dict[str, Any]) -> str:
@@ -340,6 +530,7 @@ class Experiment:
             dynamics_model_channels=cfg.dynamics_model_channels,
             dynamics_num_blocks=cfg.dynamics_num_blocks,
             dynamics_num_heads=cfg.dynamics_num_heads,
+            dynamics_action_dim=self._resolved_dynamics_action_dim(),
             dynamics_action_conditioning_mode=cfg.dynamics_action_conditioning_mode,
             dynamics_zero_init_action_embedder=cfg.dynamics_zero_init_action_embedder,
             dynamics_use_adaln_lora=cfg.dynamics_use_adaln_lora,
@@ -351,6 +542,9 @@ class Experiment:
         self.model.configure_trainability(cfg.mode)
         self.train_dataset = self._build_train_dataset()
         self._validate_train_dataset()
+        # Auto-batch probing runs a dry training step, so schedule-dependent losses
+        # need a well-defined step value before the probe happens.
+        self.current_step = 0
         self.cfg.batch_size = self._resolve_train_batch_size(self.train_dataset)
         self.train_loader = self._build_train_loader(self.train_dataset)
         self.val_loader = self._build_val_loader()
@@ -363,10 +557,21 @@ class Experiment:
         self.best_window_loss: float | None = None
         self.non_improving_windows = 0
         self.early_stop_observations = 0
-        self.current_step = 0
+        self._resume_validation_setup_matches = True
         self.run_started_at_monotonic: float | None = None
         if cfg.resume:
             self.current_step = self._load_resume()
+
+    def _resolved_dynamics_action_dim(self) -> int:
+        """Return the action dimension implied by the selected dataset format."""
+
+        if self.cfg.dataset_format == "lerobot_aloha_sim_transfer_cube_scripted":
+            return ALOHA_SIM_TRANSFER_CUBE_SCRIPTED_ACTION_DIM
+        if self.cfg.dataset_format == "lerobot_so101_base_sim_pickplace":
+            return SO101_BASE_SIM_PICKPLACE_ACTION_DIM
+        if self.cfg.dataset_format == "maniskill_replay":
+            return MANISKILL_DEFAULT_ACTION_DIM
+        return METAWORLD_ACTION_DIM
 
     def _set_seed(self, seed: int) -> None:
         """Seed Python, NumPy, and PyTorch RNGs."""
@@ -387,7 +592,13 @@ class Experiment:
 
         if self.cfg.mode not in {"ae_only", "dynamics_only"}:
             raise ValueError(f"Unsupported mode: {self.cfg.mode}")
-        if self.cfg.dataset_format not in {"interactive_world_sim", "lerobot_metaworld"}:
+        if self.cfg.dataset_format not in {
+            "interactive_world_sim",
+            "lerobot_metaworld",
+            "lerobot_aloha_sim_transfer_cube_scripted",
+            "lerobot_so101_base_sim_pickplace",
+            "maniskill_replay",
+        }:
             raise ValueError(f"Unsupported dataset format: {self.cfg.dataset_format}")
         if self.cfg.ae_backend != "wan":
             raise ValueError(
@@ -463,17 +674,30 @@ class Experiment:
             raise ValueError("dynamics_num_blocks must be positive.")
         if self.cfg.dynamics_num_heads < 1:
             raise ValueError("dynamics_num_heads must be positive.")
-        if self.cfg.dynamics_action_conditioning_mode not in {"chunk_per_frame", "global_chunk"}:
+        if self.cfg.dynamics_action_conditioning_mode != "chunk_per_frame":
             raise ValueError(
-                "dynamics_action_conditioning_mode must be 'chunk_per_frame' or 'global_chunk'."
+                "dynamics_action_conditioning_mode must be 'chunk_per_frame' for the "
+                "DreamDojo-mechanics RF DiT."
             )
+        if not self.cfg.dynamics_use_adaln_lora:
+            raise ValueError("dynamics_use_adaln_lora must be enabled for the DreamDojo-mechanics RF DiT.")
         if self.cfg.dynamics_adaln_lora_dim < 1:
             raise ValueError("dynamics_adaln_lora_dim must be positive.")
         if self.cfg.dynamics_rope_t_extrapolation_ratio <= 0.0:
             raise ValueError("dynamics_rope_t_extrapolation_ratio must be positive.")
-        if self.cfg.dynamics_validation_metric not in {"next_frame_mse", "open_rollout_frame_mse"}:
+        if self.cfg.dynamics_use_learned_temporal_embedding:
             raise ValueError(
-                "dynamics_validation_metric must be 'next_frame_mse' or 'open_rollout_frame_mse'."
+                "dynamics_use_learned_temporal_embedding is unsupported in the "
+                "DreamDojo-mechanics RF DiT."
+            )
+        if self.cfg.dynamics_validation_metric not in {
+            "next_frame_mse",
+            "open_rollout_frame_mse",
+            "open_rollout_consistency_score",
+        }:
+            raise ValueError(
+                "dynamics_validation_metric must be 'next_frame_mse', "
+                "'open_rollout_frame_mse', or 'open_rollout_consistency_score'."
             )
         if (
             self.cfg.frame_start is not None
@@ -481,8 +705,6 @@ class Experiment:
             and self.cfg.frame_end < self.cfg.frame_start
         ):
             raise ValueError("frame_end must be greater than or equal to frame_start.")
-        if self.cfg.train_all_episodes and self.cfg.mode != "ae_only":
-            raise ValueError("--train-all-episodes is only supported for mode ae_only.")
         if self.cfg.resume and (self.cfg.load_encoder_decoder or self.cfg.load_dynamics):
             raise ValueError("Do not combine --resume with --load-encoder-decoder/--load-dynamics.")
         if self.cfg.mode == "ae_only" and self.cfg.load_dynamics:
@@ -504,6 +726,34 @@ class Experiment:
                 )
             if self.cfg.metaworld_task_index is not None and self.cfg.metaworld_task_index < 0:
                 raise ValueError("metaworld_task_index must be greater than or equal to zero.")
+        if self.cfg.dataset_format == "lerobot_aloha_sim_transfer_cube_scripted":
+            if self.cfg.split not in {"train", "val"}:
+                raise ValueError("ALOHA sim transfer cube scripted only supports train/val aliases.")
+            if self.cfg.validation_split not in {"", "train", "val"}:
+                raise ValueError(
+                    "ALOHA sim transfer cube scripted only supports train/val validation aliases."
+                )
+        if self.cfg.dataset_format == "lerobot_so101_base_sim_pickplace":
+            if self.cfg.split not in {"train", "val"}:
+                raise ValueError(
+                    "SO101 base sim pickplace only supports train/val aliases."
+                )
+            if self.cfg.validation_split not in {"", "train", "val"}:
+                raise ValueError(
+                    "SO101 base sim pickplace only supports train/val validation aliases."
+                )
+        if self.cfg.dataset_format == "maniskill_replay":
+            if self.cfg.split not in {"train", "val"}:
+                raise ValueError("ManiSkill replay datasets only support train/val aliases.")
+            if self.cfg.validation_split not in {"", "train", "val"}:
+                raise ValueError(
+                    "ManiSkill replay datasets only support train/val validation aliases."
+                )
+        validation_episodes = self.cfg.resolved_validation_episodes()
+        if len(validation_episodes) < 1:
+            raise ValueError("At least one validation episode must be selected.")
+        if any(episode < 0 for episode in validation_episodes):
+            raise ValueError("validation episodes must be greater than or equal to zero.")
 
     def _validate_train_dataset(self) -> None:
         """Reject dynamics-only runs that do not contain any valid dynamics windows."""
@@ -542,6 +792,7 @@ class Experiment:
         """Build the mode-specific training dataset."""
 
         frame_layout = self.cfg.dynamics_frame_layout()
+        exclude_episodes = self._excluded_training_episodes()
         if self.cfg.dataset_format == "lerobot_metaworld":
             dataset_kwargs = {
                 "data_root": self.cfg.data_root,
@@ -558,11 +809,84 @@ class Experiment:
             }
             if self.cfg.mode == "ae_only":
                 dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
+                dataset_kwargs["exclude_episodes"] = exclude_episodes
                 return MetaWorldFrameDataset(**dataset_kwargs)
             dataset_kwargs["frame_layout"] = frame_layout
             dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
             dataset_kwargs["rollout_chunks"] = self.cfg.dynamics_self_forcing_rollout_chunks
+            dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
+            dataset_kwargs["exclude_episodes"] = exclude_episodes
             return MetaWorldTransitionDataset(**dataset_kwargs)
+        if self.cfg.dataset_format == "lerobot_aloha_sim_transfer_cube_scripted":
+            dataset_kwargs = {
+                "data_root": self.cfg.data_root,
+                "split": self.cfg.resolved_split(),
+                "episode": self.cfg.episode,
+                "frame_start": self.cfg.frame_start,
+                "frame_end": self.cfg.frame_end,
+                "resolution": self.cfg.resolution,
+                "height": self.cfg.height,
+                "width": self.cfg.width,
+                "repo_id": self.cfg.aloha_repo_id,
+                "cache_dir": self.cfg.aloha_cache_dir or None,
+            }
+            if self.cfg.mode == "ae_only":
+                dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
+                dataset_kwargs["exclude_episodes"] = exclude_episodes
+                return AlohaFrameDataset(**dataset_kwargs)
+            dataset_kwargs["frame_layout"] = frame_layout
+            dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
+            dataset_kwargs["rollout_chunks"] = self.cfg.dynamics_self_forcing_rollout_chunks
+            dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
+            dataset_kwargs["exclude_episodes"] = exclude_episodes
+            return AlohaTransitionDataset(**dataset_kwargs)
+        if self.cfg.dataset_format == "lerobot_so101_base_sim_pickplace":
+            dataset_kwargs = {
+                "data_root": self.cfg.data_root,
+                "split": self.cfg.resolved_split(),
+                "episode": self.cfg.episode,
+                "frame_start": self.cfg.frame_start,
+                "frame_end": self.cfg.frame_end,
+                "resolution": self.cfg.resolution,
+                "height": self.cfg.height,
+                "width": self.cfg.width,
+                "repo_id": SO101_BASE_SIM_PICKPLACE_DATASET_ID,
+                "image_column": SO101_BASE_SIM_PICKPLACE_IMAGE_COLUMN,
+            }
+            if self.cfg.mode == "ae_only":
+                dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
+                dataset_kwargs["exclude_episodes"] = exclude_episodes
+                return LeRobotVideoFrameDataset(**dataset_kwargs)
+            dataset_kwargs["frame_layout"] = frame_layout
+            dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
+            dataset_kwargs["rollout_chunks"] = self.cfg.dynamics_self_forcing_rollout_chunks
+            dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
+            dataset_kwargs["exclude_episodes"] = exclude_episodes
+            return LeRobotVideoTransitionDataset(**dataset_kwargs)
+        if self.cfg.dataset_format == "maniskill_replay":
+            dataset_kwargs = {
+                "data_root": self.cfg.data_root,
+                "split": self.cfg.resolved_split(),
+                "episode": self.cfg.episode,
+                "frame_start": self.cfg.frame_start,
+                "frame_end": self.cfg.frame_end,
+                "resolution": self.cfg.resolution,
+                "height": self.cfg.height,
+                "width": self.cfg.width,
+                "traj_h5": self.cfg.maniskill_traj_h5,
+                "traj_json": self.cfg.maniskill_traj_json,
+                "camera": self.cfg.maniskill_camera,
+            }
+            if self.cfg.mode == "ae_only":
+                dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
+                dataset_kwargs["exclude_episodes"] = exclude_episodes
+                return ManiSkillFrameDataset(**dataset_kwargs)
+            dataset_kwargs["frame_layout"] = frame_layout
+            dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
+            dataset_kwargs["rollout_chunks"] = self.cfg.dynamics_self_forcing_rollout_chunks
+            dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
+            dataset_kwargs["exclude_episodes"] = exclude_episodes
+            return ManiSkillTransitionDataset(**dataset_kwargs)
         dataset_kwargs = {
             "data_root": self.cfg.data_root,
             "task": self.cfg.task,
@@ -577,11 +901,23 @@ class Experiment:
         }
         if self.cfg.mode == "ae_only":
             dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
+            dataset_kwargs["exclude_episodes"] = exclude_episodes
             return FrameDataset(**dataset_kwargs)
         dataset_kwargs["frame_layout"] = frame_layout
         dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
         dataset_kwargs["rollout_chunks"] = self.cfg.dynamics_self_forcing_rollout_chunks
+        dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
+        dataset_kwargs["exclude_episodes"] = exclude_episodes
         return TransitionDataset(**dataset_kwargs)
+
+    def _excluded_training_episodes(self) -> tuple[int, ...]:
+        """Return validation episodes to exclude when all-episode training shares the same pool."""
+
+        if not self.cfg.train_all_episodes:
+            return ()
+        if self.cfg.resolved_split() != self.cfg.resolved_validation_split():
+            return ()
+        return self.cfg.resolved_validation_episodes()
 
     def _build_train_loader(self, dataset: Dataset[dict[str, Any]]) -> DataLoader[Any]:
         """Build the training dataloader for the resolved batch size."""
@@ -599,14 +935,14 @@ class Experiment:
                 )
         return DataLoader(dataset, batch_size=self.cfg.batch_size, shuffle=True, num_workers=0)
 
-    def _build_val_loader(self) -> DataLoader[Any]:
-        """Build the full-clip validation dataloader."""
+    def _build_validation_dataset_for_episode(self, episode: int) -> Dataset[dict[str, Any]]:
+        """Build one full-clip validation dataset for the requested episode."""
 
         if self.cfg.dataset_format == "lerobot_metaworld":
-            dataset = MetaWorldValidationClipDataset(
+            return MetaWorldValidationClipDataset(
                 data_root=self.cfg.data_root,
                 split=self.cfg.resolved_validation_split(),
-                episode=self.cfg.validation_episode,
+                episode=episode,
                 task_index=self.cfg.metaworld_task_index,
                 frame_start=self.cfg.frame_start,
                 frame_end=self.cfg.frame_end,
@@ -616,12 +952,51 @@ class Experiment:
                 repo_id=self.cfg.metaworld_repo_id,
                 cache_dir=self.cfg.metaworld_cache_dir or None,
             )
-            return DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
-        dataset = ValidationClipDataset(
+        if self.cfg.dataset_format == "lerobot_aloha_sim_transfer_cube_scripted":
+            return AlohaValidationClipDataset(
+                data_root=self.cfg.data_root,
+                split=self.cfg.resolved_validation_split(),
+                episode=episode,
+                frame_start=self.cfg.frame_start,
+                frame_end=self.cfg.frame_end,
+                resolution=self.cfg.resolution,
+                height=self.cfg.height,
+                width=self.cfg.width,
+                repo_id=self.cfg.aloha_repo_id,
+                cache_dir=self.cfg.aloha_cache_dir or None,
+            )
+        if self.cfg.dataset_format == "lerobot_so101_base_sim_pickplace":
+            return LeRobotVideoValidationClipDataset(
+                data_root=self.cfg.data_root,
+                split=self.cfg.resolved_validation_split(),
+                episode=episode,
+                frame_start=self.cfg.frame_start,
+                frame_end=self.cfg.frame_end,
+                resolution=self.cfg.resolution,
+                height=self.cfg.height,
+                width=self.cfg.width,
+                repo_id=SO101_BASE_SIM_PICKPLACE_DATASET_ID,
+                image_column=SO101_BASE_SIM_PICKPLACE_IMAGE_COLUMN,
+            )
+        if self.cfg.dataset_format == "maniskill_replay":
+            return ManiSkillValidationClipDataset(
+                data_root=self.cfg.data_root,
+                split=self.cfg.resolved_validation_split(),
+                episode=episode,
+                frame_start=self.cfg.frame_start,
+                frame_end=self.cfg.frame_end,
+                resolution=self.cfg.resolution,
+                height=self.cfg.height,
+                width=self.cfg.width,
+                traj_h5=self.cfg.maniskill_traj_h5,
+                traj_json=self.cfg.maniskill_traj_json,
+                camera=self.cfg.maniskill_camera,
+            )
+        return ValidationClipDataset(
             data_root=self.cfg.data_root,
             task=self.cfg.task,
             split=self.cfg.resolved_validation_split(),
-            episode=self.cfg.validation_episode,
+            episode=episode,
             camera=self.cfg.camera,
             frame_start=self.cfg.frame_start,
             frame_end=self.cfg.frame_end,
@@ -629,6 +1004,19 @@ class Experiment:
             height=self.cfg.height,
             width=self.cfg.width,
         )
+
+    def _build_val_loader(self) -> DataLoader[Any]:
+        """Build the full-clip validation dataloader."""
+
+        validation_datasets = [
+            self._build_validation_dataset_for_episode(episode)
+            for episode in self.cfg.resolved_validation_episodes()
+        ]
+        dataset: Dataset[dict[str, Any]]
+        if len(validation_datasets) == 1:
+            dataset = validation_datasets[0]
+        else:
+            dataset = ConcatDataset(validation_datasets)
         return DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
@@ -648,13 +1036,12 @@ class Experiment:
         """Return the configured or automatically probed training batch size."""
 
         max_dataset_batch = max(len(dataset), 1)
+        max_probe_batch = min(max_dataset_batch, max(int(self.cfg.batch_size), 1))
         if not self.cfg.auto_batch_size:
             return max(self.cfg.batch_size, 1)
-        if self.cfg.dataset_format == "lerobot_metaworld":
-            return max(self.cfg.batch_size, 1)
         if self.device.type != "cuda":
-            return max_dataset_batch
-        return self._probe_cuda_batch_size(dataset, max_dataset_batch)
+            return max_probe_batch
+        return self._probe_cuda_batch_size(dataset, max_probe_batch)
 
     def _probe_cuda_batch_size(
         self,
@@ -807,6 +1194,15 @@ class Experiment:
         checkpoint_config = checkpoint_dynamics.get("config")
         if not isinstance(checkpoint_config, dict):
             return
+        checkpoint_architecture_version = checkpoint_config.get("architecture_version")
+        if checkpoint_architecture_version != DREAMDOJO_DYNAMICS_ARCHITECTURE_VERSION:
+            raise ValueError(
+                "Checkpoint dynamics backbone is not load-compatible with the current "
+                f"DreamDojo-mechanics RF DiT. Expected architecture_version="
+                f"{DREAMDOJO_DYNAMICS_ARCHITECTURE_VERSION!r}, received "
+                f"{checkpoint_architecture_version!r} from {path}. Start a fresh dynamics run "
+                "or skip loading dynamics weights."
+            )
         checkpoint_max_frames = checkpoint_config.get("max_frames")
         if checkpoint_max_frames != self.model.dynamics.cfg.max_frames:
             raise ValueError(
@@ -843,19 +1239,6 @@ class Experiment:
                 f"does not match the requested action_dim={self.model.dynamics.cfg.action_dim}."
             )
         checkpoint_action_conditioning_mode = checkpoint_config.get("action_conditioning_mode")
-        checkpoint_action_input_features = None
-        model_state = checkpoint.get("model_state")
-        if isinstance(model_state, dict):
-            action_projection = model_state.get("dynamics.net.action_embedder_B_D.fc1.weight")
-            if isinstance(action_projection, torch.Tensor) and action_projection.ndim == 2:
-                checkpoint_action_input_features = int(action_projection.shape[1])
-        if checkpoint_action_conditioning_mode is None:
-            if checkpoint_action_input_features == self.model.dynamics.cfg.action_dim:
-                checkpoint_action_conditioning_mode = "chunk_per_frame"
-            elif checkpoint_action_input_features == (
-                self.model.dynamics.cfg.action_dim * self.model.dynamics.cfg.num_action_per_chunk
-            ):
-                checkpoint_action_conditioning_mode = "global_chunk"
         if checkpoint_action_conditioning_mode != self.model.dynamics.cfg.action_conditioning_mode:
             raise ValueError(
                 f"Checkpoint dynamics config action_conditioning_mode={checkpoint_action_conditioning_mode} "
@@ -879,8 +1262,9 @@ class Experiment:
                 "dynamics",
                 self.model.dynamics,
                 checkpoint["model_state"],
-                allowed_missing_keys=self._allowed_dynamics_missing_keys(),
+                allowed_missing_keys=self._allowed_dynamics_missing_keys(checkpoint),
             )
+            self._warm_start_extra_dynamics_blocks_from_checkpoint_tail(checkpoint)
 
     def _load_submodule_state(
         self,
@@ -914,34 +1298,301 @@ class Experiment:
                 f"Checkpoint has unexpected weights for {prefix}: {sorted(unexpected_keys)}."
             )
 
-    def _allowed_dynamics_missing_keys(self) -> set[str]:
-        """Return optional dynamics parameters that older checkpoints may legitimately miss."""
+    def _allowed_dynamics_missing_keys(self, checkpoint: dict[str, Any]) -> set[str]:
+        """Return optional missing dynamics keys for compatible depth-expansion warm starts."""
 
+        checkpoint_dynamics = checkpoint.get("dynamics")
+        if not isinstance(checkpoint_dynamics, dict):
+            return set()
+        checkpoint_config = checkpoint_dynamics.get("config")
+        if not isinstance(checkpoint_config, dict):
+            return set()
+        checkpoint_num_blocks = checkpoint_config.get("num_blocks")
+        if not isinstance(checkpoint_num_blocks, int):
+            return set()
+        current_num_blocks = int(self.model.dynamics.cfg.num_blocks)
+        if checkpoint_num_blocks >= current_num_blocks:
+            return set()
         allowed_missing_keys: set[str] = set()
-        if self.cfg.dynamics_use_learned_temporal_embedding:
-            allowed_missing_keys.add("net.temporal_pos_embed")
+        for key in self.model.dynamics.state_dict().keys():
+            if not key.startswith("net.blocks."):
+                continue
+            block_index_text = key.split(".", maxsplit=3)[2]
+            if not block_index_text.isdigit():
+                continue
+            if int(block_index_text) >= checkpoint_num_blocks:
+                allowed_missing_keys.add(key)
         return allowed_missing_keys
+
+    def _warm_start_extra_dynamics_blocks_from_checkpoint_tail(
+        self,
+        checkpoint: dict[str, Any],
+    ) -> None:
+        """Seed extra tail blocks from the last compatible checkpoint block when depth increases."""
+
+        checkpoint_dynamics = checkpoint.get("dynamics")
+        if not isinstance(checkpoint_dynamics, dict):
+            return
+        checkpoint_config = checkpoint_dynamics.get("config")
+        if not isinstance(checkpoint_config, dict):
+            return
+        checkpoint_num_blocks = checkpoint_config.get("num_blocks")
+        if not isinstance(checkpoint_num_blocks, int):
+            return
+        current_blocks = self.model.dynamics.net.blocks
+        current_num_blocks = len(current_blocks)
+        if checkpoint_num_blocks < 1 or checkpoint_num_blocks >= current_num_blocks:
+            return
+        source_block = current_blocks[checkpoint_num_blocks - 1]
+        source_state = source_block.state_dict()
+        for block_index in range(checkpoint_num_blocks, current_num_blocks):
+            current_blocks[block_index].load_state_dict(source_state)
+
+    def _validation_setup_signature(self) -> dict[str, Any]:
+        """Return the current validation-domain signature used for checkpoint selection."""
+
+        return {
+            "mode": self.cfg.mode,
+            "dataset_format": self.cfg.dataset_format,
+            "validation_split": self.cfg.resolved_validation_split(),
+            "validation_episodes": self.cfg.resolved_validation_episodes(),
+            "task": self.cfg.task,
+            "metaworld_task_index": self.cfg.metaworld_task_index,
+            "metaworld_repo_id": self.cfg.metaworld_repo_id,
+            "aloha_repo_id": self.cfg.aloha_repo_id,
+            "maniskill_traj_h5": self.cfg.maniskill_traj_h5,
+            "maniskill_traj_json": self.cfg.maniskill_traj_json,
+            "camera": self.cfg.resolved_camera(),
+            "frame_start": self.cfg.frame_start,
+            "frame_end": self.cfg.frame_end,
+            "resolution": self.cfg.resolution,
+            "height": self.cfg.resolved_height(),
+            "width": self.cfg.resolved_width(),
+            "dynamics_context_frames": (
+                int(self.model.dynamics.cfg.context_frames)
+                if self.cfg.mode == "dynamics_only"
+                else None
+            ),
+            "dynamics_target_frames": (
+                int(self.model.dynamics.cfg.target_frames)
+                if self.cfg.mode == "dynamics_only"
+                else None
+            ),
+            "dynamics_validation_conditioning_frame_choices": (
+                tuple(int(value) for value in self.model.dynamics.cfg.validation_conditioning_frame_choices)
+                if self.cfg.mode == "dynamics_only"
+                else None
+            ),
+            "dynamics_open_rollout_context_frames": (
+                int(self.model.dynamics.cfg.open_rollout_context_frames)
+                if self.cfg.mode == "dynamics_only"
+                else None
+            ),
+            "dynamics_open_rollout_stride_frames": (
+                None
+                if self.cfg.mode != "dynamics_only"
+                or self.model.dynamics.cfg.open_rollout_stride_frames is None
+                else int(self.model.dynamics.cfg.open_rollout_stride_frames)
+            ),
+        }
+
+    def _validation_setup_signature_from_checkpoint(
+        self,
+        checkpoint: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return the saved validation-domain signature for one checkpoint."""
+
+        checkpoint_config = checkpoint.get("config")
+        if not isinstance(checkpoint_config, dict):
+            checkpoint_config = {}
+        dataset_format = str(checkpoint_config.get("dataset_format", "interactive_world_sim"))
+        validation_split = str(checkpoint_config.get("validation_split", ""))
+        split = str(checkpoint_config.get("split", "val"))
+        resolved_validation_split = (
+            "train"
+            if dataset_format in {
+                "lerobot_metaworld",
+                "lerobot_aloha_sim_transfer_cube_scripted",
+                "lerobot_so101_base_sim_pickplace",
+                "maniskill_replay",
+            }
+            else validation_split or split
+        )
+        checkpoint_dynamics = checkpoint.get("dynamics")
+        checkpoint_dynamics_config = (
+            checkpoint_dynamics.get("config")
+            if isinstance(checkpoint_dynamics, dict)
+            and isinstance(checkpoint_dynamics.get("config"), dict)
+            else {}
+        )
+        resolution = int(checkpoint_config.get("resolution", 128))
+        raw_height = checkpoint_config.get("height")
+        raw_width = checkpoint_config.get("width")
+        return {
+            "mode": str(checkpoint.get("mode", checkpoint_config.get("mode", self.cfg.mode))),
+            "dataset_format": dataset_format,
+            "validation_split": resolved_validation_split,
+            "validation_episodes": (
+                _normalized_optional_int_tuple(checkpoint_config.get("validation_episodes"))
+                or (int(checkpoint_config.get("validation_episode", 0)),)
+            ),
+            "task": str(checkpoint_config.get("task", "single_grasp")),
+            "metaworld_task_index": checkpoint_config.get("metaworld_task_index"),
+            "metaworld_repo_id": str(
+                checkpoint_config.get("metaworld_repo_id", METAWORLD_DATASET_ID)
+            ),
+            "aloha_repo_id": str(
+                checkpoint_config.get(
+                    "aloha_repo_id",
+                    ALOHA_SIM_TRANSFER_CUBE_SCRIPTED_DATASET_ID,
+                )
+            ),
+            "maniskill_traj_h5": str(
+                checkpoint_config.get("maniskill_traj_h5", MANISKILL_DEFAULT_TRAJ_H5)
+            ),
+            "maniskill_traj_json": str(
+                checkpoint_config.get("maniskill_traj_json", MANISKILL_DEFAULT_TRAJ_JSON)
+            ),
+            "camera": (
+                "observation.image"
+                if dataset_format == "lerobot_metaworld"
+                else (
+                    ALOHA_SIM_TRANSFER_CUBE_SCRIPTED_IMAGE_COLUMN
+                    if dataset_format == "lerobot_aloha_sim_transfer_cube_scripted"
+                    else (
+                        SO101_BASE_SIM_PICKPLACE_IMAGE_COLUMN
+                        if dataset_format == "lerobot_so101_base_sim_pickplace"
+                        else (
+                            str(checkpoint_config.get("maniskill_camera", MANISKILL_DEFAULT_CAMERA))
+                            if dataset_format == "maniskill_replay"
+                            else str(checkpoint_config.get("camera", "camera_1_color"))
+                        )
+                    )
+                )
+            ),
+            "frame_start": checkpoint_config.get("frame_start"),
+            "frame_end": checkpoint_config.get("frame_end"),
+            "resolution": resolution,
+            "height": resolution if raw_height is None else int(raw_height),
+            "width": resolution if raw_width is None else int(raw_width),
+            "dynamics_context_frames": (
+                None
+                if self.cfg.mode != "dynamics_only"
+                else int(
+                    checkpoint_dynamics_config.get(
+                        "context_frames",
+                        checkpoint_config.get(
+                            "dynamics_context_frames",
+                            DYNAMICS_FRAME_LAYOUT.context_frames,
+                        ),
+                    )
+                )
+            ),
+            "dynamics_target_frames": (
+                None
+                if self.cfg.mode != "dynamics_only"
+                else int(
+                    checkpoint_dynamics_config.get(
+                        "target_frames",
+                        checkpoint_config.get(
+                            "dynamics_target_frames",
+                            DYNAMICS_FRAME_LAYOUT.target_frames,
+                        ),
+                    )
+                )
+            ),
+            "dynamics_validation_conditioning_frame_choices": (
+                None
+                if self.cfg.mode != "dynamics_only"
+                else _normalized_optional_int_tuple(
+                    checkpoint_dynamics_config.get(
+                        "validation_conditioning_frame_choices",
+                        checkpoint_config.get("dynamics_validation_conditioning_frame_choices"),
+                    )
+                )
+            ),
+            "dynamics_open_rollout_context_frames": (
+                None
+                if self.cfg.mode != "dynamics_only"
+                else int(
+                    checkpoint_dynamics_config.get(
+                        "open_rollout_context_frames",
+                        checkpoint_config.get("dynamics_open_rollout_context_frames", 1),
+                    )
+                )
+            ),
+            "dynamics_open_rollout_stride_frames": (
+                None
+                if self.cfg.mode != "dynamics_only"
+                else checkpoint_dynamics_config.get(
+                    "open_rollout_stride_frames",
+                    checkpoint_config.get("dynamics_open_rollout_stride_frames"),
+                )
+            ),
+        }
+
+    def _resume_uses_matching_validation_setup(self, checkpoint: dict[str, Any]) -> bool:
+        """Return whether resumed validation metrics are comparable to the current run."""
+
+        return self._validation_setup_signature() == self._validation_setup_signature_from_checkpoint(
+            checkpoint
+        )
 
     def _load_resume(self) -> int:
         """Restore a previous training checkpoint and return its step."""
 
         checkpoint = load_training_checkpoint(self.cfg.resume, self.device)
         self._assert_checkpoint_backend(checkpoint, self.cfg.resume)
+        checkpoint_step = int(checkpoint["step"])
         if self.cfg.mode == "ae_only":
             self._load_submodule_state("encoder", self.model.encoder, checkpoint["model_state"])
             self._load_submodule_state("decoder", self.model.decoder, checkpoint["model_state"])
         else:
             self._assert_checkpoint_dynamics_backend(checkpoint, self.cfg.resume)
-            self.model.load_state_dict(checkpoint["model_state"], strict=True)
+            self._load_submodule_state("encoder", self.model.encoder, checkpoint["model_state"])
+            self._load_submodule_state("decoder", self.model.decoder, checkpoint["model_state"])
+            self._load_submodule_state(
+                "dynamics",
+                self.model.dynamics,
+                checkpoint["model_state"],
+                allowed_missing_keys=self._allowed_dynamics_missing_keys(checkpoint),
+            )
+            self._warm_start_extra_dynamics_blocks_from_checkpoint_tail(checkpoint)
         if checkpoint["optimizer_state"] is not None:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state"])
-        restored_best_metric = self._restore_best_metric_from_metrics()
-        self.best_metric = (
-            checkpoint.get("best_metric")
-            if restored_best_metric is None
-            else restored_best_metric
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+            except ValueError as exc:
+                if "parameter group" not in str(exc):
+                    raise
+            self._apply_resume_optimizer_overrides()
+        if checkpoint.get("scheduler_state") is not None and self.scheduler is not None:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state"])
+        restore_rng_state(checkpoint.get("rng_state"))
+        self._resume_validation_setup_matches = self._resume_uses_matching_validation_setup(
+            checkpoint
         )
-        return int(checkpoint["step"])
+        if self._resume_validation_setup_matches:
+            restored_best_metric, restored_best_step = self._restore_best_metric_record_from_metrics(
+                up_to_step=checkpoint_step
+            )
+            self.best_metric = (
+                checkpoint.get("best_metric")
+                if restored_best_metric is None
+                else restored_best_metric
+            )
+            if restored_best_metric is None or restored_best_step == checkpoint_step:
+                self._materialize_resumed_best_checkpoint(step=checkpoint_step)
+        else:
+            self.best_metric = None
+        return checkpoint_step
+
+    def _apply_resume_optimizer_overrides(self) -> None:
+        """Apply user-requested optimizer overrides after loading resume state."""
+
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = float(self.cfg.lr)
+            if "initial_lr" in param_group:
+                param_group["initial_lr"] = float(self.cfg.lr)
 
     def _record_metric_for_early_stop(
         self,
@@ -1005,24 +1656,50 @@ class Experiment:
             return self.metrics_path
         return None
 
-    def _restore_best_metric_from_metrics(self) -> float | None:
-        """Rebuild the active best metric from saved validation records."""
+    def _materialize_resumed_best_checkpoint(self, step: int) -> None:
+        """Write the inherited checkpoint into this run directory when it is still the active best."""
+
+        if not self.cfg.resume:
+            return
+        best_path = self.checkpoints_dir / "best.pt"
+        if best_path.exists():
+            return
+        self._save_checkpoint(best_path, step)
+
+    def _restore_best_metric_record_from_metrics(
+        self,
+        up_to_step: int | None = None,
+    ) -> tuple[float | None, int | None]:
+        """Rebuild the active best metric and its step from saved validation records."""
 
         restore_path = self._restore_metrics_path()
         if restore_path is None:
-            return None
+            return None, None
         metric_name = self._validation_metric_name()
         best_metric: float | None = None
+        best_step: int | None = None
         for line in restore_path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             record = json.loads(line)
+            record_step = int(record.get("step", 0))
+            if up_to_step is not None and record_step > up_to_step:
+                break
             validation = record.get("validation")
-            if not isinstance(validation, dict) or metric_name not in validation:
+            if not isinstance(validation, dict):
                 continue
-            metric_value = float(validation[metric_name])
+            metric_value = validation_metric_value_from_stats(metric_name, validation)
+            if metric_value is None:
+                continue
             if best_metric is None or metric_value < best_metric:
                 best_metric = metric_value
+                best_step = record_step
+        return best_metric, best_step
+
+    def _restore_best_metric_from_metrics(self, up_to_step: int | None = None) -> float | None:
+        """Rebuild the active best metric from saved validation records."""
+
+        best_metric, _ = self._restore_best_metric_record_from_metrics(up_to_step=up_to_step)
         return best_metric
 
     def _extract_early_stop_metric_value(self, record: dict[str, Any]) -> float | None:
@@ -1032,14 +1709,14 @@ class Experiment:
         if not isinstance(validation, dict):
             return None
         metric_name = self._validation_metric_name()
-        if metric_name not in validation:
-            return None
-        return float(validation[metric_name])
+        return validation_metric_value_from_stats(metric_name, validation)
 
     def _restore_early_stop_state(self, step: int) -> None:
         """Replay prior validation metrics to rebuild plateau state for resumes."""
 
         if not self._early_stop_enabled() or step <= 0:
+            return
+        if self.cfg.resume and not self._resume_validation_setup_matches:
             return
         restore_path = self._restore_metrics_path()
         if restore_path is None:
@@ -1620,6 +2297,7 @@ class Experiment:
         rollout_steps = int(frames.shape[0]) - context_frames
         seed_frames = frames[:context_frames].unsqueeze(0)
         rollout_actions = None if actions is None else actions.unsqueeze(0)
+        initial_stride_frames = self.model.resolved_rollout_stride_frames(context_frames)
         predicted = self.model.rollout(
             seed_frames,
             steps=rollout_steps,
@@ -1630,6 +2308,9 @@ class Experiment:
         target_frames = frames[context_frames:]
         predicted_motion_l1 = 0.0
         ground_truth_motion_l1 = 0.0
+        frame_mse = float(F.mse_loss(predicted_targets, target_frames).item())
+        frame_l1 = float(F.l1_loss(predicted_targets, target_frames).item())
+        motion_ratio: float | None = None
         if predicted_targets.shape[0] > 1:
             predicted_motion_l1 = float(
                 torch.abs(predicted_targets[1:] - predicted_targets[:-1]).mean().item()
@@ -1637,6 +2318,7 @@ class Experiment:
             ground_truth_motion_l1 = float(
                 torch.abs(target_frames[1:] - target_frames[:-1]).mean().item()
             )
+            motion_ratio = compute_motion_ratio(predicted_motion_l1, ground_truth_motion_l1)
         stats = {
             "open_rollout_seed_frames": int(context_frames),
             "open_rollout_loss_frames": int(rollout_steps),
@@ -1645,18 +2327,22 @@ class Experiment:
                 if self.model.dynamics.cfg.open_rollout_stride_frames is not None
                 else None
             ),
+            "open_rollout_initial_stride_frames": int(initial_stride_frames),
             "open_rollout_decoded_frame_count": int(predicted.shape[0]),
             "open_rollout_predicted_frame_count": int(predicted.shape[0]),
-            "open_rollout_frame_mse": float(F.mse_loss(predicted_targets, target_frames).item()),
-            "open_rollout_frame_l1": float(F.l1_loss(predicted_targets, target_frames).item()),
+            "open_rollout_frame_mse": frame_mse,
+            "open_rollout_frame_l1": frame_l1,
+            "open_rollout_consistency_score": open_rollout_consistency_score(
+                frame_mse,
+                motion_ratio,
+            ),
             "open_rollout_validation_style": "open_rollout_autoregressive",
         }
         if predicted_targets.shape[0] > 1:
             stats["open_rollout_predicted_target_motion_l1"] = predicted_motion_l1
             stats["open_rollout_ground_truth_target_motion_l1"] = ground_truth_motion_l1
-            stats["open_rollout_target_motion_ratio"] = (
-                predicted_motion_l1 / max(ground_truth_motion_l1, 1e-12)
-            )
+            stats["open_rollout_target_motion_ratio"] = motion_ratio
+            stats["open_rollout_motion_log_error"] = motion_ratio_log_error(motion_ratio)
         return predicted.detach().cpu(), stats
 
     def _suffix_validation_stats(
@@ -1675,15 +2361,17 @@ class Experiment:
             if key not in excluded
         }
 
-    @torch.no_grad()
-    def _validate(self, step: int) -> dict[str, Any]:
-        """Run validation, export artifacts, and update the best checkpoint."""
+    def _validate_batch(
+        self,
+        batch: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, int, dict[str, Any]]:
+        """Run validation for one batch and return frames, preview, context, and stats."""
 
-        self.model.eval()
-        batch = self._move_batch_to_device(next(iter(self.val_loader)))
         frames = batch["frames"][0]
         if self.cfg.mode == "ae_only":
-            reconstructed, recon_loss, recon_mse, recon_l1, edge_l1, kl_loss, ae_loss = self._validate_ae_only_frames(frames)
+            reconstructed, recon_loss, recon_mse, recon_l1, edge_l1, kl_loss, ae_loss = (
+                self._validate_ae_only_frames(frames)
+            )
             stats = {
                 "episode": int(batch["episode_idx"].reshape(-1)[0].item()),
                 "input_frame_count": int(frames.shape[0]),
@@ -1698,96 +2386,183 @@ class Experiment:
                 "ae_backend": self.cfg.ae_backend,
                 "dynamics_backend": self.model.dynamics_backend,
             }
-            preview_frames = reconstructed
-            context_frames = 0
-        else:
-            clip_actions = batch.get("actions")
-            validation_context_choices = self.model.dynamics.cfg.validation_conditioning_frame_choices
-            primary_context_frames = validation_context_choices[0]
-            preview_frames, dynamics_stats = self._validate_dynamics_one_step(
-                frames,
-                actions=None if clip_actions is None else clip_actions[0],
-                num_conditional_frames=primary_context_frames,
-            )
-            auxiliary_stats = {}
-            for validation_context_frames in validation_context_choices[1:]:
-                _, extra_context_stats = self._validate_dynamics_one_step(
-                    frames,
-                    actions=None if clip_actions is None else clip_actions[0],
-                    num_conditional_frames=validation_context_frames,
-                )
-                suffix = (
-                    f"{validation_context_frames}"
-                    f"to{self.model.dynamics.cfg.max_frames - validation_context_frames}"
-                )
-                auxiliary_stats.update(
-                    self._suffix_validation_stats(
-                        extra_context_stats,
-                        suffix,
-                        excluded_keys=frozenset(
-                            {"input_frame_count", "decoded_frame_count", "predicted_frame_count"}
-                        ),
-                    )
-                )
-                auxiliary_stats[f"validation_style_{suffix}"] = extra_context_stats["validation_style"]
-            _, open_rollout_stats = self._validate_dynamics_open_rollout(
-                frames,
-                actions=None if clip_actions is None else clip_actions[0],
-            )
-            stats = {
-                "episode": int(batch["episode_idx"].reshape(-1)[0].item()),
-                **dynamics_stats,
-                **self._suffix_validation_stats(dynamics_stats, f"{primary_context_frames}to{self.model.dynamics.cfg.max_frames - primary_context_frames}"),
-                **auxiliary_stats,
-                **open_rollout_stats,
-                "conditioning_frame_choices": list(self.model.dynamics.cfg.conditioning_frame_choices),
-                "conditioning_frame_probabilities": (
-                    None
-                    if self.model.dynamics.cfg.conditioning_frame_probabilities is None
-                    else list(self.model.dynamics.cfg.conditioning_frame_probabilities)
-                ),
-                "validation_conditioning_frame_choices": list(
-                    self.model.dynamics.cfg.validation_conditioning_frame_choices
-                ),
-                "open_rollout_context_frames": int(self.model.dynamics.cfg.open_rollout_context_frames),
-                "open_rollout_stride_frames": (
-                    None
-                    if self.model.dynamics.cfg.open_rollout_stride_frames is None
-                    else int(self.model.dynamics.cfg.open_rollout_stride_frames)
-                ),
-                "mode": self.cfg.mode,
-                "ae_backend": self.cfg.ae_backend,
-                "dynamics_backend": self.model.dynamics_backend,
-            }
-            context_frames = primary_context_frames
+            return frames, reconstructed, 0, stats
 
-        output_dir = self.run_dir / "samples" / f"step_{step:06d}"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        grid_path = output_dir / "episode_0_grid.png"
-        video_path = output_dir / "episode_0.mp4"
-        stats_path = output_dir / "episode_0_stats.json"
-        build_side_by_side_grid(
-            original=frames.detach().cpu(),
-            reconstructed=preview_frames.detach().cpu(),
-            max_frames=int(frames.shape[0]),
-            context_frames=context_frames,
-        ).save(grid_path)
-        exported_frame_count = write_side_by_side_mp4(
-            original=frames.detach().cpu(),
-            reconstructed=preview_frames.detach().cpu(),
-            output_path=video_path,
-            duration_ms=120,
-            context_frames=context_frames,
+        clip_actions = batch.get("actions")
+        validation_context_choices = self.model.dynamics.cfg.validation_conditioning_frame_choices
+        primary_context_frames = validation_context_choices[0]
+        preview_frames, dynamics_stats = self._validate_dynamics_one_step(
+            frames,
+            actions=None if clip_actions is None else clip_actions[0],
+            num_conditional_frames=primary_context_frames,
         )
-        stats["checkpoint"] = str(self.checkpoints_dir / "last.pt")
-        stats["elapsed_run_seconds"] = self._elapsed_run_seconds()
-        stats["exported_video_frame_count"] = int(exported_frame_count)
-        save_json(stats_path, stats)
+        auxiliary_stats = {}
+        for validation_context_frames in validation_context_choices[1:]:
+            _, extra_context_stats = self._validate_dynamics_one_step(
+                frames,
+                actions=None if clip_actions is None else clip_actions[0],
+                num_conditional_frames=validation_context_frames,
+            )
+            suffix = (
+                f"{validation_context_frames}"
+                f"to{self.model.dynamics.cfg.max_frames - validation_context_frames}"
+            )
+            auxiliary_stats.update(
+                self._suffix_validation_stats(
+                    extra_context_stats,
+                    suffix,
+                    excluded_keys=frozenset(
+                        {"input_frame_count", "decoded_frame_count", "predicted_frame_count"}
+                    ),
+                )
+            )
+            auxiliary_stats[f"validation_style_{suffix}"] = extra_context_stats["validation_style"]
+        _, open_rollout_stats = self._validate_dynamics_open_rollout(
+            frames,
+            actions=None if clip_actions is None else clip_actions[0],
+        )
+        stats = {
+            "episode": int(batch["episode_idx"].reshape(-1)[0].item()),
+            **dynamics_stats,
+            **self._suffix_validation_stats(
+                dynamics_stats,
+                f"{primary_context_frames}to{self.model.dynamics.cfg.max_frames - primary_context_frames}",
+            ),
+            **auxiliary_stats,
+            **open_rollout_stats,
+            "conditioning_frame_choices": list(self.model.dynamics.cfg.conditioning_frame_choices),
+            "conditioning_frame_probabilities": (
+                None
+                if self.model.dynamics.cfg.conditioning_frame_probabilities is None
+                else list(self.model.dynamics.cfg.conditioning_frame_probabilities)
+            ),
+            "validation_conditioning_frame_choices": list(
+                self.model.dynamics.cfg.validation_conditioning_frame_choices
+            ),
+            "open_rollout_context_frames": int(self.model.dynamics.cfg.open_rollout_context_frames),
+            "open_rollout_stride_frames": (
+                None
+                if self.model.dynamics.cfg.open_rollout_stride_frames is None
+                else int(self.model.dynamics.cfg.open_rollout_stride_frames)
+            ),
+            "mode": self.cfg.mode,
+            "ae_backend": self.cfg.ae_backend,
+            "dynamics_backend": self.model.dynamics_backend,
+        }
+        teacher_forced_frame_metrics = teacher_forced_next_frame_mse_stats(stats)
+        if teacher_forced_frame_metrics:
+            stats["worst_case_next_frame_mse"] = max(teacher_forced_frame_metrics.values())
+        return frames, preview_frames, primary_context_frames, stats
+
+    def _aggregate_validation_stats(
+        self,
+        per_episode_stats: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Aggregate validation stats across multiple clips by averaging numeric fields."""
+
+        if not per_episode_stats:
+            raise ValueError("Expected at least one validation stats record to aggregate.")
+        if len(per_episode_stats) == 1:
+            return dict(per_episode_stats[0])
+        aggregated: dict[str, Any] = {
+            "validation_episode_count": len(per_episode_stats),
+            "validation_episodes": [
+                int(stats["episode"])
+                for stats in per_episode_stats
+                if isinstance(stats.get("episode"), Integral)
+            ],
+        }
+        all_keys = sorted({key for stats in per_episode_stats for key in stats})
+        for key in all_keys:
+            values = [stats[key] for stats in per_episode_stats if key in stats]
+            if len(values) != len(per_episode_stats):
+                continue
+            if key == "episode":
+                continue
+            if all(isinstance(value, Real) and not isinstance(value, bool) for value in values):
+                if all(isinstance(value, Integral) for value in values) and len(set(values)) == 1:
+                    aggregated[key] = int(values[0])
+                else:
+                    aggregated[key] = float(
+                        sum(float(value) for value in values) / len(values)
+                    )
+                continue
+            first_value = values[0]
+            if all(value == first_value for value in values):
+                aggregated[key] = first_value
+        return aggregated
+
+    @torch.no_grad()
+    def _validate(self, step: int) -> dict[str, Any]:
+        """Run validation, export artifacts, and update the best checkpoint."""
+
+        self.model.eval()
+        validation_results: list[dict[str, Any]] = []
+        for raw_batch in self.val_loader:
+            batch = self._move_batch_to_device(raw_batch)
+            frames, preview_frames, context_frames, stats = self._validate_batch(batch)
+            validation_results.append(
+                {
+                    "frames": frames.detach().cpu(),
+                    "preview_frames": preview_frames.detach().cpu(),
+                    "context_frames": int(context_frames),
+                    "stats": stats,
+                }
+            )
+        stats = self._aggregate_validation_stats([result["stats"] for result in validation_results])
         metric_name = self._validation_metric_name()
         metric_value = float(stats[metric_name])
-        if self.best_metric is None or metric_value < self.best_metric:
+        is_best_checkpoint = self.best_metric is None or metric_value < self.best_metric
+        if is_best_checkpoint:
             self.best_metric = metric_value
             self._save_checkpoint(self.checkpoints_dir / "best.pt", step)
+        output_dir = self.run_dir / "samples" / f"step_{step:06d}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        exported_frame_counts: list[int] = []
+        for result in validation_results:
+            episode_value = result["stats"].get("episode", 0)
+            episode_label = (
+                int(episode_value)
+                if isinstance(episode_value, Integral)
+                else len(exported_frame_counts)
+            )
+            grid_path = output_dir / f"episode_{episode_label}_grid.png"
+            video_path = output_dir / f"episode_{episode_label}.mp4"
+            stats_path = output_dir / f"episode_{episode_label}_stats.json"
+            build_side_by_side_grid(
+                original=result["frames"],
+                reconstructed=result["preview_frames"],
+                max_frames=int(result["frames"].shape[0]),
+                context_frames=int(result["context_frames"]),
+            ).save(grid_path)
+            exported_frame_count = write_side_by_side_mp4(
+                original=result["frames"],
+                reconstructed=result["preview_frames"],
+                output_path=video_path,
+                duration_ms=120,
+                context_frames=int(result["context_frames"]),
+            )
+            exported_frame_counts.append(int(exported_frame_count))
+            per_episode_stats = dict(result["stats"])
+            per_episode_stats["checkpoint"] = str(self.checkpoints_dir / "last.pt")
+            per_episode_stats["best_checkpoint"] = str(self.checkpoints_dir / "best.pt")
+            per_episode_stats["is_best_checkpoint"] = bool(is_best_checkpoint)
+            per_episode_stats["elapsed_run_seconds"] = self._elapsed_run_seconds()
+            per_episode_stats["exported_video_frame_count"] = int(exported_frame_count)
+            save_json(stats_path, per_episode_stats)
+        stats["checkpoint"] = str(self.checkpoints_dir / "last.pt")
+        stats["best_checkpoint"] = str(self.checkpoints_dir / "best.pt")
+        stats["is_best_checkpoint"] = bool(is_best_checkpoint)
+        stats["elapsed_run_seconds"] = self._elapsed_run_seconds()
+        if len(exported_frame_counts) == 1:
+            stats["exported_video_frame_count"] = int(exported_frame_counts[0])
+        else:
+            stats["exported_video_frame_count"] = float(
+                sum(exported_frame_counts) / len(exported_frame_counts)
+            )
+            stats["validation_episode_count"] = len(validation_results)
+            summary_path = output_dir / "validation_summary.json"
+            save_json(summary_path, stats)
         append_jsonl(self.metrics_path, {"step": step, "validation": stats})
         return stats
 
