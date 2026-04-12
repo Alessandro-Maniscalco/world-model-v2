@@ -262,8 +262,8 @@ def test_restore_rng_state_normalizes_torch_and_cuda_rng_tensors(
     assert cuda_states[0].tolist() == list(range(4))
 
 
-def test_experiment_auto_batch_size_uses_requested_ceiling_for_metaworld() -> None:
-    """MetaWorld auto-batch probing should honor the requested batch-size ceiling."""
+def test_experiment_auto_batch_size_uses_requested_batch_as_cuda_probe_start() -> None:
+    """CUDA auto-batch probing should start from the requested batch size."""
 
     class DummyDataset:
         """Expose a fixed dataset length for batch-size resolution tests."""
@@ -283,9 +283,14 @@ def test_experiment_auto_batch_size_uses_requested_ceiling_for_metaworld() -> No
     experiment.device = torch.device("cuda")
     captured: dict[str, int] = {}
 
-    def fake_probe(dataset: DummyDataset, max_batch_size: int) -> int:
-        """Capture the probe ceiling and return a synthetic fit result."""
+    def fake_probe(
+        dataset: DummyDataset,
+        requested_batch_size: int,
+        max_batch_size: int,
+    ) -> int:
+        """Capture the probe inputs and return a synthetic fit result."""
 
+        captured["requested_batch_size"] = requested_batch_size
         captured["max_batch_size"] = max_batch_size
         return 17
 
@@ -294,7 +299,48 @@ def test_experiment_auto_batch_size_uses_requested_ceiling_for_metaworld() -> No
     resolved_batch_size = experiment._resolve_train_batch_size(DummyDataset())
 
     assert resolved_batch_size == 17
-    assert captured["max_batch_size"] == 64
+    assert captured["requested_batch_size"] == 64
+    assert captured["max_batch_size"] == 100
+
+
+def test_experiment_probe_cuda_batch_size_grows_beyond_requested_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CUDA auto-batch probing should keep growing when larger batches fit."""
+
+    class DummyDataset:
+        """Expose a fixed dataset length for auto-batch probing tests."""
+
+        def __len__(self) -> int:
+            """Return the synthetic dataset length."""
+
+            return 100
+
+    experiment = object.__new__(Experiment)
+    observed_batch_sizes: list[int] = []
+
+    def fake_batch_size_fits(dataset: DummyDataset, batch_size: int) -> bool:
+        """Pretend every batch up to forty-eight samples fits in memory."""
+
+        observed_batch_sizes.append(batch_size)
+        return batch_size <= 48
+
+    experiment._batch_size_fits = fake_batch_size_fits  # type: ignore[method-assign]
+    monkeypatch.setattr(torch, "get_rng_state", lambda: torch.arange(4, dtype=torch.uint8))
+    monkeypatch.setattr(torch, "set_rng_state", lambda _state: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    resolved_batch_size = experiment._probe_cuda_batch_size(
+        DummyDataset(),
+        requested_batch_size=8,
+        max_batch_size=100,
+    )
+
+    assert resolved_batch_size == 48
+    assert 16 in observed_batch_sizes
+    assert 32 in observed_batch_sizes
+    assert 48 in observed_batch_sizes
+    assert 64 in observed_batch_sizes
 
 
 def test_experiment_rejects_negative_self_forcing_weight(
@@ -1470,6 +1516,34 @@ def test_experiment_dynamics_only_can_train_all_episodes_with_separate_validatio
     assert validation_batch["frames"].shape[1] == 130
 
 
+def test_experiment_ae_motion_loss_requests_neighbor_frames(
+    fake_lerobot_so101_base_sim_pickplace_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Motion-weighted AE runs should receive neighboring GT frames in each training batch."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            dataset_format="lerobot_so101_base_sim_pickplace",
+            data_root=str(fake_lerobot_so101_base_sim_pickplace_root),
+            split="train",
+            train_all_episodes=True,
+            validation_split="val",
+            validation_episode=0,
+            batch_size=2,
+            resolution=8,
+            recon_motion_weight=0.5,
+            output_dir=str(tmp_path / "outputs"),
+            run_name="lerobot_so101_motion_ae",
+            device="cpu",
+        )
+    )
+    train_batch = next(iter(experiment.train_loader))
+    assert train_batch["prev_frame"].shape == (2, 3, 8, 8)
+    assert train_batch["next_frame"].shape == (2, 3, 8, 8)
+
+
 def test_experiment_supports_metaworld_dynamics_training_across_all_episodes(
     fake_metaworld_dataset_root: Path,
     saved_world_model_ae_checkpoint: Path,
@@ -1790,6 +1864,57 @@ def test_reconstruction_loss_terms_capture_edge_changes() -> None:
     assert float(terms["recon_l1"].item()) > 0.0
     assert float(terms["edge_l1"].item()) > 0.0
     assert float(terms["recon_loss"].item()) > 0.0
+
+
+def test_reconstruction_loss_terms_upweight_motion_regions() -> None:
+    """Motion loss should focus reconstruction pressure on pixels that move across neighbors."""
+
+    target = torch.zeros(1, 3, 8, 8)
+    target[:, :, 3:5, 3:5] = 1.0
+    prev_frame = torch.zeros_like(target)
+    prev_frame[:, :, 3:5, 1:3] = 1.0
+    next_frame = torch.zeros_like(target)
+    next_frame[:, :, 3:5, 5:7] = 1.0
+    predicted = torch.zeros_like(target)
+
+    base_terms = reconstruction_loss_terms(
+        predicted,
+        target,
+        mse_weight=1.0,
+        l1_weight=1.0,
+        edge_weight=0.0,
+    )
+    motion_terms = reconstruction_loss_terms(
+        predicted,
+        target,
+        mse_weight=1.0,
+        l1_weight=1.0,
+        edge_weight=0.0,
+        motion_weight=1.0,
+        motion_threshold=0.05,
+        motion_dilation_kernel_size=3,
+        prev_frame=prev_frame,
+        next_frame=next_frame,
+    )
+
+    assert float(motion_terms["motion_l1"].item()) > 0.0
+    assert float(motion_terms["motion_mask_fraction"].item()) > 0.0
+    assert float(motion_terms["recon_loss"].item()) > float(base_terms["recon_loss"].item())
+
+
+def test_reconstruction_loss_terms_require_motion_context_when_enabled() -> None:
+    """Motion-weighted loss should fail fast if neighboring GT frames are unavailable."""
+
+    target = torch.zeros(1, 3, 4, 4)
+    with pytest.raises(ValueError, match="prev_frame and next_frame"):
+        reconstruction_loss_terms(
+            target,
+            target,
+            mse_weight=1.0,
+            l1_weight=0.0,
+            edge_weight=0.0,
+            motion_weight=1.0,
+        )
 
 
 def test_experiment_can_partial_load_encoder_decoder(

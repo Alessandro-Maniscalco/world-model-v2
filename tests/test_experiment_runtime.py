@@ -41,7 +41,17 @@ def test_wan_ae_only_training_step_reports_kl_terms(
     )
     batch = experiment._move_batch_to_device(next(iter(experiment.train_loader)))
     metrics = experiment._ae_only_training_step(batch)
-    assert set(metrics) == {"loss", "recon_loss", "recon_mse", "recon_l1", "edge_l1", "kl_loss", "ae_loss"}
+    assert set(metrics) == {
+        "loss",
+        "recon_loss",
+        "recon_mse",
+        "recon_l1",
+        "edge_l1",
+        "motion_l1",
+        "motion_mask_fraction",
+        "kl_loss",
+        "ae_loss",
+    }
     assert float(metrics["kl_loss"]) >= 0.0
     assert torch.isclose(metrics["loss"], metrics["ae_loss"])
 

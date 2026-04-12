@@ -65,9 +65,14 @@ def test_run_parse_args_uses_expected_defaults() -> None:
     assert config.recon_mse_weight == 1.0
     assert config.recon_l1_weight == 0.0
     assert config.recon_edge_weight == 0.0
+    assert config.recon_motion_weight == 0.0
+    assert config.recon_motion_threshold == 0.02
+    assert config.recon_motion_dilation_kernel_size == 5
     assert config.batch_size == 32
     assert config.auto_batch_size is False
     assert config.lr == 1e-4
+    assert config.validation_interval == 250
+    assert config.checkpoint_interval == 250
     assert config.early_stop_window_size == 1
     assert config.early_stop_patience_windows == 5
     assert config.early_stop_min_delta == 1e-10
@@ -239,12 +244,21 @@ def test_run_build_config_preserves_reconstruction_loss_flags() -> None:
             "1.0",
             "--recon-edge-weight",
             "0.5",
+            "--recon-motion-weight",
+            "0.75",
+            "--recon-motion-threshold",
+            "0.03",
+            "--recon-motion-dilation-kernel-size",
+            "7",
         ]
     )
     config = build_config(args)
     assert config.recon_mse_weight == 0.25
     assert config.recon_l1_weight == 1.0
     assert config.recon_edge_weight == 0.5
+    assert config.recon_motion_weight == 0.75
+    assert config.recon_motion_threshold == 0.03
+    assert config.recon_motion_dilation_kernel_size == 7
 
 
 def test_run_build_config_preserves_explicit_frame_bounds() -> None:

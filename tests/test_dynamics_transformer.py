@@ -17,6 +17,7 @@ def build_dynamics(
     context_frames: int = DYNAMICS_FRAME_LAYOUT.context_frames,
     target_frames: int = DYNAMICS_FRAME_LAYOUT.target_frames,
     conditional_frame_sigma: float = 0.0,
+    dynamics_video_condition_dropout: float = 0.0,
     conditioning_frame_choices: tuple[int, ...] | None = None,
     conditioning_frame_probabilities: tuple[float, ...] | None = None,
     validation_conditioning_frame_choices: tuple[int, ...] | None = None,
@@ -54,6 +55,7 @@ def build_dynamics(
             use_adaln_lora=use_adaln_lora,
             use_learned_temporal_embedding=use_learned_temporal_embedding,
             conditional_frame_sigma=conditional_frame_sigma,
+            dynamics_video_condition_dropout=dynamics_video_condition_dropout,
             dynamics_infer_steps=4,
             dynamics_train_timesteps=32,
             dynamics_rf_shift=5.0,
@@ -239,6 +241,16 @@ def test_make_zero_actions_matches_transition_chunk_shape() -> None:
     assert torch.count_nonzero(actions) == 0
 
 
+def test_action_embedders_match_dreamdojo_hidden_width() -> None:
+    """Both DreamDojo action embedders should use the same `4x model_channels` hidden width."""
+
+    dynamics = build_dynamics()
+    expected_hidden_features = dynamics.cfg.model_channels * 4
+
+    assert dynamics.net.action_embedder_B_D.hidden_features == expected_hidden_features
+    assert dynamics.net.action_embedder_B_3D.hidden_features == expected_hidden_features
+
+
 def test_prepare_training_inputs_respects_conditioning_frame_probabilities() -> None:
     """Sampling conditioning lengths should honor explicit per-choice probabilities."""
 
@@ -402,6 +414,73 @@ def test_action_chunk_conditioning_aligns_actions_to_future_frames(
     assert not torch.allclose(zero_embedding[:, 1], action_embedding[:, 1])
 
 
+def test_action_chunk_conditioning_aligns_actions_in_1_to_1_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 1->1 layout should keep the context frame action-free and apply actions to frame 1."""
+
+    dynamics = build_dynamics(
+        context_frames=1,
+        target_frames=1,
+        conditioning_frame_choices=(1,),
+        conditioning_frame_probabilities=(1.0,),
+        validation_conditioning_frame_choices=(1,),
+        open_rollout_context_frames=1,
+    )
+    clean_latent_video = torch.randn(1, 4, dynamics.cfg.max_frames, 8, 8)
+    timesteps = torch.full((1, dynamics.cfg.max_frames), 9.0)
+    condition_mask = dynamics.make_condition_mask(
+        clean_latent_video,
+        num_conditional_frames=1,
+    )
+    captured: list[torch.Tensor] = []
+    original_forward = dynamics.net.blocks[0].forward
+
+    def capture_forward(
+        self: object,
+        x: torch.Tensor,
+        timestep_embedding: torch.Tensor,
+        rope_emb: torch.Tensor,
+        adaln_lora: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Capture the timestep embedding so the 1->1 action alignment can be asserted."""
+
+        captured.append(timestep_embedding.detach().clone())
+        return original_forward(x, timestep_embedding, rope_emb, adaln_lora=adaln_lora)
+
+    monkeypatch.setattr(
+        dynamics.net.blocks[0],
+        "forward",
+        capture_forward.__get__(dynamics.net.blocks[0], type(dynamics.net.blocks[0])),
+    )
+    zero_actions = dynamics.make_zero_actions(
+        batch_size=1,
+        device=clean_latent_video.device,
+        dtype=clean_latent_video.dtype,
+    )
+    first_transition_only = zero_actions.clone()
+    first_transition_only[:, 0, :] = 1.0
+    dynamics(
+        noisy_latent_video=clean_latent_video,
+        timesteps=timesteps,
+        condition_mask=condition_mask,
+        actions=zero_actions,
+        conditioning_latent_video=clean_latent_video,
+    )
+    dynamics(
+        noisy_latent_video=clean_latent_video,
+        timesteps=timesteps,
+        condition_mask=condition_mask,
+        actions=first_transition_only,
+        conditioning_latent_video=clean_latent_video,
+    )
+
+    assert len(captured) == 2
+    zero_embedding, action_embedding = captured
+    assert torch.allclose(zero_embedding[:, 0], action_embedding[:, 0])
+    assert not torch.allclose(zero_embedding[:, 1], action_embedding[:, 1])
+
+
 def test_zero_init_action_embedder_starts_as_noop() -> None:
     """Zero-init action embedders should ignore actions until training updates them."""
 
@@ -528,6 +607,46 @@ def test_forward_zeroes_conditioned_input_when_video_condition_is_dropped(
         conditioning_latent_video=conditioning_latent_video,
         use_video_condition=False,
     )
+    assert torch.count_nonzero(captured["x"][:, :, : dynamics.cfg.context_frames]) == 0
+
+
+def test_forward_samples_video_condition_dropout_when_unspecified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unspecified `use_video_condition` should honor the configured dropout rate."""
+
+    dynamics = build_dynamics(dynamics_video_condition_dropout=1.0)
+    conditioning_latent_video = torch.randn(1, 4, dynamics.cfg.max_frames, 8, 8)
+    noisy_latent_video = torch.randn_like(conditioning_latent_video)
+    timesteps = torch.full((1, dynamics.cfg.max_frames), 12.0)
+    condition_mask = dynamics.make_condition_mask(
+        conditioning_latent_video,
+        num_conditional_frames=dynamics.cfg.context_frames,
+    )
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_forward(
+        *,
+        x_B_C_T_H_W: torch.Tensor,
+        timesteps_B_T: torch.Tensor,
+        condition_video_input_mask_B_C_T_H_W: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Capture the DiT input after the sampled conditioning-dropout gate."""
+
+        del timesteps_B_T, condition_video_input_mask_B_C_T_H_W, action
+        captured["x"] = x_B_C_T_H_W.detach().clone()
+        return torch.zeros_like(x_B_C_T_H_W)
+
+    monkeypatch.setattr(dynamics.net, "forward", fake_forward)
+    dynamics(
+        noisy_latent_video=noisy_latent_video,
+        timesteps=timesteps,
+        condition_mask=condition_mask,
+        actions=None,
+        conditioning_latent_video=conditioning_latent_video,
+    )
+
     assert torch.count_nonzero(captured["x"][:, :, : dynamics.cfg.context_frames]) == 0
 
 

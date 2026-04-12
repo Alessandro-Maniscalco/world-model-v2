@@ -77,7 +77,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--latent-channels", type=int, default=16)
     parser.add_argument("--hidden-channels", type=int, default=64)
-    parser.add_argument("--dynamics-infer-steps", type=int, default=16)
+    parser.add_argument("--dynamics-infer-steps", type=int, default=35)
     parser.add_argument("--dynamics-train-timesteps", type=int, default=1000)
     parser.add_argument("--dynamics-rf-shift", type=float, default=5.0)
     parser.add_argument("--conditional-frame-timestep", type=float, default=-1.0)
@@ -145,12 +145,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--recon-mse-weight", type=float, default=1.0)
     parser.add_argument("--recon-l1-weight", type=float, default=0.0)
     parser.add_argument("--recon-edge-weight", type=float, default=0.0)
+    parser.add_argument("--recon-motion-weight", type=float, default=0.0)
+    parser.add_argument("--recon-motion-threshold", type=float, default=0.02)
+    parser.add_argument("--recon-motion-dilation-kernel-size", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--auto-batch-size", action="store_true")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max-steps", type=int, default=3000)
-    parser.add_argument("--validation-interval", type=int, default=100)
-    parser.add_argument("--checkpoint-interval", type=int, default=100)
+    parser.add_argument("--validation-interval", type=int, default=250)
+    parser.add_argument("--checkpoint-interval", type=int, default=250)
     parser.add_argument("--early-stop-window-size", type=int, default=1)
     parser.add_argument("--early-stop-patience-windows", type=int, default=5)
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-10)
@@ -239,6 +242,9 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         recon_mse_weight=args.recon_mse_weight,
         recon_l1_weight=args.recon_l1_weight,
         recon_edge_weight=args.recon_edge_weight,
+        recon_motion_weight=args.recon_motion_weight,
+        recon_motion_threshold=args.recon_motion_threshold,
+        recon_motion_dilation_kernel_size=args.recon_motion_dilation_kernel_size,
         batch_size=args.batch_size,
         auto_batch_size=args.auto_batch_size,
         lr=args.lr,

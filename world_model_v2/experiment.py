@@ -74,6 +74,7 @@ LEGACY_WORLD_MODEL_CHECKPOINT_KINDS = frozenset(
     }
 )
 AUTO_BATCH_SIZE_BACKOFF_DIVISOR = 2
+AUTO_BATCH_SIZE_GROWTH_FACTOR = 2
 _TEACHER_FORCED_NEXT_FRAME_MSE_PATTERN = re.compile(r"^next_frame_mse(?:_\d+to\d+)?$")
 
 
@@ -144,12 +145,15 @@ class ExperimentConfig:
     recon_mse_weight: float = 1.0
     recon_l1_weight: float = 0.0
     recon_edge_weight: float = 0.0
+    recon_motion_weight: float = 0.0
+    recon_motion_threshold: float = 0.02
+    recon_motion_dilation_kernel_size: int = 5
     batch_size: int = 32
     auto_batch_size: bool = False
     lr: float = 1e-4
     max_steps: int = 3000
-    validation_interval: int = 100
-    checkpoint_interval: int = 100
+    validation_interval: int = 250
+    checkpoint_interval: int = 250
     early_stop_window_size: int = 1
     early_stop_patience_windows: int = 5
     early_stop_min_delta: float = 1e-10
@@ -267,12 +271,30 @@ def reconstruction_loss_terms(
     mse_weight: float,
     l1_weight: float,
     edge_weight: float,
+    motion_weight: float = 0.0,
+    motion_threshold: float = 0.02,
+    motion_dilation_kernel_size: int = 5,
+    prev_frame: torch.Tensor | None = None,
+    next_frame: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute mixed pixel and edge reconstruction losses for one image batch."""
 
-    if mse_weight < 0.0 or l1_weight < 0.0 or edge_weight < 0.0:
+    if (
+        mse_weight < 0.0
+        or l1_weight < 0.0
+        or edge_weight < 0.0
+        or motion_weight < 0.0
+    ):
         raise ValueError("Reconstruction loss weights must be non-negative.")
-    total_weight = mse_weight + l1_weight + edge_weight
+    if motion_threshold < 0.0:
+        raise ValueError("recon_motion_threshold must be non-negative.")
+    if motion_dilation_kernel_size < 1 or motion_dilation_kernel_size % 2 == 0:
+        raise ValueError("recon_motion_dilation_kernel_size must be a positive odd integer.")
+    if motion_weight > 0.0 and (prev_frame is None or next_frame is None):
+        raise ValueError(
+            "Motion-weighted reconstruction requires both prev_frame and next_frame tensors."
+        )
+    total_weight = mse_weight + l1_weight + edge_weight + motion_weight
     if total_weight <= 0.0:
         raise ValueError("At least one reconstruction loss weight must be positive.")
     recon_mse = F.mse_loss(predicted, target)
@@ -282,16 +304,38 @@ def reconstruction_loss_terms(
     edge_l1 = 0.5 * (
         F.l1_loss(predicted_grad_x, target_grad_x) + F.l1_loss(predicted_grad_y, target_grad_y)
     )
+    motion_l1 = predicted.new_zeros(())
+    motion_mask_fraction = predicted.new_zeros(())
+    if motion_weight > 0.0:
+        motion_prev = torch.mean(torch.abs(target - prev_frame), dim=1, keepdim=True)
+        motion_next = torch.mean(torch.abs(next_frame - target), dim=1, keepdim=True)
+        motion_signal = torch.maximum(motion_prev, motion_next)
+        motion_mask = (motion_signal > motion_threshold).to(dtype=predicted.dtype)
+        if motion_dilation_kernel_size > 1:
+            motion_mask = F.max_pool2d(
+                motion_mask,
+                kernel_size=motion_dilation_kernel_size,
+                stride=1,
+                padding=motion_dilation_kernel_size // 2,
+            )
+        expanded_motion_mask = motion_mask.expand(-1, predicted.shape[1], -1, -1)
+        motion_mask_fraction = motion_mask.mean().detach()
+        motion_l1 = torch.sum(torch.abs(predicted - target) * expanded_motion_mask) / (
+            expanded_motion_mask.sum().clamp_min(1.0)
+        )
     recon_loss = (
         mse_weight * recon_mse
         + l1_weight * recon_l1
         + edge_weight * edge_l1
+        + motion_weight * motion_l1
     ) / total_weight
     return {
         "recon_loss": recon_loss,
         "recon_mse": recon_mse.detach(),
         "recon_l1": recon_l1.detach(),
         "edge_l1": edge_l1.detach(),
+        "motion_l1": motion_l1.detach(),
+        "motion_mask_fraction": motion_mask_fraction,
     }
 
 
@@ -545,7 +589,14 @@ class Experiment:
         # Auto-batch probing runs a dry training step, so schedule-dependent losses
         # need a well-defined step value before the probe happens.
         self.current_step = 0
+        requested_batch_size = max(int(self.cfg.batch_size), 1)
         self.cfg.batch_size = self._resolve_train_batch_size(self.train_dataset)
+        if self.cfg.auto_batch_size:
+            self._log_auto_batch_size_resolution(
+                requested_batch_size=requested_batch_size,
+                resolved_batch_size=self.cfg.batch_size,
+                max_dataset_batch=max(len(self.train_dataset), 1),
+            )
         self.train_loader = self._build_train_loader(self.train_dataset)
         self.val_loader = self._build_val_loader()
         self.optimizer = self._build_optimizer()
@@ -699,6 +750,17 @@ class Experiment:
                 "dynamics_validation_metric must be 'next_frame_mse', "
                 "'open_rollout_frame_mse', or 'open_rollout_consistency_score'."
             )
+        if self.cfg.recon_motion_weight < 0.0:
+            raise ValueError("recon_motion_weight must be non-negative.")
+        if self.cfg.recon_motion_threshold < 0.0:
+            raise ValueError("recon_motion_threshold must be non-negative.")
+        if (
+            self.cfg.recon_motion_dilation_kernel_size < 1
+            or self.cfg.recon_motion_dilation_kernel_size % 2 == 0
+        ):
+            raise ValueError(
+                "recon_motion_dilation_kernel_size must be a positive odd integer."
+            )
         if (
             self.cfg.frame_start is not None
             and self.cfg.frame_end is not None
@@ -793,6 +855,7 @@ class Experiment:
 
         frame_layout = self.cfg.dynamics_frame_layout()
         exclude_episodes = self._excluded_training_episodes()
+        include_motion_neighbors = self.cfg.mode == "ae_only" and self.cfg.recon_motion_weight > 0.0
         if self.cfg.dataset_format == "lerobot_metaworld":
             dataset_kwargs = {
                 "data_root": self.cfg.data_root,
@@ -810,6 +873,7 @@ class Experiment:
             if self.cfg.mode == "ae_only":
                 dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
                 dataset_kwargs["exclude_episodes"] = exclude_episodes
+                dataset_kwargs["include_motion_neighbors"] = include_motion_neighbors
                 return MetaWorldFrameDataset(**dataset_kwargs)
             dataset_kwargs["frame_layout"] = frame_layout
             dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
@@ -833,6 +897,7 @@ class Experiment:
             if self.cfg.mode == "ae_only":
                 dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
                 dataset_kwargs["exclude_episodes"] = exclude_episodes
+                dataset_kwargs["include_motion_neighbors"] = include_motion_neighbors
                 return AlohaFrameDataset(**dataset_kwargs)
             dataset_kwargs["frame_layout"] = frame_layout
             dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
@@ -856,6 +921,7 @@ class Experiment:
             if self.cfg.mode == "ae_only":
                 dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
                 dataset_kwargs["exclude_episodes"] = exclude_episodes
+                dataset_kwargs["include_motion_neighbors"] = include_motion_neighbors
                 return LeRobotVideoFrameDataset(**dataset_kwargs)
             dataset_kwargs["frame_layout"] = frame_layout
             dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
@@ -880,6 +946,7 @@ class Experiment:
             if self.cfg.mode == "ae_only":
                 dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
                 dataset_kwargs["exclude_episodes"] = exclude_episodes
+                dataset_kwargs["include_motion_neighbors"] = include_motion_neighbors
                 return ManiSkillFrameDataset(**dataset_kwargs)
             dataset_kwargs["frame_layout"] = frame_layout
             dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
@@ -1035,27 +1102,50 @@ class Experiment:
     def _resolve_train_batch_size(self, dataset: Dataset[dict[str, Any]]) -> int:
         """Return the configured or automatically probed training batch size."""
 
+        requested_batch_size = max(int(self.cfg.batch_size), 1)
         max_dataset_batch = max(len(dataset), 1)
-        max_probe_batch = min(max_dataset_batch, max(int(self.cfg.batch_size), 1))
         if not self.cfg.auto_batch_size:
-            return max(self.cfg.batch_size, 1)
+            return requested_batch_size
         if self.device.type != "cuda":
-            return max_probe_batch
-        return self._probe_cuda_batch_size(dataset, max_probe_batch)
+            return min(max_dataset_batch, requested_batch_size)
+        return self._probe_cuda_batch_size(dataset, requested_batch_size, max_dataset_batch)
 
     def _probe_cuda_batch_size(
         self,
         dataset: Dataset[dict[str, Any]],
+        requested_batch_size: int,
         max_batch_size: int,
     ) -> int:
         """Probe the largest CUDA batch size that fits for one training step."""
 
         torch_rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-        left = 1
-        right = max_batch_size
+        initial_batch_size = min(max(int(requested_batch_size), 1), max_batch_size)
         best = 1
         try:
+            if self._batch_size_fits(dataset, initial_batch_size):
+                best = initial_batch_size
+                highest_failed_batch: int | None = None
+                while best < max_batch_size:
+                    next_batch_size = min(best * AUTO_BATCH_SIZE_GROWTH_FACTOR, max_batch_size)
+                    if next_batch_size == best:
+                        break
+                    if self._batch_size_fits(dataset, next_batch_size):
+                        best = next_batch_size
+                        continue
+                    highest_failed_batch = next_batch_size
+                    break
+                if best >= max_batch_size:
+                    return max_batch_size
+                left = best + 1
+                right = (
+                    max_batch_size
+                    if highest_failed_batch is None
+                    else max(highest_failed_batch - 1, best)
+                )
+            else:
+                left = 1
+                right = initial_batch_size - 1
             while left <= right:
                 candidate = (left + right) // 2
                 if self._batch_size_fits(dataset, candidate):
@@ -1068,6 +1158,27 @@ class Experiment:
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state_all(cuda_rng_state)
         return best
+
+    def _log_auto_batch_size_resolution(
+        self,
+        requested_batch_size: int,
+        resolved_batch_size: int,
+        max_dataset_batch: int,
+    ) -> None:
+        """Emit a JSON event describing the resolved auto-batch training size."""
+
+        print(
+            json.dumps(
+                {
+                    "event": "auto_batch_size_resolved",
+                    "device": self.device.type,
+                    "requested_batch_size": requested_batch_size,
+                    "resolved_batch_size": resolved_batch_size,
+                    "max_dataset_batch": max_dataset_batch,
+                },
+                sort_keys=True,
+            )
+        )
 
     def _batch_size_fits(
         self,
@@ -1368,6 +1479,13 @@ class Experiment:
             "resolution": self.cfg.resolution,
             "height": self.cfg.resolved_height(),
             "width": self.cfg.resolved_width(),
+            "kl_beta": self.cfg.kl_beta,
+            "recon_mse_weight": self.cfg.recon_mse_weight,
+            "recon_l1_weight": self.cfg.recon_l1_weight,
+            "recon_edge_weight": self.cfg.recon_edge_weight,
+            "recon_motion_weight": self.cfg.recon_motion_weight,
+            "recon_motion_threshold": self.cfg.recon_motion_threshold,
+            "recon_motion_dilation_kernel_size": self.cfg.recon_motion_dilation_kernel_size,
             "dynamics_context_frames": (
                 int(self.model.dynamics.cfg.context_frames)
                 if self.cfg.mode == "dynamics_only"
@@ -1475,6 +1593,15 @@ class Experiment:
             "resolution": resolution,
             "height": resolution if raw_height is None else int(raw_height),
             "width": resolution if raw_width is None else int(raw_width),
+            "kl_beta": float(checkpoint_config.get("kl_beta", 1e-4)),
+            "recon_mse_weight": float(checkpoint_config.get("recon_mse_weight", 1.0)),
+            "recon_l1_weight": float(checkpoint_config.get("recon_l1_weight", 0.0)),
+            "recon_edge_weight": float(checkpoint_config.get("recon_edge_weight", 0.0)),
+            "recon_motion_weight": float(checkpoint_config.get("recon_motion_weight", 0.0)),
+            "recon_motion_threshold": float(checkpoint_config.get("recon_motion_threshold", 0.02)),
+            "recon_motion_dilation_kernel_size": int(
+                checkpoint_config.get("recon_motion_dilation_kernel_size", 5)
+            ),
             "dynamics_context_frames": (
                 None
                 if self.cfg.mode != "dynamics_only"
@@ -1770,6 +1897,11 @@ class Experiment:
             mse_weight=self.cfg.recon_mse_weight,
             l1_weight=self.cfg.recon_l1_weight,
             edge_weight=self.cfg.recon_edge_weight,
+            motion_weight=self.cfg.recon_motion_weight,
+            motion_threshold=self.cfg.recon_motion_threshold,
+            motion_dilation_kernel_size=self.cfg.recon_motion_dilation_kernel_size,
+            prev_frame=batch.get("prev_frame"),
+            next_frame=batch.get("next_frame"),
         )
         ae_loss = recon_terms["recon_loss"] + self.cfg.kl_beta * output.kl_loss
         return {
@@ -1778,6 +1910,8 @@ class Experiment:
             "recon_mse": recon_terms["recon_mse"],
             "recon_l1": recon_terms["recon_l1"],
             "edge_l1": recon_terms["edge_l1"],
+            "motion_l1": recon_terms["motion_l1"],
+            "motion_mask_fraction": recon_terms["motion_mask_fraction"],
             "kl_loss": output.kl_loss.detach(),
             "ae_loss": ae_loss.detach(),
         }
@@ -2104,7 +2238,7 @@ class Experiment:
     def _validate_ae_only_frames(
         self,
         frames: torch.Tensor,
-    ) -> tuple[torch.Tensor, float, float, float, float, float, float]:
+    ) -> tuple[torch.Tensor, float, float, float, float, float, float, float, float]:
         """Validate AE reconstructions in chunks to avoid full-clip CUDA OOMs."""
 
         chunk_size = max(1, min(int(self.cfg.batch_size), int(frames.shape[0])))
@@ -2113,11 +2247,19 @@ class Experiment:
         total_recon_mse = 0.0
         total_recon_l1 = 0.0
         total_edge_l1 = 0.0
+        total_motion_l1 = 0.0
+        total_motion_mask_fraction = 0.0
         total_kl = 0.0
         total_frames = int(frames.shape[0])
         for start in range(0, total_frames, chunk_size):
             stop = min(start + chunk_size, total_frames)
             frame_chunk = frames[start:stop]
+            chunk_indices = torch.arange(start, stop, device=frames.device)
+            prev_chunk = frames.index_select(0, torch.clamp(chunk_indices - 1, min=0))
+            next_chunk = frames.index_select(
+                0,
+                torch.clamp(chunk_indices + 1, max=total_frames - 1),
+            )
             output = self.model.autoencode(frame_chunk, sample_posterior=False)
             chunk_frames = int(frame_chunk.shape[0])
             recon_terms = reconstruction_loss_terms(
@@ -2126,21 +2268,40 @@ class Experiment:
                 mse_weight=self.cfg.recon_mse_weight,
                 l1_weight=self.cfg.recon_l1_weight,
                 edge_weight=self.cfg.recon_edge_weight,
+                motion_weight=self.cfg.recon_motion_weight,
+                motion_threshold=self.cfg.recon_motion_threshold,
+                motion_dilation_kernel_size=self.cfg.recon_motion_dilation_kernel_size,
+                prev_frame=prev_chunk,
+                next_frame=next_chunk,
             )
             reconstructed_chunks.append(output.reconstructed.detach().cpu())
             total_recon_loss += float(recon_terms["recon_loss"].item()) * chunk_frames
             total_recon_mse += float(recon_terms["recon_mse"].item()) * chunk_frames
             total_recon_l1 += float(recon_terms["recon_l1"].item()) * chunk_frames
             total_edge_l1 += float(recon_terms["edge_l1"].item()) * chunk_frames
+            total_motion_l1 += float(recon_terms["motion_l1"].item()) * chunk_frames
+            total_motion_mask_fraction += float(recon_terms["motion_mask_fraction"].item()) * chunk_frames
             total_kl += float(output.kl_loss.item()) * chunk_frames
         reconstructed = torch.cat(reconstructed_chunks, dim=0)
         recon_loss = total_recon_loss / total_frames
         recon_mse = total_recon_mse / total_frames
         recon_l1 = total_recon_l1 / total_frames
         edge_l1 = total_edge_l1 / total_frames
+        motion_l1 = total_motion_l1 / total_frames
+        motion_mask_fraction = total_motion_mask_fraction / total_frames
         kl_loss = total_kl / total_frames
         ae_loss = recon_loss + self.cfg.kl_beta * kl_loss
-        return reconstructed, recon_loss, recon_mse, recon_l1, edge_l1, kl_loss, ae_loss
+        return (
+            reconstructed,
+            recon_loss,
+            recon_mse,
+            recon_l1,
+            edge_l1,
+            motion_l1,
+            motion_mask_fraction,
+            kl_loss,
+            ae_loss,
+        )
 
     @torch.no_grad()
     def _validate_dynamics_one_step(
@@ -2369,9 +2530,17 @@ class Experiment:
 
         frames = batch["frames"][0]
         if self.cfg.mode == "ae_only":
-            reconstructed, recon_loss, recon_mse, recon_l1, edge_l1, kl_loss, ae_loss = (
-                self._validate_ae_only_frames(frames)
-            )
+            (
+                reconstructed,
+                recon_loss,
+                recon_mse,
+                recon_l1,
+                edge_l1,
+                motion_l1,
+                motion_mask_fraction,
+                kl_loss,
+                ae_loss,
+            ) = self._validate_ae_only_frames(frames)
             stats = {
                 "episode": int(batch["episode_idx"].reshape(-1)[0].item()),
                 "input_frame_count": int(frames.shape[0]),
@@ -2380,6 +2549,8 @@ class Experiment:
                 "recon_mse": float(recon_mse),
                 "recon_l1": float(recon_l1),
                 "edge_l1": float(edge_l1),
+                "motion_l1": float(motion_l1),
+                "motion_mask_fraction": float(motion_mask_fraction),
                 "kl_loss": kl_loss,
                 "ae_loss": ae_loss,
                 "mode": self.cfg.mode,

@@ -533,6 +533,7 @@ class LeRobotVideoFrameDataset(Dataset[dict[str, Any]]):
         width: int | None = None,
         all_episodes: bool = False,
         exclude_episodes: tuple[int, ...] = (),
+        include_motion_neighbors: bool = False,
         repo_id: str = SO101_BASE_SIM_PICKPLACE_DATASET_ID,
         image_column: str = SO101_BASE_SIM_PICKPLACE_IMAGE_COLUMN,
         cache_dir: str | Path | None = None,
@@ -550,6 +551,7 @@ class LeRobotVideoFrameDataset(Dataset[dict[str, Any]]):
         self.height = height
         self.width = width
         self.all_episodes = all_episodes
+        self.include_motion_neighbors = include_motion_neighbors
         excluded_episodes = set(int(episode_index) for episode_index in exclude_episodes)
         if all_episodes:
             self.frames: list[LeRobotVideoFrameRecord] = []
@@ -617,7 +619,7 @@ class LeRobotVideoFrameDataset(Dataset[dict[str, Any]]):
             if index < 0 or index >= len(self.frames):
                 raise IndexError("LeRobotVideoFrameDataset index out of range.")
             frame_record = self.frames[index]
-            return {
+            sample = {
                 "frame": self.repository.load_frame_tensor(
                     frame_record,
                     resolution=self.resolution,
@@ -627,11 +629,39 @@ class LeRobotVideoFrameDataset(Dataset[dict[str, Any]]):
                 "frame_idx": torch.tensor(frame_record.frame_index, dtype=torch.long),
                 "episode_idx": torch.tensor(frame_record.episode.episode_index, dtype=torch.long),
             }
-        return {
+            if self.include_motion_neighbors:
+                prev_record = LeRobotVideoFrameRecord(
+                    episode=frame_record.episode,
+                    frame_index=max(frame_record.frame_index - 1, 0),
+                )
+                next_record = LeRobotVideoFrameRecord(
+                    episode=frame_record.episode,
+                    frame_index=min(frame_record.frame_index + 1, frame_record.episode.length - 1),
+                )
+                sample["prev_frame"] = self.repository.load_frame_tensor(
+                    prev_record,
+                    resolution=self.resolution,
+                    height=self.height,
+                    width=self.width,
+                )
+                sample["next_frame"] = self.repository.load_frame_tensor(
+                    next_record,
+                    resolution=self.resolution,
+                    height=self.height,
+                    width=self.width,
+                )
+            return sample
+        sample = {
             "frame": self.clip["frames"][index],
             "frame_idx": self.clip["frame_idx"][index],
             "episode_idx": self.clip["episode_idx"],
         }
+        if self.include_motion_neighbors:
+            prev_index = max(index - 1, 0)
+            next_index = min(index + 1, int(self.clip["frames"].shape[0]) - 1)
+            sample["prev_frame"] = self.clip["frames"][prev_index]
+            sample["next_frame"] = self.clip["frames"][next_index]
+        return sample
 
 
 class LeRobotVideoTransitionDataset(Dataset[dict[str, Any]]):

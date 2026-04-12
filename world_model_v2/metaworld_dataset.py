@@ -486,6 +486,7 @@ class MetaWorldFrameDataset(Dataset[dict[str, Any]]):
         width: int | None = None,
         all_episodes: bool = False,
         exclude_episodes: tuple[int, ...] = (),
+        include_motion_neighbors: bool = False,
         repo_id: str = METAWORLD_DATASET_ID,
         cache_dir: str | Path | None = None,
     ) -> None:
@@ -497,7 +498,9 @@ class MetaWorldFrameDataset(Dataset[dict[str, Any]]):
         self.height = height
         self.width = width
         self.all_episodes = all_episodes
+        self.include_motion_neighbors = include_motion_neighbors
         self.task_index = task_index
+        self._episode_records_by_index: dict[int, MetaWorldEpisodeRecord] = {}
         excluded_episodes = set(int(episode_index) for episode_index in exclude_episodes)
         if all_episodes:
             self.frames: list[MetaWorldFrameRecord] = []
@@ -507,6 +510,7 @@ class MetaWorldFrameDataset(Dataset[dict[str, Any]]):
             ):
                 if episode_position in excluded_episodes:
                     continue
+                self._episode_records_by_index[episode_record.episode_index] = episode_record
                 if frame_start is not None and frame_start >= episode_record.length:
                     continue
                 resolved_frame_start = 0 if frame_start is None else frame_start
@@ -574,7 +578,7 @@ class MetaWorldFrameDataset(Dataset[dict[str, Any]]):
             if index < 0 or index >= len(self.frames):
                 raise IndexError("MetaWorldFrameDataset index out of range.")
             frame_record = self.frames[index]
-            return {
+            sample = {
                 "frame": self.repository.load_frame_tensor(
                     frame_record,
                     resolution=self.resolution,
@@ -584,11 +588,56 @@ class MetaWorldFrameDataset(Dataset[dict[str, Any]]):
                 "frame_idx": torch.tensor(frame_record.frame_index, dtype=torch.long),
                 "episode_idx": torch.tensor(frame_record.episode_index, dtype=torch.long),
             }
-        return {
+            if self.include_motion_neighbors:
+                episode_record = self._episode_records_by_index[frame_record.episode_index]
+                prev_index = max(frame_record.frame_index - 1, 0)
+                next_index = min(frame_record.frame_index + 1, episode_record.length - 1)
+                prev_record = MetaWorldFrameRecord(
+                    episode_index=episode_record.episode_index,
+                    task_index=episode_record.task_index,
+                    data_chunk_index=episode_record.data_chunk_index,
+                    data_file_index=episode_record.data_file_index,
+                    row_index_in_file=self.repository.frame_row_index_in_file(
+                        episode_record,
+                        prev_index,
+                    ),
+                    frame_index=prev_index,
+                )
+                next_record = MetaWorldFrameRecord(
+                    episode_index=episode_record.episode_index,
+                    task_index=episode_record.task_index,
+                    data_chunk_index=episode_record.data_chunk_index,
+                    data_file_index=episode_record.data_file_index,
+                    row_index_in_file=self.repository.frame_row_index_in_file(
+                        episode_record,
+                        next_index,
+                    ),
+                    frame_index=next_index,
+                )
+                sample["prev_frame"] = self.repository.load_frame_tensor(
+                    prev_record,
+                    resolution=self.resolution,
+                    height=self.height,
+                    width=self.width,
+                )
+                sample["next_frame"] = self.repository.load_frame_tensor(
+                    next_record,
+                    resolution=self.resolution,
+                    height=self.height,
+                    width=self.width,
+                )
+            return sample
+        sample = {
             "frame": self.clip["frames"][index],
             "frame_idx": self.clip["frame_idx"][index],
             "episode_idx": self.clip["episode_idx"],
         }
+        if self.include_motion_neighbors:
+            prev_index = max(index - 1, 0)
+            next_index = min(index + 1, int(self.clip["frames"].shape[0]) - 1)
+            sample["prev_frame"] = self.clip["frames"][prev_index]
+            sample["next_frame"] = self.clip["frames"][next_index]
+        return sample
 
 
 class MetaWorldTransitionDataset(Dataset[dict[str, Any]]):
@@ -1303,6 +1352,7 @@ class AlohaFrameDataset(Dataset[dict[str, Any]]):
         width: int | None = None,
         all_episodes: bool = False,
         exclude_episodes: tuple[int, ...] = (),
+        include_motion_neighbors: bool = False,
         repo_id: str = ALOHA_SIM_TRANSFER_CUBE_SCRIPTED_DATASET_ID,
         cache_dir: str | Path | None = None,
     ) -> None:
@@ -1314,6 +1364,8 @@ class AlohaFrameDataset(Dataset[dict[str, Any]]):
         self.height = height
         self.width = width
         self.all_episodes = all_episodes
+        self.include_motion_neighbors = include_motion_neighbors
+        self._episode_records_by_index: dict[int, AlohaEpisodeRecord] = {}
         excluded_episodes = set(int(episode_index) for episode_index in exclude_episodes)
         if all_episodes:
             self.frames: list[AlohaFrameRecord] = []
@@ -1321,6 +1373,7 @@ class AlohaFrameDataset(Dataset[dict[str, Any]]):
             for episode_position, episode_record in enumerate(self.repository.episode_records()):
                 if episode_position in excluded_episodes:
                     continue
+                self._episode_records_by_index[episode_record.episode_index] = episode_record
                 if frame_start is not None and frame_start >= episode_record.length:
                     continue
                 resolved_frame_start = 0 if frame_start is None else frame_start
@@ -1391,7 +1444,7 @@ class AlohaFrameDataset(Dataset[dict[str, Any]]):
             if index < 0 or index >= len(self.frames):
                 raise IndexError("AlohaFrameDataset index out of range.")
             frame_record = self.frames[index]
-            return {
+            sample = {
                 "frame": self.repository.load_frame_tensor(
                     frame_record,
                     resolution=self.resolution,
@@ -1401,11 +1454,68 @@ class AlohaFrameDataset(Dataset[dict[str, Any]]):
                 "frame_idx": torch.tensor(frame_record.frame_index, dtype=torch.long),
                 "episode_idx": torch.tensor(frame_record.episode_index, dtype=torch.long),
             }
-        return {
+            if self.include_motion_neighbors:
+                episode_record = self._episode_records_by_index[frame_record.episode_index]
+                prev_index = max(frame_record.frame_index - 1, 0)
+                next_index = min(frame_record.frame_index + 1, episode_record.length - 1)
+                prev_record = AlohaFrameRecord(
+                    episode_index=episode_record.episode_index,
+                    task_index=episode_record.task_index,
+                    data_chunk_index=episode_record.data_chunk_index,
+                    data_file_index=episode_record.data_file_index,
+                    row_index_in_file=self.repository.frame_row_index_in_file(
+                        episode_record,
+                        prev_index,
+                    ),
+                    frame_index=prev_index,
+                    video_chunk_index=episode_record.video_chunk_index,
+                    video_file_index=episode_record.video_file_index,
+                    video_frame_index_in_file=self.repository.video_frame_index_in_file(
+                        episode_record,
+                        prev_index,
+                    ),
+                )
+                next_record = AlohaFrameRecord(
+                    episode_index=episode_record.episode_index,
+                    task_index=episode_record.task_index,
+                    data_chunk_index=episode_record.data_chunk_index,
+                    data_file_index=episode_record.data_file_index,
+                    row_index_in_file=self.repository.frame_row_index_in_file(
+                        episode_record,
+                        next_index,
+                    ),
+                    frame_index=next_index,
+                    video_chunk_index=episode_record.video_chunk_index,
+                    video_file_index=episode_record.video_file_index,
+                    video_frame_index_in_file=self.repository.video_frame_index_in_file(
+                        episode_record,
+                        next_index,
+                    ),
+                )
+                sample["prev_frame"] = self.repository.load_frame_tensor(
+                    prev_record,
+                    resolution=self.resolution,
+                    height=self.height,
+                    width=self.width,
+                )
+                sample["next_frame"] = self.repository.load_frame_tensor(
+                    next_record,
+                    resolution=self.resolution,
+                    height=self.height,
+                    width=self.width,
+                )
+            return sample
+        sample = {
             "frame": self.clip["frames"][index],
             "frame_idx": self.clip["frame_idx"][index],
             "episode_idx": self.clip["episode_idx"],
         }
+        if self.include_motion_neighbors:
+            prev_index = max(index - 1, 0)
+            next_index = min(index + 1, int(self.clip["frames"].shape[0]) - 1)
+            sample["prev_frame"] = self.clip["frames"][prev_index]
+            sample["next_frame"] = self.clip["frames"][next_index]
+        return sample
 
 
 class AlohaTransitionDataset(Dataset[dict[str, Any]]):

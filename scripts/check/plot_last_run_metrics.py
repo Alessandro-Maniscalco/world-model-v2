@@ -3,6 +3,7 @@
 source .venv/bin/activate
 python scripts/check/plot_last_run_metrics.py
 python scripts/check/plot_last_run_metrics.py --run-dir outputs/dynamics_only_single_grasp_ep0_f111_116_from_last
+python scripts/check/plot_last_run_metrics.py --run-dir outputs/so101_base_pickplace_wan_ae_240x320_1224 --min-step 3000
 """
 
 from __future__ import annotations
@@ -66,6 +67,12 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Destination PNG path. Defaults to <run-dir>/metrics_validation_plot.png.",
     )
+    parser.add_argument(
+        "--min-step",
+        type=int,
+        default=0,
+        help="Only plot records at or after this step.",
+    )
     return parser.parse_args()
 
 
@@ -86,6 +93,26 @@ def load_metrics_records(metrics_path: Path) -> list[dict[str, Any]]:
 
     with metrics_path.open(encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def filter_records_min_step(
+    records: list[dict[str, Any]],
+    min_step: int,
+) -> list[dict[str, Any]]:
+    """Keep run metadata plus step-scoped records at or after the minimum step."""
+
+    if min_step <= 0:
+        return list(records)
+
+    filtered_records: list[dict[str, Any]] = []
+    for record in records:
+        step = record.get("step")
+        if step is None:
+            filtered_records.append(record)
+            continue
+        if int(step) >= min_step:
+            filtered_records.append(record)
+    return filtered_records
 
 
 def is_numeric(value: Any) -> bool:
@@ -228,6 +255,8 @@ def build_plot(
     run_dir: Path,
     records: list[dict[str, Any]],
     output_path: Path,
+    *,
+    min_step: int = 0,
 ) -> dict[str, Any]:
     """Render the training and validation curves to a PNG file."""
 
@@ -291,7 +320,10 @@ def build_plot(
     config = extract_run_config(records)
     run_start = next((record["run_start"] for record in records if "run_start" in record), {})
     mode = str(config.get("mode", run_start.get("mode", "unknown")))
-    ax_train.set_title(f"{run_dir.name} ({mode})")
+    title = f"{run_dir.name} ({mode})"
+    if min_step > 0:
+        title = f"{title} steps >= {min_step}"
+    ax_train.set_title(title)
     ax_train.set_xlabel("Step")
     ax_train.set_ylabel("Training metrics")
     ax_val.set_ylabel("Validation metrics")
@@ -320,6 +352,7 @@ def build_plot(
         validation_metric_names,
     )
     return {
+        "min_step": min_step,
         "run_dir": str(run_dir),
         "metrics_path": str(run_dir / "metrics.jsonl"),
         "output_path": str(output_path),
@@ -359,7 +392,8 @@ def main() -> None:
     if not metrics_path.exists():
         raise FileNotFoundError(f"Expected metrics at {metrics_path}.")
     output_path = resolve_output_path(args, run_dir)
-    result = build_plot(run_dir, load_metrics_records(metrics_path), output_path)
+    records = filter_records_min_step(load_metrics_records(metrics_path), args.min_step)
+    result = build_plot(run_dir, records, output_path, min_step=args.min_step)
     print(json.dumps(result, indent=2, sort_keys=True))
 
 

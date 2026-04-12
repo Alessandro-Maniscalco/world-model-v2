@@ -169,10 +169,12 @@ class FrameDataset(Dataset[dict[str, Any]]):
         width: int | None = None,
         all_episodes: bool = False,
         exclude_episodes: tuple[int, ...] = (),
+        include_motion_neighbors: bool = False,
     ) -> None:
         """Cache one clip or all split clips for reconstruction training."""
 
         self.all_episodes = all_episodes
+        self.include_motion_neighbors = include_motion_neighbors
         excluded_episodes = set(int(episode_index) for episode_index in exclude_episodes)
         if all_episodes:
             self.clips = []
@@ -235,16 +237,28 @@ class FrameDataset(Dataset[dict[str, Any]]):
             clip_start = 0 if clip_index == 0 else self.cumulative_lengths[clip_index - 1]
             frame_index = index - clip_start
             clip = self.clips[clip_index]
-            return {
+            sample = {
                 "frame": clip["frames"][frame_index],
                 "frame_idx": clip["frame_idx"][frame_index],
                 "episode_idx": clip["episode_idx"],
             }
-        return {
+            if self.include_motion_neighbors:
+                prev_index = max(frame_index - 1, 0)
+                next_index = min(frame_index + 1, int(clip["frames"].shape[0]) - 1)
+                sample["prev_frame"] = clip["frames"][prev_index]
+                sample["next_frame"] = clip["frames"][next_index]
+            return sample
+        sample = {
             "frame": self.clip["frames"][index],
             "frame_idx": self.clip["frame_idx"][index],
             "episode_idx": self.clip["episode_idx"],
         }
+        if self.include_motion_neighbors:
+            prev_index = max(index - 1, 0)
+            next_index = min(index + 1, int(self.clip["frames"].shape[0]) - 1)
+            sample["prev_frame"] = self.clip["frames"][prev_index]
+            sample["next_frame"] = self.clip["frames"][next_index]
+        return sample
 
 
 class TransitionDataset(Dataset[dict[str, Any]]):

@@ -96,6 +96,24 @@ def test_lerobot_video_transition_dataset_returns_sliding_windows(
     assert torch.equal(sample["target_frame_idx"], torch.tensor([1], dtype=torch.long))
 
 
+def test_lerobot_video_frame_dataset_can_include_motion_neighbors(
+    fake_lerobot_so101_base_sim_pickplace_root: Path,
+) -> None:
+    """LeRobot frame samples should optionally include adjacent GT frames for motion losses."""
+
+    dataset = LeRobotVideoFrameDataset(
+        data_root=str(fake_lerobot_so101_base_sim_pickplace_root),
+        split="train",
+        resolution=8,
+        all_episodes=True,
+        include_motion_neighbors=True,
+    )
+    sample = dataset[1]
+    assert sample["prev_frame"].shape == (3, 8, 8)
+    assert sample["next_frame"].shape == (3, 8, 8)
+    assert float(sample["next_frame"][0].mean()) > float(sample["prev_frame"][0].mean())
+
+
 def test_lerobot_video_transition_dataset_exposes_future_rollout_targets(
     fake_lerobot_so101_base_sim_pickplace_root: Path,
 ) -> None:

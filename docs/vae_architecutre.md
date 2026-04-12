@@ -283,7 +283,7 @@ Important practical detail:
 
 ### Best Pickplace VAE Loss Settings
 
-The curated checkpoint in `outputs/best_vae_pickplace/` was trained with:
+The curated checkpoint in `saved_checkpoints/best_vae/` was trained with:
 
 - `--recon-mse-weight 1.0`
 - `--recon-l1-weight 1.0`

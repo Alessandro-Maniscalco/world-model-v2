@@ -28,3 +28,4 @@ assets/**
 /preprocessed
 /tmp_vace/
 /outputs/
+/saved_checkpoints/

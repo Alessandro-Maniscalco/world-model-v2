@@ -358,6 +358,7 @@ class ManiSkillFrameDataset(Dataset[dict[str, Any]]):
         width: int | None = None,
         all_episodes: bool = False,
         exclude_episodes: tuple[int, ...] = (),
+        include_motion_neighbors: bool = False,
         traj_h5: str = MANISKILL_DEFAULT_TRAJ_H5,
         traj_json: str = MANISKILL_DEFAULT_TRAJ_JSON,
         camera: str = MANISKILL_DEFAULT_CAMERA,
@@ -375,6 +376,8 @@ class ManiSkillFrameDataset(Dataset[dict[str, Any]]):
         self.height = height
         self.width = width
         self.all_episodes = all_episodes
+        self.include_motion_neighbors = include_motion_neighbors
+        self._episode_records_by_index: dict[int, ManiSkillEpisodeRecord] = {}
         excluded_episodes = set(int(episode_index) for episode_index in exclude_episodes)
         if all_episodes:
             self.frames: list[ManiSkillFrameRecord] = []
@@ -382,6 +385,7 @@ class ManiSkillFrameDataset(Dataset[dict[str, Any]]):
             for episode_position, episode_record in enumerate(self.repository.episode_records()):
                 if episode_position in excluded_episodes:
                     continue
+                self._episode_records_by_index[episode_record.episode_index] = episode_record
                 if frame_start is not None and frame_start >= episode_record.frame_count:
                     continue
                 resolved_frame_start = 0 if frame_start is None else frame_start
@@ -441,7 +445,7 @@ class ManiSkillFrameDataset(Dataset[dict[str, Any]]):
             if index < 0 or index >= len(self.frames):
                 raise IndexError("ManiSkillFrameDataset index out of range.")
             frame_record = self.frames[index]
-            return {
+            sample = {
                 "frame": self.repository.load_frame_tensor(
                     frame_record,
                     resolution=self.resolution,
@@ -451,11 +455,44 @@ class ManiSkillFrameDataset(Dataset[dict[str, Any]]):
                 "frame_idx": torch.tensor(frame_record.frame_index, dtype=torch.long),
                 "episode_idx": torch.tensor(frame_record.episode_index, dtype=torch.long),
             }
-        return {
+            if self.include_motion_neighbors:
+                episode_record = self._episode_records_by_index[frame_record.episode_index]
+                prev_index = max(frame_record.frame_index - 1, 0)
+                next_index = min(frame_record.frame_index + 1, episode_record.frame_count - 1)
+                prev_record = ManiSkillFrameRecord(
+                    episode_index=episode_record.episode_index,
+                    h5_group_name=episode_record.h5_group_name,
+                    frame_index=prev_index,
+                )
+                next_record = ManiSkillFrameRecord(
+                    episode_index=episode_record.episode_index,
+                    h5_group_name=episode_record.h5_group_name,
+                    frame_index=next_index,
+                )
+                sample["prev_frame"] = self.repository.load_frame_tensor(
+                    prev_record,
+                    resolution=self.resolution,
+                    height=self.height,
+                    width=self.width,
+                )
+                sample["next_frame"] = self.repository.load_frame_tensor(
+                    next_record,
+                    resolution=self.resolution,
+                    height=self.height,
+                    width=self.width,
+                )
+            return sample
+        sample = {
             "frame": self.clip["frames"][index],
             "frame_idx": self.clip["frame_idx"][index],
             "episode_idx": self.clip["episode_idx"],
         }
+        if self.include_motion_neighbors:
+            prev_index = max(index - 1, 0)
+            next_index = min(index + 1, int(self.clip["frames"].shape[0]) - 1)
+            sample["prev_frame"] = self.clip["frames"][prev_index]
+            sample["next_frame"] = self.clip["frames"][next_index]
+        return sample
 
 
 class ManiSkillTransitionDataset(Dataset[dict[str, Any]]):

@@ -137,8 +137,8 @@ class DynamicsTransformerConfig:
     validation_conditioning_frame_choices: tuple[int, ...] | None = None
     open_rollout_context_frames: int | None = None
     open_rollout_stride_frames: int | None = None
-    in_channels: int = 16
-    out_channels: int = 16
+    in_channels: int = 32
+    out_channels: int = 32
     patch_spatial: int = 2
     patch_temporal: int = 1
     model_channels: int = 256
@@ -162,7 +162,7 @@ class DynamicsTransformerConfig:
     timestep_scale: float = 1.0
     conditional_frame_timestep: float = -1.0
     conditional_frame_sigma: float = 0.0
-    dynamics_infer_steps: int = 16
+    dynamics_infer_steps: int = 35
     dynamics_train_timesteps: int = 1000
     dynamics_rf_shift: float = 5.0
     dynamics_video_condition_dropout: float = 0.0
@@ -449,15 +449,28 @@ class TimestepEmbedding(nn.Module):
 class Mlp(nn.Module):
     """Apply the DreamDojo action MLP used before AdaLN modulation."""
 
-    def __init__(self, in_features: int, out_features: int) -> None:
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        hidden_features: int | None = None,
+    ) -> None:
         """Create the two-layer action embedder."""
 
         super().__init__()
-        hidden_features = out_features * 4
-        self.fc1 = nn.Linear(in_features, hidden_features)
+        resolved_hidden_features = (
+            out_features * 4
+            if hidden_features is None
+            else int(hidden_features)
+        )
+        if resolved_hidden_features < 1:
+            raise ValueError("hidden_features must be positive.")
+        self.fc1 = nn.Linear(in_features, resolved_hidden_features)
         self.activation = nn.GELU(approximate="tanh")
-        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.fc2 = nn.Linear(resolved_hidden_features, out_features)
         self.drop = nn.Dropout(0.0)
+        self.hidden_features = resolved_hidden_features
 
     def forward(self, actions: torch.Tensor) -> torch.Tensor:
         """Return one action-conditioning embedding for each batch item."""
@@ -1117,13 +1130,16 @@ class ActionConditionedDynamicsTransformer(nn.Module):
             adaln_lora_dim=cfg.adaln_lora_dim,
         )
         action_embedder_in_features = cfg.action_dim * self._num_action_per_latent_frame
+        action_embedder_hidden_features = cfg.model_channels * 4
         self.action_embedder_B_D = Mlp(
             action_embedder_in_features,
             cfg.model_channels,
+            hidden_features=action_embedder_hidden_features,
         )
         self.action_embedder_B_3D = Mlp(
             action_embedder_in_features,
             cfg.model_channels * 3,
+            hidden_features=action_embedder_hidden_features,
         )
         self.init_weights()
 
@@ -1516,7 +1532,7 @@ class RectifiedFlowDynamics(nn.Module):
             reference_noise=reference_noise,
         )
         conditioning_flags = self._normalize_use_video_condition(
-            True if use_video_condition is None else use_video_condition,
+            use_video_condition,
             batch_size=conditioning_latent_video.shape[0],
             device=conditioning_latent_video.device,
         )

@@ -8,6 +8,7 @@ from scripts.check.plot_last_run_metrics import (
     build_plot,
     collect_training_series,
     collect_validation_series,
+    filter_records_min_step,
     select_training_metric_names,
     select_validation_metric_names,
 )
@@ -96,6 +97,23 @@ def test_build_plot_summary_reports_only_selected_metrics(tmp_path: Path) -> Non
 
     assert output_path.exists()
     assert result["latest"] == {"loss": 0.25, "validation.ae_loss": 0.4}
+
+
+def test_filter_records_min_step_keeps_metadata_and_drops_earlier_steps() -> None:
+    """Minimum-step filtering should preserve metadata while trimming old metrics."""
+
+    records = [
+        {"run_start": {"config": {"mode": "ae_only"}}},
+        {"step": 1, "loss": 1.0},
+        {"step": 2, "loss": 0.5},
+        {"step": 2, "validation": {"ae_loss": 0.4}},
+    ]
+
+    assert filter_records_min_step(records, 2) == [
+        {"run_start": {"config": {"mode": "ae_only"}}},
+        {"step": 2, "loss": 0.5},
+        {"step": 2, "validation": {"ae_loss": 0.4}},
+    ]
 
 
 def test_build_plot_supports_dynamics_validation_metrics(tmp_path: Path) -> None:
