@@ -1,6 +1,7 @@
 """Root package for the Wan-VAE plus RF-DiT world-model pipeline."""
 
 from world_model_v2.dataset import (
+    AutoencoderClipDataset,
     FrameDataset,
     TransitionDataset,
     ValidationClipDataset,
@@ -21,6 +22,7 @@ from world_model_v2.experiment import (
     save_training_checkpoint,
 )
 from world_model_v2.maniskill_dataset import (
+    ManiSkillAutoencoderClipDataset,
     ManiSkillFrameDataset,
     ManiSkillReplayRepository,
     ManiSkillTransitionDataset,
@@ -29,16 +31,19 @@ from world_model_v2.maniskill_dataset import (
 )
 from world_model_v2.lerobot_video_dataset import (
     LeRobotEpisodeVideoRepository,
+    LeRobotVideoAutoencoderClipDataset,
     LeRobotVideoFrameDataset,
     LeRobotVideoTransitionDataset,
     LeRobotVideoValidationClipDataset,
     load_lerobot_video_clip,
 )
 from world_model_v2.metaworld_dataset import (
+    AlohaAutoencoderClipDataset,
     AlohaFrameDataset,
     AlohaSimRepository,
     AlohaTransitionDataset,
     AlohaValidationClipDataset,
+    MetaWorldAutoencoderClipDataset,
     MetaWorldFrameDataset,
     MetaWorldRepository,
     MetaWorldTransitionDataset,
@@ -46,30 +51,36 @@ from world_model_v2.metaworld_dataset import (
     load_aloha_clip,
     load_metaworld_clip,
 )
-from world_model_v2.model import WorldModel
+from world_model_v2.model import LatentNormalizationStats, WorldModel
 
 __all__ = [
     "DYNAMICS_FRAME_LAYOUT",
     "DynamicsTransformerConfig",
     "Experiment",
     "ExperimentConfig",
+    "AutoencoderClipDataset",
     "FrameDataset",
+    "ManiSkillAutoencoderClipDataset",
     "ManiSkillFrameDataset",
     "ManiSkillReplayRepository",
     "ManiSkillTransitionDataset",
     "ManiSkillValidationClipDataset",
     "LeRobotEpisodeVideoRepository",
+    "LeRobotVideoAutoencoderClipDataset",
     "LeRobotVideoFrameDataset",
     "LeRobotVideoTransitionDataset",
     "LeRobotVideoValidationClipDataset",
+    "AlohaAutoencoderClipDataset",
     "AlohaFrameDataset",
     "AlohaSimRepository",
     "AlohaTransitionDataset",
     "AlohaValidationClipDataset",
+    "MetaWorldAutoencoderClipDataset",
     "MetaWorldFrameDataset",
     "MetaWorldRepository",
     "MetaWorldTransitionDataset",
     "MetaWorldValidationClipDataset",
+    "LatentNormalizationStats",
     "RectifiedFlowDynamics",
     "TransitionDataset",
     "ValidationClipDataset",

@@ -495,6 +495,138 @@ class ManiSkillFrameDataset(Dataset[dict[str, Any]]):
         return sample
 
 
+class ManiSkillAutoencoderClipDataset(Dataset[dict[str, Any]]):
+    """Expose replayed ManiSkill episodes as sliding AE clip windows."""
+
+    def __init__(
+        self,
+        data_root: str | Path,
+        split: str = "train",
+        episode: int = 0,
+        frame_start: int | None = None,
+        frame_end: int | None = None,
+        resolution: int = 128,
+        height: int | None = None,
+        width: int | None = None,
+        all_episodes: bool = False,
+        exclude_episodes: tuple[int, ...] = (),
+        traj_h5: str = MANISKILL_DEFAULT_TRAJ_H5,
+        traj_json: str = MANISKILL_DEFAULT_TRAJ_JSON,
+        camera: str = MANISKILL_DEFAULT_CAMERA,
+        frame_layout: DynamicsFrameLayout = DYNAMICS_FRAME_LAYOUT,
+    ) -> None:
+        """Build either one cached clip or a lazy all-episode AE clip index."""
+
+        resolve_maniskill_split(split)
+        self.repository = ManiSkillReplayRepository(
+            data_root=data_root,
+            traj_h5=traj_h5,
+            traj_json=traj_json,
+            camera=camera,
+        )
+        self.resolution = resolution
+        self.height = height
+        self.width = width
+        self.all_episodes = all_episodes
+        self.required_frames = frame_layout.max_pixel_frames
+        excluded_episodes = set(int(episode_index) for episode_index in exclude_episodes)
+        if all_episodes:
+            self.window_records: list[ManiSkillTransitionRecord] = []
+            buckets: list[list[int]] = []
+            for episode_position, episode_record in enumerate(self.repository.episode_records()):
+                if episode_position in excluded_episodes:
+                    continue
+                if frame_start is not None and frame_start >= episode_record.frame_count:
+                    continue
+                resolved_frame_start = 0 if frame_start is None else frame_start
+                resolved_frame_end = (
+                    episode_record.frame_count - 1
+                    if frame_end is None
+                    else min(frame_end, episode_record.frame_count - 1)
+                )
+                if resolved_frame_end < resolved_frame_start:
+                    continue
+                clip_length = resolved_frame_end - resolved_frame_start + 1
+                available_windows = max(clip_length - self.required_frames + 1, 0)
+                if available_windows < 1:
+                    continue
+                bucket: list[int] = []
+                for offset in range(available_windows):
+                    dataset_index = len(self.window_records)
+                    self.window_records.append(
+                        ManiSkillTransitionRecord(
+                            episode=episode_record,
+                            start_frame_index=resolved_frame_start + offset,
+                        )
+                    )
+                    bucket.append(dataset_index)
+                buckets.append(bucket)
+            if not self.window_records:
+                raise ValueError(
+                    "No ManiSkill episodes contain valid AE clip windows in the requested range."
+                )
+            self._sampler = MetaWorldGroupedFrameSampler(buckets)
+        else:
+            self.clip = load_maniskill_clip(
+                data_root=data_root,
+                split=split,
+                episode=episode,
+                resolution=resolution,
+                height=height,
+                width=width,
+                frame_start=frame_start,
+                frame_end=frame_end,
+                traj_h5=traj_h5,
+                traj_json=traj_json,
+                camera=camera,
+            )
+            self._sampler = None
+
+    def training_sampler(self) -> Sampler[int] | None:
+        """Return the preferred training sampler for the current dataset mode."""
+
+        return self._sampler
+
+    def _sample_from_clip(self, clip: dict[str, Any], index: int) -> dict[str, Any]:
+        """Return one AE clip window from one cached ManiSkill clip."""
+
+        stop = index + self.required_frames
+        return {
+            "frames": clip["frames"][index:stop],
+            "frame_idx": clip["frame_idx"][index:stop],
+            "episode_idx": clip["episode_idx"],
+        }
+
+    def _load_clip_window(self, record: ManiSkillTransitionRecord) -> dict[str, Any]:
+        """Load the minimal frame slice needed for one lazy AE clip window."""
+
+        stop_frame_index = record.start_frame_index + self.required_frames
+        return self.repository.load_clip(
+            record=record.episode,
+            frame_start=record.start_frame_index,
+            frame_end=stop_frame_index - 1,
+            resolution=self.resolution,
+            height=self.height,
+            width=self.width,
+        )
+
+    def __len__(self) -> int:
+        """Return the number of available AE clip windows."""
+
+        if self.all_episodes:
+            return len(self.window_records)
+        return max(int(self.clip["frames"].shape[0]) - self.required_frames + 1, 0)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        """Return one cached AE clip window."""
+
+        if self.all_episodes:
+            if index < 0 or index >= len(self.window_records):
+                raise IndexError("ManiSkillAutoencoderClipDataset index out of range.")
+            return self._sample_from_clip(self._load_clip_window(self.window_records[index]), 0)
+        return self._sample_from_clip(self.clip, index)
+
+
 class ManiSkillTransitionDataset(Dataset[dict[str, Any]]):
     """Expose replayed ManiSkill clips as sliding dynamics windows."""
 
@@ -532,7 +664,13 @@ class ManiSkillTransitionDataset(Dataset[dict[str, Any]]):
             raise ValueError("rollout_chunks must be non-negative.")
         self.rollout_chunks = int(rollout_chunks)
         self.rollout_target_frames = self.frame_layout.max_frames - self.rollout_context_frames
-        self.required_frames = self.frame_layout.max_frames + self.rollout_chunks * self.rollout_target_frames
+        self.context_pixel_frames = self.frame_layout.context_pixel_frames
+        self.target_pixel_frames = self.frame_layout.target_pixel_frames
+        self.rollout_target_pixel_frames = (
+            self.frame_layout.temporal_compression_ratio * self.rollout_target_frames
+        )
+        total_latent_frames = self.frame_layout.max_frames + self.rollout_chunks * self.rollout_target_frames
+        self.required_frames = self.frame_layout.pixel_frames_for_latent_frames(total_latent_frames)
         self.all_episodes = all_episodes
         excluded_episodes = set(int(episode_index) for episode_index in exclude_episodes)
         if all_episodes:
@@ -605,11 +743,11 @@ class ManiSkillTransitionDataset(Dataset[dict[str, Any]]):
     def _sample_from_clip(self, clip: dict[str, Any], index: int) -> dict[str, Any]:
         """Return one configured ManiSkill `(context, target)` training sample."""
 
-        context_stop = index + self.frame_layout.context_frames
-        target_stop = context_stop + self.frame_layout.target_frames
-        future_target_stop = target_stop + self.rollout_chunks * self.rollout_target_frames
+        context_stop = index + self.context_pixel_frames
+        target_stop = context_stop + self.target_pixel_frames
+        future_target_stop = target_stop + self.rollout_chunks * self.rollout_target_pixel_frames
         action_stop = index + self.frame_layout.num_action_per_chunk
-        future_action_stop = action_stop + self.rollout_chunks * self.rollout_target_frames
+        future_action_stop = action_stop + self.rollout_chunks * self.rollout_target_pixel_frames
         return {
             "context_frames": clip["frames"][index:context_stop],
             "target_frames": clip["frames"][context_stop:target_stop],

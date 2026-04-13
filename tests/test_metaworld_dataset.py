@@ -95,24 +95,25 @@ def test_metaworld_transition_dataset_returns_consecutive_pairs(
         task_index=0,
         episode=0,
         resolution=8,
+        frame_layout=DynamicsFrameLayout(
+            context_frames=1,
+            target_frames=1,
+            temporal_compression_ratio=1,
+        ),
     )
     sample = dataset[0]
-    assert len(dataset) == 5 - DYNAMICS_FRAME_LAYOUT.max_frames + 1
-    assert sample["context_frames"].shape == (DYNAMICS_FRAME_LAYOUT.context_frames, 3, 8, 8)
-    assert sample["target_frames"].shape == (DYNAMICS_FRAME_LAYOUT.target_frames, 3, 8, 8)
-    assert sample["actions"].shape == (DYNAMICS_FRAME_LAYOUT.num_action_per_chunk, 4)
+    assert len(dataset) == 4
+    assert sample["context_frames"].shape == (1, 3, 8, 8)
+    assert sample["target_frames"].shape == (1, 3, 8, 8)
+    assert sample["actions"].shape == (1, 4)
     assert torch.equal(sample["actions"][0], torch.tensor([10.0, 11.0, 12.0, 13.0]))
     assert torch.equal(
         sample["context_frame_idx"],
-        torch.arange(DYNAMICS_FRAME_LAYOUT.context_frames, dtype=torch.long),
+        torch.tensor([0], dtype=torch.long),
     )
     assert torch.equal(
         sample["target_frame_idx"],
-        torch.arange(
-            DYNAMICS_FRAME_LAYOUT.context_frames,
-            DYNAMICS_FRAME_LAYOUT.max_frames,
-            dtype=torch.long,
-        ),
+        torch.tensor([1], dtype=torch.long),
     )
     assert sample["episode_idx"].item() == 0
 
@@ -150,7 +151,11 @@ def test_metaworld_transition_dataset_supports_custom_frame_layout(
         resolution=8,
         frame_start=0,
         frame_end=1,
-        frame_layout=DynamicsFrameLayout(context_frames=1, target_frames=1),
+        frame_layout=DynamicsFrameLayout(
+            context_frames=1,
+            target_frames=1,
+            temporal_compression_ratio=1,
+        ),
     )
 
     assert len(dataset) == 1
@@ -175,7 +180,11 @@ def test_metaworld_transition_dataset_exposes_future_rollout_targets_when_reques
         resolution=8,
         frame_start=0,
         frame_end=4,
-        frame_layout=DynamicsFrameLayout(context_frames=1, target_frames=2),
+        frame_layout=DynamicsFrameLayout(
+            context_frames=1,
+            target_frames=2,
+            temporal_compression_ratio=1,
+        ),
         rollout_context_frames=1,
         rollout_chunks=1,
     )
@@ -206,7 +215,11 @@ def test_metaworld_transition_dataset_flattens_all_task_episodes(
         split="train",
         task_index=0,
         resolution=8,
-        frame_layout=DynamicsFrameLayout(context_frames=1, target_frames=1),
+        frame_layout=DynamicsFrameLayout(
+            context_frames=1,
+            target_frames=1,
+            temporal_compression_ratio=1,
+        ),
         all_episodes=True,
     )
     assert len(dataset) == 6
@@ -237,7 +250,11 @@ def test_metaworld_transition_dataset_can_exclude_selected_task_episodes(
         split="train",
         task_index=0,
         resolution=8,
-        frame_layout=DynamicsFrameLayout(context_frames=1, target_frames=1),
+        frame_layout=DynamicsFrameLayout(
+            context_frames=1,
+            target_frames=1,
+            temporal_compression_ratio=1,
+        ),
         all_episodes=True,
         exclude_episodes=(0,),
     )

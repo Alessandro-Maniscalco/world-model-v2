@@ -26,10 +26,10 @@ def test_run_parse_args_uses_expected_defaults() -> None:
     assert config.resolution == 128
     assert config.height is None
     assert config.width is None
-    assert config.latent_channels == 16
+    assert config.latent_channels == 32
     assert config.hidden_channels == 64
     assert config.ae_backend == "wan"
-    assert config.dynamics_infer_steps == 16
+    assert config.dynamics_infer_steps == 35
     assert config.dynamics_train_timesteps == 1000
     assert config.dynamics_rf_shift == 5.0
     assert config.conditional_frame_timestep == -1.0
@@ -61,6 +61,7 @@ def test_run_parse_args_uses_expected_defaults() -> None:
     assert config.dynamics_rope_t_extrapolation_ratio == 1.0
     assert config.dynamics_use_learned_temporal_embedding is False
     assert config.dynamics_validation_metric == "next_frame_mse"
+    assert config.dynamics_run_open_rollout_validation is None
     assert config.kl_beta == 1e-4
     assert config.recon_mse_weight == 1.0
     assert config.recon_l1_weight == 0.0
@@ -222,6 +223,18 @@ def test_run_build_config_preserves_rollout_consistency_validation_metric() -> N
     args = parse_args(["--dynamics-validation-metric", "open_rollout_consistency_score"])
     config = build_config(args)
     assert config.dynamics_validation_metric == "open_rollout_consistency_score"
+
+
+def test_run_build_config_preserves_explicit_open_rollout_validation_toggle() -> None:
+    """The config builder should keep explicit open-rollout validation toggles."""
+
+    enabled_args = parse_args(["--dynamics-run-open-rollout-validation"])
+    enabled_config = build_config(enabled_args)
+    assert enabled_config.dynamics_run_open_rollout_validation is True
+
+    disabled_args = parse_args(["--no-dynamics-run-open-rollout-validation"])
+    disabled_config = build_config(disabled_args)
+    assert disabled_config.dynamics_run_open_rollout_validation is False
 
 
 def test_run_build_config_preserves_kl_flag() -> None:

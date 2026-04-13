@@ -2,368 +2,190 @@
 
 ## Summary
 
-The source of truth for the autoencoder is `world_model_v2/wan_vae.py`.
-This repo now supports a single autoencoder backend: the Wan-style VAE used by `WorldModel`.
-- `--mode ae_only` for Wan VAE reconstruction training
-- `--mode dynamics_only` for latent dynamics training with the autoencoder frozen
+The source of truth for the autoencoder lives in `world_model_v2/wan_vae.py`, with the repo-facing integration in `world_model_v2/model.py`.
 
-The current deployed config comes from `WorldModel`, which instantiates:
+This repo now uses one default autoencoder path:
 
-- `dim = 64`
-- `z_dim = 16`
-- `dim_mult = (1, 2, 4, 4)`
+- a Wan2.1-style causal video tokenizer
+- `8x` spatial compression
+- `4x` temporal compression
+- `z_dim = 32`
+
+The world-model stack follows DreamDojo-style timing semantics end to end. The default latent layout is:
+
+- `1` context latent frame
+- `3` target latent frames
+
+That corresponds to:
+
+- `13` pixel frames per full training chunk
+- `12` actions per chunk
+
+## Active Default Config
+
+`WorldModel` instantiates the tokenizer with:
+
+- `dim = 96`
+- `z_dim = 32`
+- `dim_mult = (1, 2, 2, 4)`
 - `num_res_blocks = 1`
 - `attn_scales = ()`
-- `temperal_downsample = (False, False, False)`
+- `temperal_downsample = (False, True, True)`
 - `dropout = 0.0`
 
-Important: the config field is spelled `temperal_downsample` in code. The doc keeps that spelling because it is part of the actual API and serialized config.
+Important: the config field is spelled `temperal_downsample` in code and checkpoints, so the docs keep that spelling.
 
-## What The VAE Does In This Repo
+## Temporal Mapping
 
-At a high level, the Wan VAE compresses RGB frames into 16-channel latent maps and reconstructs them back to RGB:
+The tokenizer uses the Wan2.1 frame mapping:
 
 $$
-x \;\xrightarrow{\text{encoder}}\; (\mu, \log \sigma^2)
-\;\xrightarrow{\text{sample or mean}}\; z
-\;\xrightarrow{\text{decoder}}\; \hat{x}
+\text{latent\_T} = 1 + \left\lfloor \frac{\text{pixel\_T} - 1}{4} \right\rfloor
 $$
 
-For the default 128x128 setup used by the repo:
+and the inverse reconstruction length:
 
-- input frame shape: `(B, 3, 128, 128)`
-- posterior mean shape: `(B, 16, 16, 16)`
-- posterior log-variance shape: `(B, 16, 16, 16)`
-- reconstruction shape: `(B, 3, 128, 128)`
+$$
+\text{pixel\_T} = 1 + 4 \cdot (\text{latent\_T} - 1)
+$$
 
-That is an 8x spatial downsample in height and width, so one frame goes from `3 x 128 x 128 = 49,152` scalars to `16 x 16 x 16 = 4,096` latent scalars, which is a 12x reduction in per-frame element count.
+For the default setup:
 
-## Active Model Size
+- `1` pixel frame encodes to `1` latent frame and decodes back to `1`
+- `5` pixel frames encode to `2` latent frames and decode back to `5`
+- `13` pixel frames encode to `4` latent frames and decode back to `13`
 
-Measured from the instantiated default modules in the repo virtualenv:
+This is why the default dynamics chunk is `13` pixel frames wide even though the latent transformer sees `4` frames.
 
-- encoder params: `15,466,528`
-- decoder params: `25,754,755`
-- total VAE params: `41,221,283`
+## Spatial Mapping
+
+Spatial compression remains `8x`:
+
+- input video: `(B, T, 3, H, W)`
+- latent video: `(B, 32, T_latent, H/8, W/8)`
+- decoded video: `(B, T, 3, H, W)`
+
+At `128 x 128` resolution, a `13`-frame clip becomes a latent tensor of shape `(B, 32, 4, 16, 16)`.
+
+## Parameter Count
+
+Measured from the default instantiated modules in the repo virtualenv:
+
+- encoder params: `28,213,824`
+- decoder params: `43,374,915`
+- total VAE params: `71,588,739`
 - parameter memory only:
-  - about `157.25 MiB` in fp32
-  - about `78.62 MiB` in fp16/bf16
+  - about `273.09 MiB` in fp32
+  - about `136.55 MiB` in fp16 or bf16
 
-The decoder is larger than the encoder because each decoder stage uses `num_res_blocks + 1` residual blocks, while each encoder stage uses `num_res_blocks`.
-
-## Core Logic Blocks In `wan_vae.py`
+## Core Components
 
 ### `WanVAEConfig`
 
-Holds the backend hyperparameters and validates the shape assumptions:
+`WanVAEConfig` owns the tokenizer hyperparameters and the frame-conversion helpers:
 
-- `dim_mult` must be non-empty
-- `temperal_downsample` must have exactly `len(dim_mult) - 1` entries
-- `spatial_downsample_factor()` returns the total spatial compression factor, which is `8` for the default config
-- `to_dict()` produces the checkpoint-friendly serialized config
+- `spatial_downsample_factor()`
+- `temporal_downsample_factor()`
+- `pixel_frames_to_latent_frames()`
+- `latent_frames_to_pixel_frames()`
+- `exact_latent_frames_for_pixels()`
+- `to_dict()` and `from_dict()`
+
+Those helpers are used by datasets, rollout code, validation, and checkpoint compatibility checks.
 
 ### `CausalConv3d`
 
-Wraps `nn.Conv3d` but replaces normal symmetric temporal padding with explicit causal padding:
-
-- spatial padding stays symmetric
-- temporal padding is one-sided into the past
-- future frames are never visible to the convolution
-
-This matters if the 3D backbone is used on videos directly.
-
-### `RMSNorm`
-
-Channel-first RMS normalization with learned scale and optional bias:
-
-- `images=True` creates 2D broadcast shapes for frame-wise attention tensors
-- `images=False` creates 3D broadcast shapes for video tensors
-
-### `AttentionBlock`
-
-Per-frame spatial self-attention over a 5D tensor `(B, C, T, H, W)`:
-
-- it flattens `(B, T)` together
-- runs attention independently on each frame
-- does not mix information across time
-- the output projection is zero-initialized, so the block starts close to an identity residual update
-
-This is important: the attention path is spatial-only, not temporal.
+The backbone uses causal temporal padding so each convolution only sees the current frame and the past.
 
 ### `Resample`
 
-Handles up/down sampling for 5D tensors:
+`Resample` implements Wan-style spatial and temporal up/downsampling. With the default `temperal_downsample = (False, True, True)`:
 
-- `downsample2d` and `upsample2d` change only height and width
-- `downsample3d` and `upsample3d` change time as well
-- `none` is an identity path
+- the first downsample stage is spatial-only
+- the second and third downsample stages compress time by `2x`
+- the total temporal compression becomes `4x`
 
-In the default repo config, only the 2D resampling modes are active because `temperal_downsample` is all `False`.
+The decoder mirrors that schedule during reconstruction.
 
-### `ResidualBlock`
+### `WanPosteriorEncoder`
 
-A Wan-style residual block:
+`WanPosteriorEncoder` is the full video encoder used by the world model. It accepts 5D video tensors and runs the cached causal encode loop used by Wan-style temporal tokenizers.
 
-```text
-RMSNorm -> SiLU -> causal 3D conv -> RMSNorm -> SiLU -> dropout -> causal 3D conv + shortcut
-```
+This is the important behavior change relative to the old framewise path:
 
-If the channel count changes, the shortcut uses a `1x1x1` causal convolution; otherwise it is an identity.
+- sequence encoding no longer flattens `(B, T)` into independent images
+- the encoder sees the whole clip as one causal video
+- latent frame boundaries now match the tokenizer's real temporal compression
 
-### `WanEncoder3d`
+### `WanVideoDecoder`
 
-Builds the encoder backbone for video tensors:
+`WanVideoDecoder` performs the matching cached causal decode loop. It reconstructs whole clips with the correct Wan frame counts.
 
-1. `conv_in` maps RGB to the base feature width.
-2. A stack of down blocks applies residual processing.
-3. Optional attention can be inserted at selected spatial scales through `attn_scales`.
-4. Each non-final stage downsamples spatially or spatio-temporally.
-5. A middle bottleneck runs `ResidualBlock -> AttentionBlock -> ResidualBlock`.
-6. `norm_out -> SiLU -> conv_out` produces `2 * z_dim` channels.
-7. The output is split into $(\mu, \log \sigma^2)$.
+For predicted videos, the repo now decodes:
 
-For the default config, the encoder channel schedule is:
+- `context_latents + target_latents` together
 
-- `3 -> 64` via `conv_in`
-- stage 0: `64 -> 64`, then downsample by 2
-- stage 1: `64 -> 128`, then downsample by 2
-- stage 2: `128 -> 256`, then downsample by 2
-- stage 3: `256 -> 256`, no further downsample
-- bottleneck at `256` channels
-- output moments: `32` channels total, split into $16$ for $\mu$ and $16$ for $\log \sigma^2$
+and then crops away the context pixel frames after decoding. Target latents are not decoded in isolation, which keeps temporal alignment consistent with Wan2.1 and DreamDojo.
 
-### `WanDecoder3d`
+### Image Wrappers
 
-Mirrors the encoder and reconstructs RGB frames:
+Single-frame image encode/decode is still supported, but only as a thin wrapper:
 
-1. `conv_in` maps latent channels to the widest feature width.
-2. A middle bottleneck again runs `ResidualBlock -> AttentionBlock -> ResidualBlock`.
-3. Up blocks apply residual processing.
-4. Each non-final stage upsamples spatially or spatio-temporally.
-5. `norm_out -> SiLU -> conv_out -> sigmoid` returns RGB in `[0, 1]`.
+- images are temporarily reshaped to a one-frame video
+- all real sequence paths use the 5D video tokenizer directly
 
-For the default config, the decoder channel schedule is:
+## World-Model Integration
 
-- `16 -> 256` via `conv_in`
-- stage 0: `256 -> 256`, then upsample by 2
-- stage 1: `256 -> 256`, then upsample by 2
-- stage 2: `256 -> 128`, then upsample by 2
-- stage 3: `128 -> 64`, no further upsample
-- output: `3` RGB channels
+`WorldModel` stores tokenizer metadata and latent normalization stats together:
 
-### `WanVAEEncoder` and `WanVAEDecoder`
+- serialized Wan config
+- `img_mean` and `img_std`
+- `video_mean` and `video_std`
 
-These are the image-facing wrappers used by the rest of the repo:
+Image latents and video latents are normalized before they are passed into dynamics and unnormalized before decoding.
 
-- `WanVAEEncoder` adds a singleton time dimension before calling `WanEncoder3d`, then squeezes time back out
-- `WanVAEDecoder` does the inverse for latent image tensors
+This matches the DreamDojo-style latent-stat handling used by the downstream transformer path.
 
-This lets the repo reuse one implementation for both image and video-shaped tensors.
+## Dataset And Training Semantics
 
-### `kl_divergence_from_moments`
+Autoencoder training now uses clip datasets rather than frame-only datasets.
 
-Computes the KL penalty from $(\mu, \log \sigma^2)$ against a unit Gaussian prior:
+The default AE clip size is the full latent training chunk mapped back to pixels:
 
 $$
-\mathcal{L}_{\mathrm{KL}}
-= \frac{1}{2}\,\operatorname{mean}\!\left(
-\exp(\log \sigma^2) + \mu^2 - 1 - \log \sigma^2
-\right)
+\text{pixel\_frames} = 1 + 4 \cdot ((1 + 3) - 1) = 13
 $$
 
-### `sample_posterior`
+So the default AE batch element is a `13`-frame clip.
 
-Implements the reparameterization trick:
+Dynamics training also works in pixel clips:
 
-$$
-\sigma = \exp\!\left(\frac{1}{2}\log \sigma^2\right), \qquad
-\varepsilon \sim \mathcal{N}(0, I), \qquad
-z = \mu + \sigma \odot \varepsilon
-$$
+- context: `1` latent frame -> `1` pixel frame
+- target: `3` latent frames -> `12` future actions and `12` future frame steps
+- full encoded chunk: `13` pixel frames -> `4` latent frames
 
-## Encoder And Decoder Flow
+During training, the combined pixel clip is encoded once and then split in latent space. That avoids the frame-misalignment bug that happens when context and target windows are encoded separately.
 
-The actual default path is easiest to picture as:
+## Validation And Rollout Semantics
 
-```text
-(B, 3, H, W)
-  -> WanVAEEncoder
-  -> unsqueeze to (B, 3, 1, H, W)
-  -> 3D causal encoder backbone
-  -> moments (B, 32, 1, H/8, W/8)
-  -> split to μ / log σ²
-  -> squeeze to (B, 16, H/8, W/8)
+Validation and rollout APIs are now pixel-facing:
 
-(B, 16, H/8, W/8)
-  -> WanVAEDecoder
-  -> unsqueeze to (B, 16, 1, H/8, W/8)
-  -> 3D causal decoder backbone
-  -> RGB logits
-  -> sigmoid
-  -> squeeze to (B, 3, H, W)
-```
+- callers pass pixel frames and pixel-aligned actions
+- the model converts those counts into latent lengths internally
+- decoding expands predictions back to the correct pixel-frame counts
 
-## Training Loss
+Examples:
 
-In `ae_only` mode, the repo trains the Wan VAE with a KL-regularized reconstruction loss:
+- conditioning on `1` pixel frame produces the next `4` predicted pixel frames per chunk
+- conditioning on `5` pixel frames means the tokenizer sees `2` latent context frames
+- a default open-rollout chunk adds `12` actions and `12` new pixel frames
 
-$$
-\mathcal{L}_{\mathrm{AE}}
-= \mathcal{L}_{\mathrm{recon}} + \beta_{\mathrm{KL}}\,\mathcal{L}_{\mathrm{KL}}
-$$
+## Checkpoint Compatibility
 
-where:
+Checkpoint metadata now includes the full tokenizer config and latent normalization stats.
 
-$$
-\mathcal{L}_{\mathrm{KL}}
-= \frac{1}{2}\,\operatorname{mean}\!\left(
-\exp(\log \sigma^2) + \mu^2 - 1 - \log \sigma^2
-\right)
-$$
+That means:
 
-and the reconstruction term is the normalized weighted mixture used in
-`Experiment.reconstruction_loss_terms(...)`:
-
-$$
-\mathcal{L}_{\mathrm{recon}}
-=
-\frac{
-w_{\mathrm{mse}}\,\mathcal{L}_{\mathrm{mse}}
-\, + \,
-w_{\mathrm{l1}}\,\mathcal{L}_{\mathrm{l1}}
-\, + \,
-w_{\mathrm{edge}}\,\mathcal{L}_{\mathrm{edge}}
-}{
-w_{\mathrm{mse}} + w_{\mathrm{l1}} + w_{\mathrm{edge}}
-}
-$$
-
-with:
-
-$$
-\mathcal{L}_{\mathrm{mse}}
-=
-\frac{1}{N}\sum_{i=1}^{N}(\hat{x}_i - x_i)^2
-$$
-
-$$
-\mathcal{L}_{\mathrm{l1}}
-=
-\frac{1}{N}\sum_{i=1}^{N}\left|\hat{x}_i - x_i\right|
-$$
-
-$$
-\partial_x u = u[..., :, 1:] - u[..., :, :-1]
-\qquad\text{and}\qquad
-\partial_y u = u[..., 1:, :] - u[..., :-1, :]
-$$
-
-$$
-\mathcal{L}_{\mathrm{edge}}
-= \frac{1}{2}\left(
-\frac{1}{N_x}\sum_{i=1}^{N_x}\left|(\partial_x \hat{x})_i - (\partial_x x)_i\right|
-+
-\frac{1}{N_y}\sum_{i=1}^{N_y}\left|(\partial_y \hat{x})_i - (\partial_y x)_i\right|
-\right)
-$$
-
-Here:
-
-- `x` is the target image batch
-- $\hat{x}$ is the reconstructed image batch
-- `N` is the number of scalar elements in the image batch
-- `N_x` and `N_y` are the number of scalar elements in the horizontal and vertical gradient tensors
-- $\partial_x$ and $\partial_y$ are the finite-difference image gradients used in `finite_difference_gradients(...)`
-- $\beta_{\mathrm{KL}}$ controls how strongly the posterior is pushed toward a unit Gaussian prior
-
-Important practical detail:
-
-- training uses `sample_posterior=True`, so reconstruction is computed from sampled latents
-- validation uses `sample_posterior=False`, so reconstruction is computed from the posterior mean
-
-### Best Pickplace VAE Loss Settings
-
-The curated checkpoint in `saved_checkpoints/best_vae/` was trained with:
-
-- `--recon-mse-weight 1.0`
-- `--recon-l1-weight 1.0`
-- `--recon-edge-weight 0.25`
-- `--kl-beta 5e-5`
-
-Plugging those values into the normalized reconstruction formula gives:
-
-$$
-\mathcal{L}_{\mathrm{recon}}
-=
-\frac{
-1.0\,\mathcal{L}_{\mathrm{mse}}
-\, + \,
-1.0\,\mathcal{L}_{\mathrm{l1}}
-\, + \,
-0.25\,\mathcal{L}_{\mathrm{edge}}
-}{
-2.25
-}
-$$
-
-and the full autoencoder objective for that run is:
-
-$$
-\mathcal{L}_{\mathrm{AE}}
-=
-\frac{
-\mathcal{L}_{\mathrm{mse}}
-\, + \,
-\mathcal{L}_{\mathrm{l1}}
-\, + \,
-0.25\,\mathcal{L}_{\mathrm{edge}}
-}{
-2.25
-}
-+
-5\times 10^{-5}\,\mathcal{L}_{\mathrm{KL}}
-$$
-
-So the effective reconstruction mix is about:
-
-- `44.4%` MSE
-- `44.4%` L1
-- `11.1%` edge
-
-with a relatively small KL coefficient. In practice, that biases training toward
-pixel fidelity and sharp local detail while still keeping a light latent
-regularization term.
-
-## Inference Path
-
-At inference time, the repo uses the deterministic posterior mean rather than sampling:
-
-$$
-z_{\mathrm{infer}} = \mu
-$$
-
-and reconstruction becomes:
-
-$$
-\hat{x}_{\mathrm{infer}} = D(\mu)
-$$
-
-This is the path used by `WorldModel.encode(..., deterministic=True)` and by
-the sequence helpers that feed the dynamics model. For a frame sequence
-$x_{1:T}$, the deployed path is:
-
-$$
-z_t = \mu(x_t), \qquad t = 1, \dots, T
-$$
-
-followed later by frame-wise decoding:
-
-$$
-\hat{x}_t = D(z_t)
-$$
-
-So during inference and rollout:
-
-- no latent noise sample $\varepsilon$ is drawn
-- no stochastic posterior sample $z = \mu + \sigma \odot \varepsilon$ is used
-- the autoencoder contributes a deterministic latent representation based only on $\mu$
+- temporal Wan checkpoints can be resumed safely
+- encoder/decoder loading requires matching tokenizer config and stats
+- older spatial-only checkpoints fail fast with a clear incompatibility error instead of silently mis-shaping temporal data

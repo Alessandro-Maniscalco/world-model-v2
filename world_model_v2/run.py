@@ -75,7 +75,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resolution", type=int, default=128)
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
-    parser.add_argument("--latent-channels", type=int, default=16)
+    parser.add_argument("--latent-channels", type=int, default=32)
     parser.add_argument("--hidden-channels", type=int, default=64)
     parser.add_argument("--dynamics-infer-steps", type=int, default=35)
     parser.add_argument("--dynamics-train-timesteps", type=int, default=1000)
@@ -140,6 +140,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "open_rollout_consistency_score",
         ],
         default="next_frame_mse",
+    )
+    parser.add_argument(
+        "--dynamics-run-open-rollout-validation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
     )
     parser.add_argument("--kl-beta", type=float, default=1e-4)
     parser.add_argument("--recon-mse-weight", type=float, default=1.0)
@@ -238,6 +243,7 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         dynamics_rope_t_extrapolation_ratio=args.dynamics_rope_t_extrapolation_ratio,
         dynamics_use_learned_temporal_embedding=args.dynamics_use_learned_temporal_embedding,
         dynamics_validation_metric=args.dynamics_validation_metric,
+        dynamics_run_open_rollout_validation=args.dynamics_run_open_rollout_validation,
         kl_beta=args.kl_beta,
         recon_mse_weight=args.recon_mse_weight,
         recon_l1_weight=args.recon_l1_weight,

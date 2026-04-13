@@ -30,7 +30,7 @@ from world_model_v2.model import WorldModel
 from world_model_v2.utils.checkpointing import append_jsonl
 
 
-DEBUG_FRAME_KWARGS = {"frame_start": 111, "frame_end": 116}
+DEBUG_FRAME_KWARGS = {"frame_start": 111, "frame_end": 123}
 
 
 def _all_trainable(module: torch.nn.Module) -> bool:
@@ -114,14 +114,14 @@ def test_experiment_dynamics_only_requires_encoder_decoder_checkpoint(
         )
 
 
-def test_experiment_dynamics_only_requires_at_least_four_frames(
+def test_experiment_dynamics_only_requires_at_least_one_temporal_window(
     fake_long_dataset_root: Path,
     saved_world_model_ae_checkpoint: Path,
     tmp_path: Path,
 ) -> None:
-    """Dynamics-only mode should reject a three-frame clip with no valid 4-frame window."""
+    """Dynamics-only mode should reject clips shorter than one 13-frame temporal window."""
 
-    with pytest.raises(ValueError, match="at least 4 frames"):
+    with pytest.raises(ValueError, match="at least 13 pixel frames"):
         Experiment(
             ExperimentConfig(
                 mode="dynamics_only",
@@ -150,7 +150,7 @@ def test_experiment_supports_custom_dynamics_layout_controls(
             output_dir=str(tmp_path / "outputs"),
             run_name="custom_layout",
             frame_start=111,
-            frame_end=112,
+            frame_end=115,
             load_encoder_decoder=str(saved_world_model_ae_checkpoint),
             conditional_frame_sigma=1e-4,
             dynamics_context_frames=1,
@@ -722,13 +722,15 @@ def test_dynamics_training_step_adds_rollout_self_forcing_auxiliary_loss(
     )
 
     def fake_encode_frame_sequence(images: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
-        """Return the right latent slice for target versus future-target encoding."""
+        """Return one combined latent sequence for the concatenated temporal training chunk."""
 
         del deterministic
-        if images.shape[1] == 2 and torch.equal(images, batch["target_frames"]):
-            return clean_latent_video[:, :, 1:]
-        if images.shape[1] == 2 and torch.equal(images, batch["future_target_frames"]):
-            return future_target_latent_video
+        expected_images = torch.cat(
+            [batch["context_frames"], batch["target_frames"], batch["future_target_frames"]],
+            dim=1,
+        )
+        if torch.equal(images, expected_images):
+            return torch.cat([clean_latent_video, future_target_latent_video], dim=2)
         raise AssertionError("Unexpected image batch passed to encode_frame_sequence.")
 
     monkeypatch.setattr(experiment.model, "encode_frame_sequence", fake_encode_frame_sequence)
@@ -1003,13 +1005,15 @@ def test_dynamics_training_step_delays_rollout_self_forcing_auxiliary_during_own
     )
 
     def fake_encode_frame_sequence(images: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
-        """Return the right latent slice for target versus future-target encoding."""
+        """Return one combined latent sequence for the concatenated temporal training chunk."""
 
         del deterministic
-        if images.shape[1] == 2 and torch.equal(images, batch["target_frames"]):
-            return clean_latent_video[:, :, 1:]
-        if images.shape[1] == 2 and torch.equal(images, batch["future_target_frames"]):
-            return future_target_latent_video
+        expected_images = torch.cat(
+            [batch["context_frames"], batch["target_frames"], batch["future_target_frames"]],
+            dim=1,
+        )
+        if torch.equal(images, expected_images):
+            return torch.cat([clean_latent_video, future_target_latent_video], dim=2)
         raise AssertionError("Unexpected image batch passed to encode_frame_sequence.")
 
     monkeypatch.setattr(experiment.model, "encode_frame_sequence", fake_encode_frame_sequence)
@@ -1109,13 +1113,15 @@ def test_dynamics_training_step_ramps_rollout_self_forcing_auxiliary_after_own_w
     )
 
     def fake_encode_frame_sequence(images: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
-        """Return the right latent slice for target versus future-target encoding."""
+        """Return one combined latent sequence for the concatenated temporal training chunk."""
 
         del deterministic
-        if images.shape[1] == 2 and torch.equal(images, batch["target_frames"]):
-            return clean_latent_video[:, :, 1:]
-        if images.shape[1] == 2 and torch.equal(images, batch["future_target_frames"]):
-            return future_target_latent_video
+        expected_images = torch.cat(
+            [batch["context_frames"], batch["target_frames"], batch["future_target_frames"]],
+            dim=1,
+        )
+        if torch.equal(images, expected_images):
+            return torch.cat([clean_latent_video, future_target_latent_video], dim=2)
         raise AssertionError("Unexpected image batch passed to encode_frame_sequence.")
 
     monkeypatch.setattr(experiment.model, "encode_frame_sequence", fake_encode_frame_sequence)
@@ -1268,12 +1274,12 @@ def test_dynamics_rollout_self_forcing_loss_uses_same_context_rollout_semantics(
             primary_clean_latent_video,
             num_conditional_frames=1,
         ),
-        actions=torch.tensor([[[0.0, 1.0, 2.0, 3.0], [1.0, 2.0, 3.0, 4.0]]]),
+        actions=torch.arange(32, dtype=torch.float32).view(1, 8, 4),
         target_sigmas=torch.ones(1),
         num_conditional_frames=torch.ones(1, dtype=torch.long),
         use_video_condition=torch.ones(1, dtype=torch.bool),
     )
-    future_actions = torch.tensor([[[2.0, 3.0, 4.0, 5.0], [3.0, 4.0, 5.0, 6.0]]])
+    future_actions = torch.arange(32, 64, dtype=torch.float32).view(1, 8, 4)
     captured_contexts: list[torch.Tensor] = []
     captured_actions: list[torch.Tensor] = []
 
@@ -1307,10 +1313,7 @@ def test_dynamics_rollout_self_forcing_loss_uses_same_context_rollout_semantics(
     assert stats["latent_rf_self_forcing_rollout_mse_chunk1"] == pytest.approx(1.0)
     assert len(captured_contexts) == 1
     assert torch.equal(captured_contexts[0], primary_clean_latent_video[:, :, 2:3])
-    assert torch.equal(
-        captured_actions[0],
-        torch.tensor([[[2.0, 3.0, 4.0, 5.0], [3.0, 4.0, 5.0, 6.0]]]),
-    )
+    assert torch.equal(captured_actions[0], future_actions)
 
 
 def test_experiment_rejects_validation_plateau_without_validation_interval(
@@ -1335,6 +1338,29 @@ def test_experiment_rejects_validation_plateau_without_validation_interval(
         )
 
 
+def test_experiment_rejects_disabling_open_rollout_for_open_rollout_metric(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Open-rollout metrics should fail fast when rollout validation is explicitly disabled."""
+
+    with pytest.raises(ValueError, match="requires open-rollout stats"):
+        Experiment(
+            ExperimentConfig(
+                mode="dynamics_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="invalid_open_rollout_validation_toggle",
+                **DEBUG_FRAME_KWARGS,
+                load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+                dynamics_validation_metric="open_rollout_frame_mse",
+                dynamics_run_open_rollout_validation=False,
+                device="cpu",
+            )
+        )
+
+
 def test_experiment_ae_only_can_train_all_episodes_with_separate_validation_clip(
     fake_multi_episode_dataset_root: Path,
     tmp_path: Path,
@@ -1354,7 +1380,7 @@ def test_experiment_ae_only_can_train_all_episodes_with_separate_validation_clip
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 245
+    assert len(experiment.train_dataset) == 221
     validation_batch = next(iter(experiment.val_loader))
     assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
     assert validation_batch["frames"].shape[1] == 130
@@ -1374,22 +1400,23 @@ def test_experiment_supports_metaworld_ae_training(
             split="train",
             train_all_episodes=True,
             validation_split="val",
-            validation_episode=0,
+            validation_episode=1,
             metaworld_task_index=0,
             batch_size=2,
             resolution=8,
+            dynamics_target_frames=1,
             output_dir=str(tmp_path / "outputs"),
             run_name="metaworld_ae",
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 3
+    assert len(experiment.train_dataset) == 1
     train_batch = next(iter(experiment.train_loader))
     validation_batch = next(iter(experiment.val_loader))
-    assert train_batch["frame"].shape == (2, 3, 8, 8)
-    assert train_batch["episode_idx"].reshape(-1)[0].item() == 1
-    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
-    assert validation_batch["frames"].shape[1:] == (5, 3, 8, 8)
+    assert train_batch["frames"].shape == (1, 5, 3, 8, 8)
+    assert train_batch["episode_idx"].reshape(-1)[0].item() == 0
+    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 1
+    assert validation_batch["frames"].shape[1:] == (3, 3, 8, 8)
 
 
 def test_experiment_supports_aloha_ae_training(
@@ -1406,22 +1433,23 @@ def test_experiment_supports_aloha_ae_training(
             split="train",
             train_all_episodes=True,
             validation_split="val",
-            validation_episode=0,
+            validation_episode=1,
             batch_size=2,
             resolution=8,
+            dynamics_target_frames=1,
             output_dir=str(tmp_path / "outputs"),
             run_name="aloha_ae",
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 3
+    assert len(experiment.train_dataset) == 1
     assert experiment.model.dynamics.cfg.action_dim == 14
     train_batch = next(iter(experiment.train_loader))
     validation_batch = next(iter(experiment.val_loader))
-    assert train_batch["frame"].shape == (2, 3, 8, 8)
-    assert train_batch["episode_idx"].reshape(-1)[0].item() == 1
-    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
-    assert validation_batch["frames"].shape[1:] == (5, 3, 8, 8)
+    assert train_batch["frames"].shape == (1, 5, 3, 8, 8)
+    assert train_batch["episode_idx"].reshape(-1)[0].item() == 0
+    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 1
+    assert validation_batch["frames"].shape[1:] == (3, 3, 8, 8)
 
 
 def test_experiment_supports_maniskill_ae_training(
@@ -1438,22 +1466,23 @@ def test_experiment_supports_maniskill_ae_training(
             split="train",
             train_all_episodes=True,
             validation_split="val",
-            validation_episode=0,
+            validation_episode=1,
             batch_size=2,
             resolution=8,
+            dynamics_target_frames=1,
             output_dir=str(tmp_path / "outputs"),
             run_name="maniskill_ae",
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 3
+    assert len(experiment.train_dataset) == 1
     assert experiment.model.dynamics.cfg.action_dim == 8
     train_batch = next(iter(experiment.train_loader))
     validation_batch = next(iter(experiment.val_loader))
-    assert train_batch["frame"].shape == (2, 3, 8, 8)
-    assert train_batch["episode_idx"].reshape(-1)[0].item() == 1
-    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
-    assert validation_batch["frames"].shape[1:] == (5, 3, 8, 8)
+    assert train_batch["frames"].shape == (1, 5, 3, 8, 8)
+    assert train_batch["episode_idx"].reshape(-1)[0].item() == 0
+    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 1
+    assert validation_batch["frames"].shape[1:] == (3, 3, 8, 8)
 
 
 def test_experiment_supports_lerobot_so101_base_sim_pickplace_ae_training(
@@ -1470,22 +1499,23 @@ def test_experiment_supports_lerobot_so101_base_sim_pickplace_ae_training(
             split="train",
             train_all_episodes=True,
             validation_split="val",
-            validation_episode=0,
+            validation_episode=1,
             batch_size=2,
             resolution=8,
+            dynamics_target_frames=1,
             output_dir=str(tmp_path / "outputs"),
             run_name="lerobot_so101_base_sim_pickplace_ae",
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 3
+    assert len(experiment.train_dataset) == 1
     assert experiment.model.dynamics.cfg.action_dim == 6
     train_batch = next(iter(experiment.train_loader))
     validation_batch = next(iter(experiment.val_loader))
-    assert train_batch["frame"].shape == (2, 3, 8, 8)
-    assert train_batch["episode_idx"].reshape(-1)[0].item() == 1
-    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
-    assert validation_batch["frames"].shape[1:] == (5, 3, 8, 8)
+    assert train_batch["frames"].shape == (1, 5, 3, 8, 8)
+    assert train_batch["episode_idx"].reshape(-1)[0].item() == 0
+    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 1
+    assert validation_batch["frames"].shape[1:] == (3, 3, 8, 8)
 
 
 def test_experiment_dynamics_only_can_train_all_episodes_with_separate_validation_clip(
@@ -1509,18 +1539,18 @@ def test_experiment_dynamics_only_can_train_all_episodes_with_separate_validatio
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 239
-    assert experiment.train_dataset[127]["episode_idx"].item() == 1
+    assert len(experiment.train_dataset) == 221
+    assert experiment.train_dataset[118]["episode_idx"].item() == 1
     validation_batch = next(iter(experiment.val_loader))
     assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
     assert validation_batch["frames"].shape[1] == 130
 
 
-def test_experiment_ae_motion_loss_requests_neighbor_frames(
+def test_experiment_ae_motion_loss_uses_clip_batches(
     fake_lerobot_so101_base_sim_pickplace_root: Path,
     tmp_path: Path,
 ) -> None:
-    """Motion-weighted AE runs should receive neighboring GT frames in each training batch."""
+    """Motion-weighted AE runs should still receive temporal clip batches for reconstruction."""
 
     experiment = Experiment(
         ExperimentConfig(
@@ -1530,9 +1560,10 @@ def test_experiment_ae_motion_loss_requests_neighbor_frames(
             split="train",
             train_all_episodes=True,
             validation_split="val",
-            validation_episode=0,
+            validation_episode=1,
             batch_size=2,
             resolution=8,
+            dynamics_target_frames=1,
             recon_motion_weight=0.5,
             output_dir=str(tmp_path / "outputs"),
             run_name="lerobot_so101_motion_ae",
@@ -1540,8 +1571,9 @@ def test_experiment_ae_motion_loss_requests_neighbor_frames(
         )
     )
     train_batch = next(iter(experiment.train_loader))
-    assert train_batch["prev_frame"].shape == (2, 3, 8, 8)
-    assert train_batch["next_frame"].shape == (2, 3, 8, 8)
+    assert train_batch["frames"].shape == (1, 5, 3, 8, 8)
+    assert "prev_frame" not in train_batch
+    assert "next_frame" not in train_batch
 
 
 def test_experiment_supports_metaworld_dynamics_training_across_all_episodes(
@@ -1559,7 +1591,6 @@ def test_experiment_supports_metaworld_dynamics_training_across_all_episodes(
             split="train",
             train_all_episodes=True,
             validation_split="val",
-            validation_episode=0,
             metaworld_task_index=0,
             batch_size=2,
             resolution=8,
@@ -1568,17 +1599,19 @@ def test_experiment_supports_metaworld_dynamics_training_across_all_episodes(
             load_encoder_decoder=str(saved_world_model_ae_checkpoint),
             output_dir=str(tmp_path / "outputs"),
             run_name="metaworld_dynamics_all_episodes",
+            validation_episode=1,
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 2
-    assert experiment.train_dataset[0]["episode_idx"].item() == 1
+    assert len(experiment.train_dataset) == 1
+    assert experiment.train_dataset[0]["episode_idx"].item() == 0
     train_batch = next(iter(experiment.train_loader))
     validation_batch = next(iter(experiment.val_loader))
     assert train_batch["context_frames"].shape[1:] == (1, 3, 8, 8)
-    assert train_batch["episode_idx"].reshape(-1)[0].item() == 1
-    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
-    assert validation_batch["frames"].shape[1:] == (5, 3, 8, 8)
+    assert train_batch["target_frames"].shape[1:] == (4, 3, 8, 8)
+    assert train_batch["episode_idx"].reshape(-1)[0].item() == 0
+    assert validation_batch["episode_idx"].reshape(-1)[0].item() == 1
+    assert validation_batch["frames"].shape[1:] == (3, 3, 8, 8)
 
 
 def test_experiment_excludes_validation_episodes_from_same_split_all_episode_training(
@@ -1602,7 +1635,7 @@ def test_experiment_excludes_validation_episodes_from_same_split_all_episode_tra
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 112
+    assert len(experiment.train_dataset) == 103
     assert experiment.train_dataset[0]["episode_idx"].item() == 1
 
 
@@ -1620,7 +1653,6 @@ def test_experiment_excludes_metaworld_validation_episodes_from_all_episode_trai
             data_root=str(fake_metaworld_dataset_root),
             split="train",
             train_all_episodes=True,
-            validation_episodes=(0,),
             metaworld_task_index=0,
             batch_size=2,
             resolution=8,
@@ -1629,11 +1661,12 @@ def test_experiment_excludes_metaworld_validation_episodes_from_all_episode_trai
             load_encoder_decoder=str(saved_world_model_ae_checkpoint),
             output_dir=str(tmp_path / "outputs"),
             run_name="metaworld_excluding_validation",
+            validation_episodes=(1,),
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 2
-    assert experiment.train_dataset[0]["episode_idx"].item() == 1
+    assert len(experiment.train_dataset) == 1
+    assert experiment.train_dataset[0]["episode_idx"].item() == 0
 
 
 def test_experiment_auto_batch_size_uses_requested_ceiling_on_cpu(

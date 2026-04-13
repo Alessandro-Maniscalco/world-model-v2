@@ -17,11 +17,12 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from einops import rearrange
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torch.utils.data._utils.collate import default_collate
 
 from world_model_v2.dataset import (
-    FrameDataset,
+    AutoencoderClipDataset,
     TransitionDataset,
     ValidationClipDataset,
 )
@@ -32,7 +33,7 @@ from world_model_v2.dynamics_transformer import (
 )
 from world_model_v2.dynamics_transformer import DynamicsTrainingInputs
 from world_model_v2.lerobot_video_dataset import (
-    LeRobotVideoFrameDataset,
+    LeRobotVideoAutoencoderClipDataset,
     LeRobotVideoTransitionDataset,
     LeRobotVideoValidationClipDataset,
     SO101_BASE_SIM_PICKPLACE_ACTION_DIM,
@@ -44,7 +45,7 @@ from world_model_v2.maniskill_dataset import (
     MANISKILL_DEFAULT_CAMERA,
     MANISKILL_DEFAULT_TRAJ_H5,
     MANISKILL_DEFAULT_TRAJ_JSON,
-    ManiSkillFrameDataset,
+    ManiSkillAutoencoderClipDataset,
     ManiSkillTransitionDataset,
     ManiSkillValidationClipDataset,
 )
@@ -52,18 +53,19 @@ from world_model_v2.metaworld_dataset import (
     ALOHA_SIM_TRANSFER_CUBE_SCRIPTED_ACTION_DIM,
     ALOHA_SIM_TRANSFER_CUBE_SCRIPTED_DATASET_ID,
     ALOHA_SIM_TRANSFER_CUBE_SCRIPTED_IMAGE_COLUMN,
-    AlohaFrameDataset,
+    AlohaAutoencoderClipDataset,
     AlohaTransitionDataset,
     AlohaValidationClipDataset,
     METAWORLD_DATASET_ID,
     METAWORLD_ACTION_DIM,
-    MetaWorldFrameDataset,
+    MetaWorldAutoencoderClipDataset,
     MetaWorldTransitionDataset,
     MetaWorldValidationClipDataset,
 )
-from world_model_v2.model import WorldModel
+from world_model_v2.model import LatentNormalizationStats, WorldModel
 from world_model_v2.utils.checkpointing import append_jsonl, save_json
 from world_model_v2.utils.visualization import build_side_by_side_grid, write_side_by_side_mp4
+from world_model_v2.wan_vae import WanVAEConfig
 
 
 WORLD_MODEL_CHECKPOINT_KIND = "world_model_v2_v1"
@@ -76,6 +78,18 @@ LEGACY_WORLD_MODEL_CHECKPOINT_KINDS = frozenset(
 AUTO_BATCH_SIZE_BACKOFF_DIVISOR = 2
 AUTO_BATCH_SIZE_GROWTH_FACTOR = 2
 _TEACHER_FORCED_NEXT_FRAME_MSE_PATTERN = re.compile(r"^next_frame_mse(?:_\d+to\d+)?$")
+_OPEN_ROLLOUT_VALIDATION_METRICS = frozenset(
+    {
+        "open_rollout_frame_mse",
+        "open_rollout_consistency_score",
+    }
+)
+
+
+def validation_metric_requires_open_rollout(metric_name: str) -> bool:
+    """Return whether one validation metric depends on open-rollout stats."""
+
+    return metric_name in _OPEN_ROLLOUT_VALIDATION_METRICS
 
 
 @dataclass
@@ -106,7 +120,7 @@ class ExperimentConfig:
     resolution: int = 128
     height: int | None = None
     width: int | None = None
-    latent_channels: int = 16
+    latent_channels: int = 32
     hidden_channels: int = 64
     ae_backend: str = "wan"
     dynamics_infer_steps: int = 16
@@ -141,6 +155,7 @@ class ExperimentConfig:
     dynamics_rope_t_extrapolation_ratio: float = 1.0
     dynamics_use_learned_temporal_embedding: bool = False
     dynamics_validation_metric: str = "next_frame_mse"
+    dynamics_run_open_rollout_validation: bool | None = None
     kl_beta: float = 1e-4
     recon_mse_weight: float = 1.0
     recon_l1_weight: float = 0.0
@@ -223,6 +238,13 @@ class ExperimentConfig:
         if self.validation_episodes is None:
             return (self.validation_episode,)
         return self.validation_episodes
+
+    def resolved_run_open_rollout_validation(self) -> bool:
+        """Return whether validation should execute the expensive open rollout."""
+
+        if self.dynamics_run_open_rollout_validation is not None:
+            return self.dynamics_run_open_rollout_validation
+        return validation_metric_requires_open_rollout(self.dynamics_validation_metric)
 
     def resolved_camera(self) -> str:
         """Return the effective image stream key for the selected dataset format."""
@@ -550,6 +572,7 @@ class Experiment:
         self.run_dir = Path(cfg.output_dir) / self.run_name
         self.checkpoints_dir = self.run_dir / "checkpoints"
         self.metrics_path = self.run_dir / "metrics.jsonl"
+        wan_config, latent_normalization_stats = self._resolve_initial_autoencoder_metadata()
         self.model = WorldModel(
             latent_channels=cfg.latent_channels,
             hidden_channels=cfg.hidden_channels,
@@ -581,6 +604,8 @@ class Experiment:
             dynamics_adaln_lora_dim=cfg.dynamics_adaln_lora_dim,
             dynamics_rope_t_extrapolation_ratio=cfg.dynamics_rope_t_extrapolation_ratio,
             dynamics_use_learned_temporal_embedding=cfg.dynamics_use_learned_temporal_embedding,
+            wan_config=wan_config,
+            latent_normalization_stats=latent_normalization_stats,
         ).to(self.device)
         self._load_requested_pretrained_weights()
         self.model.configure_trainability(cfg.mode)
@@ -637,6 +662,78 @@ class Experiment:
 
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is not available to PyTorch.")
+
+    def _requested_wan_config(self) -> WanVAEConfig:
+        """Return the fixed local Wan2.1-style tokenizer config requested by the run."""
+
+        return WanVAEConfig(z_dim=self.cfg.latent_channels)
+
+    def _extract_checkpoint_autoencoder_metadata(
+        self,
+        checkpoint: dict[str, Any],
+        path: str | Path,
+        *,
+        require_stats: bool,
+    ) -> tuple[WanVAEConfig, LatentNormalizationStats]:
+        """Read the serialized Wan config and latent stats from one checkpoint."""
+
+        backend = checkpoint_ae_backend(checkpoint)
+        if backend != self.cfg.ae_backend:
+            raise ValueError(
+                f"Checkpoint backend {backend} from {path} does not match requested "
+                f"backend {self.cfg.ae_backend}."
+            )
+        autoencoder = checkpoint.get("autoencoder")
+        if not isinstance(autoencoder, dict):
+            raise ValueError(f"Checkpoint {path} is missing autoencoder metadata.")
+        raw_config = autoencoder.get("config")
+        if not isinstance(raw_config, dict):
+            raise ValueError(
+                f"Checkpoint {path} is missing the serialized Wan autoencoder config."
+            )
+        wan_config = WanVAEConfig.from_dict(raw_config)
+        raw_stats = autoencoder.get("normalization_stats")
+        if require_stats and not isinstance(raw_stats, dict):
+            raise ValueError(
+                f"Checkpoint {path} is missing autoencoder normalization_stats. "
+                "Older spatial-only checkpoints are not load-compatible with the temporal Wan tokenizer."
+            )
+        stats_payload = raw_stats if isinstance(raw_stats, dict) else None
+        return wan_config, LatentNormalizationStats.from_dict(stats_payload, wan_config.z_dim)
+
+    def _resolve_initial_autoencoder_metadata(
+        self,
+    ) -> tuple[WanVAEConfig, LatentNormalizationStats]:
+        """Resolve the initial Wan config and latent stats before model construction."""
+
+        requested_config = self._requested_wan_config()
+        if self.cfg.resume:
+            checkpoint = load_training_checkpoint(self.cfg.resume, self.device)
+            checkpoint_config, checkpoint_stats = self._extract_checkpoint_autoencoder_metadata(
+                checkpoint,
+                self.cfg.resume,
+                require_stats=True,
+            )
+            if checkpoint_config.to_dict() != requested_config.to_dict():
+                raise ValueError(
+                    f"Checkpoint autoencoder config from {self.cfg.resume} does not match the "
+                    "requested Wan temporal tokenizer config."
+                )
+            return requested_config, checkpoint_stats
+        if self.cfg.load_encoder_decoder:
+            checkpoint = load_training_checkpoint(self.cfg.load_encoder_decoder, self.device)
+            checkpoint_config, checkpoint_stats = self._extract_checkpoint_autoencoder_metadata(
+                checkpoint,
+                self.cfg.load_encoder_decoder,
+                require_stats=True,
+            )
+            if checkpoint_config.to_dict() != requested_config.to_dict():
+                raise ValueError(
+                    f"Checkpoint autoencoder config from {self.cfg.load_encoder_decoder} does not "
+                    "match the requested Wan temporal tokenizer config."
+                )
+            return requested_config, checkpoint_stats
+        return requested_config, LatentNormalizationStats.identity(requested_config.z_dim)
 
     def _validate_config(self) -> None:
         """Validate mode-specific flag combinations before work begins."""
@@ -750,6 +847,14 @@ class Experiment:
                 "dynamics_validation_metric must be 'next_frame_mse', "
                 "'open_rollout_frame_mse', or 'open_rollout_consistency_score'."
             )
+        if (
+            self.cfg.dynamics_run_open_rollout_validation is False
+            and validation_metric_requires_open_rollout(self.cfg.dynamics_validation_metric)
+        ):
+            raise ValueError(
+                "dynamics_run_open_rollout_validation cannot be disabled when "
+                "dynamics_validation_metric requires open-rollout stats."
+            )
         if self.cfg.recon_motion_weight < 0.0:
             raise ValueError("recon_motion_weight must be non-negative.")
         if self.cfg.recon_motion_threshold < 0.0:
@@ -821,16 +926,22 @@ class Experiment:
         """Reject dynamics-only runs that do not contain any valid dynamics windows."""
 
         if self.cfg.mode == "dynamics_only" and len(self.train_dataset) < 1:
-            required_frames = self.model.dynamics.cfg.max_frames
+            required_frames = self.model.latent_frames_to_pixel_frames(
+                self.model.dynamics.cfg.max_frames
+            )
             if self.cfg.dynamics_self_forcing_rollout_chunks > 0:
                 rollout_target_frames = (
                     self.model.dynamics.cfg.max_frames
                     - self.model.dynamics.cfg.open_rollout_context_frames
                 )
-                required_frames += self.cfg.dynamics_self_forcing_rollout_chunks * rollout_target_frames
+                required_frames += (
+                    self.cfg.dynamics_self_forcing_rollout_chunks
+                    * self.model.temporal_downsample_factor
+                    * rollout_target_frames
+                )
             raise ValueError(
-                f"dynamics_only requires at least {required_frames} frames in the selected clip "
-                "so one valid dynamics window exists."
+                f"dynamics_only requires at least {required_frames} pixel frames in the selected "
+                "clip so one valid dynamics window exists."
             )
 
     def _default_run_name(self, mode: str) -> str:
@@ -855,7 +966,6 @@ class Experiment:
 
         frame_layout = self.cfg.dynamics_frame_layout()
         exclude_episodes = self._excluded_training_episodes()
-        include_motion_neighbors = self.cfg.mode == "ae_only" and self.cfg.recon_motion_weight > 0.0
         if self.cfg.dataset_format == "lerobot_metaworld":
             dataset_kwargs = {
                 "data_root": self.cfg.data_root,
@@ -873,8 +983,8 @@ class Experiment:
             if self.cfg.mode == "ae_only":
                 dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
                 dataset_kwargs["exclude_episodes"] = exclude_episodes
-                dataset_kwargs["include_motion_neighbors"] = include_motion_neighbors
-                return MetaWorldFrameDataset(**dataset_kwargs)
+                dataset_kwargs["frame_layout"] = frame_layout
+                return MetaWorldAutoencoderClipDataset(**dataset_kwargs)
             dataset_kwargs["frame_layout"] = frame_layout
             dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
             dataset_kwargs["rollout_chunks"] = self.cfg.dynamics_self_forcing_rollout_chunks
@@ -897,8 +1007,8 @@ class Experiment:
             if self.cfg.mode == "ae_only":
                 dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
                 dataset_kwargs["exclude_episodes"] = exclude_episodes
-                dataset_kwargs["include_motion_neighbors"] = include_motion_neighbors
-                return AlohaFrameDataset(**dataset_kwargs)
+                dataset_kwargs["frame_layout"] = frame_layout
+                return AlohaAutoencoderClipDataset(**dataset_kwargs)
             dataset_kwargs["frame_layout"] = frame_layout
             dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
             dataset_kwargs["rollout_chunks"] = self.cfg.dynamics_self_forcing_rollout_chunks
@@ -921,8 +1031,8 @@ class Experiment:
             if self.cfg.mode == "ae_only":
                 dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
                 dataset_kwargs["exclude_episodes"] = exclude_episodes
-                dataset_kwargs["include_motion_neighbors"] = include_motion_neighbors
-                return LeRobotVideoFrameDataset(**dataset_kwargs)
+                dataset_kwargs["frame_layout"] = frame_layout
+                return LeRobotVideoAutoencoderClipDataset(**dataset_kwargs)
             dataset_kwargs["frame_layout"] = frame_layout
             dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
             dataset_kwargs["rollout_chunks"] = self.cfg.dynamics_self_forcing_rollout_chunks
@@ -946,8 +1056,8 @@ class Experiment:
             if self.cfg.mode == "ae_only":
                 dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
                 dataset_kwargs["exclude_episodes"] = exclude_episodes
-                dataset_kwargs["include_motion_neighbors"] = include_motion_neighbors
-                return ManiSkillFrameDataset(**dataset_kwargs)
+                dataset_kwargs["frame_layout"] = frame_layout
+                return ManiSkillAutoencoderClipDataset(**dataset_kwargs)
             dataset_kwargs["frame_layout"] = frame_layout
             dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
             dataset_kwargs["rollout_chunks"] = self.cfg.dynamics_self_forcing_rollout_chunks
@@ -969,7 +1079,8 @@ class Experiment:
         if self.cfg.mode == "ae_only":
             dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
             dataset_kwargs["exclude_episodes"] = exclude_episodes
-            return FrameDataset(**dataset_kwargs)
+            dataset_kwargs["frame_layout"] = frame_layout
+            return AutoencoderClipDataset(**dataset_kwargs)
         dataset_kwargs["frame_layout"] = frame_layout
         dataset_kwargs["rollout_context_frames"] = self.model.dynamics.cfg.open_rollout_context_frames
         dataset_kwargs["rollout_chunks"] = self.cfg.dynamics_self_forcing_rollout_chunks
@@ -1285,6 +1396,33 @@ class Experiment:
                 f"backend {self.cfg.ae_backend}."
             )
 
+    def _assert_checkpoint_autoencoder_compatible(
+        self,
+        checkpoint: dict[str, Any],
+        path: str | Path,
+    ) -> None:
+        """Ensure the checkpoint autoencoder metadata matches the active temporal tokenizer."""
+
+        self._assert_checkpoint_backend(checkpoint, path)
+        checkpoint_config, checkpoint_stats = self._extract_checkpoint_autoencoder_metadata(
+            checkpoint,
+            path,
+            require_stats=True,
+        )
+        active_autoencoder = self.model.autoencoder_config()
+        active_config = active_autoencoder.get("config")
+        if checkpoint_config.to_dict() != active_config:
+            raise ValueError(
+                f"Checkpoint autoencoder config from {path} does not match the active Wan "
+                "temporal tokenizer config."
+            )
+        active_stats = active_autoencoder.get("normalization_stats")
+        if checkpoint_stats.to_dict() != active_stats:
+            raise ValueError(
+                f"Checkpoint latent normalization stats from {path} do not match the active "
+                "autoencoder statistics."
+            )
+
     def _assert_checkpoint_dynamics_backend(
         self,
         checkpoint: dict[str, Any],
@@ -1362,12 +1500,15 @@ class Experiment:
 
         if self.cfg.load_encoder_decoder:
             checkpoint = load_training_checkpoint(self.cfg.load_encoder_decoder, self.device)
-            self._assert_checkpoint_backend(checkpoint, self.cfg.load_encoder_decoder)
+            self._assert_checkpoint_autoencoder_compatible(
+                checkpoint,
+                self.cfg.load_encoder_decoder,
+            )
             self._load_submodule_state("encoder", self.model.encoder, checkpoint["model_state"])
             self._load_submodule_state("decoder", self.model.decoder, checkpoint["model_state"])
         if self.cfg.load_dynamics:
             checkpoint = load_training_checkpoint(self.cfg.load_dynamics, self.device)
-            self._assert_checkpoint_backend(checkpoint, self.cfg.load_dynamics)
+            self._assert_checkpoint_autoencoder_compatible(checkpoint, self.cfg.load_dynamics)
             self._assert_checkpoint_dynamics_backend(checkpoint, self.cfg.load_dynamics)
             self._load_submodule_state(
                 "dynamics",
@@ -1669,7 +1810,7 @@ class Experiment:
         """Restore a previous training checkpoint and return its step."""
 
         checkpoint = load_training_checkpoint(self.cfg.resume, self.device)
-        self._assert_checkpoint_backend(checkpoint, self.cfg.resume)
+        self._assert_checkpoint_autoencoder_compatible(checkpoint, self.cfg.resume)
         checkpoint_step = int(checkpoint["step"])
         if self.cfg.mode == "ae_only":
             self._load_submodule_state("encoder", self.model.encoder, checkpoint["model_state"])
@@ -1889,19 +2030,27 @@ class Experiment:
     def _ae_only_training_step(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         """Run one KL-regularized autoencoder reconstruction step."""
 
-        frames = batch["frame"]
-        output = self.model.autoencode(frames, sample_posterior=True)
+        frames = batch["frames"]
+        output = self.model.autoencode_video(frames, sample_posterior=True)
+        flat_frames = rearrange(frames, "b t c h w -> (b t) c h w")
+        flat_reconstructed = rearrange(output.reconstructed, "b t c h w -> (b t) c h w")
+        frame_indices = torch.arange(frames.shape[1], device=frames.device)
+        prev_frames = frames.index_select(1, torch.clamp(frame_indices - 1, min=0))
+        next_frames = frames.index_select(
+            1,
+            torch.clamp(frame_indices + 1, max=int(frames.shape[1]) - 1),
+        )
         recon_terms = reconstruction_loss_terms(
-            output.reconstructed,
-            frames,
+            flat_reconstructed,
+            flat_frames,
             mse_weight=self.cfg.recon_mse_weight,
             l1_weight=self.cfg.recon_l1_weight,
             edge_weight=self.cfg.recon_edge_weight,
             motion_weight=self.cfg.recon_motion_weight,
             motion_threshold=self.cfg.recon_motion_threshold,
             motion_dilation_kernel_size=self.cfg.recon_motion_dilation_kernel_size,
-            prev_frame=batch.get("prev_frame"),
-            next_frame=batch.get("next_frame"),
+            prev_frame=rearrange(prev_frames, "b t c h w -> (b t) c h w"),
+            next_frame=rearrange(next_frames, "b t c h w -> (b t) c h w"),
         )
         ae_loss = recon_terms["recon_loss"] + self.cfg.kl_beta * output.kl_loss
         return {
@@ -1925,23 +2074,12 @@ class Experiment:
         future_target_frames = batch["future_target_frames"]
         future_actions = batch["future_actions"]
         with torch.no_grad():
-            context_latent_video = self.model.encode_context_frames(context_frames, deterministic=True)
-            target_latent_video = self.model.encode_frame_sequence(target_frames, deterministic=True)
-            if future_target_frames.shape[1] > 0:
-                future_target_latent_video = self.model.encode_frame_sequence(
-                    future_target_frames,
-                    deterministic=True,
-                )
-            else:
-                future_target_latent_video = context_latent_video.new_empty(
-                    context_latent_video.shape[0],
-                    context_latent_video.shape[1],
-                    0,
-                    context_latent_video.shape[3],
-                    context_latent_video.shape[4],
-                )
-        clean_latent_video = torch.cat([context_latent_video, target_latent_video], dim=2)
-        extended_clean_latent_video = torch.cat([clean_latent_video, future_target_latent_video], dim=2)
+            full_frame_chunk = torch.cat([context_frames, target_frames, future_target_frames], dim=1)
+            extended_clean_latent_video = self.model.encode_frame_sequence(
+                full_frame_chunk,
+                deterministic=True,
+            )
+        clean_latent_video = extended_clean_latent_video[:, :, : self.model.dynamics.cfg.max_frames]
         dynamics_inputs = self.model.dynamics.prepare_training_inputs(clean_latent_video, actions=actions)
         predicted_velocity = self.model.dynamics(
             noisy_latent_video=dynamics_inputs.noisy_latent_video,
@@ -2171,13 +2309,14 @@ class Experiment:
             return zero, {}
         rollout_context_frames = self.model.dynamics.cfg.open_rollout_context_frames
         rollout_target_frames = self.model.dynamics.cfg.max_frames - rollout_context_frames
+        rollout_target_pixel_frames = self.model.temporal_downsample_factor * rollout_target_frames
         future_latent_video = extended_clean_latent_video[:, :, clean_latent_video.shape[2]:]
         expected_future_frames = rollout_chunks * rollout_target_frames
         if future_latent_video.shape[2] < expected_future_frames:
             raise ValueError(
                 "extended_clean_latent_video is missing the future target frames required for rollout self-forcing."
             )
-        if future_actions.shape[1] < rollout_chunks * rollout_target_frames:
+        if future_actions.shape[1] < rollout_chunks * rollout_target_pixel_frames:
             raise ValueError(
                 "future_actions is missing the action horizon required for rollout self-forcing."
             )
@@ -2205,7 +2344,7 @@ class Experiment:
                 auxiliary_clean_latent_video,
                 num_conditional_frames=rollout_context_frames,
             )
-            action_start = (chunk_index + 1) * rollout_target_frames
+            action_start = (chunk_index + 1) * rollout_target_pixel_frames
             action_stop = action_start + self.model.dynamics.cfg.num_action_per_chunk
             auxiliary_actions = full_actions[:, action_start:action_stop]
             auxiliary_predicted_velocity = self.model.dynamics(
@@ -2241,55 +2380,58 @@ class Experiment:
     ) -> tuple[torch.Tensor, float, float, float, float, float, float, float, float]:
         """Validate AE reconstructions in chunks to avoid full-clip CUDA OOMs."""
 
-        chunk_size = max(1, min(int(self.cfg.batch_size), int(frames.shape[0])))
-        reconstructed_chunks: list[torch.Tensor] = []
-        total_recon_loss = 0.0
-        total_recon_mse = 0.0
-        total_recon_l1 = 0.0
-        total_edge_l1 = 0.0
-        total_motion_l1 = 0.0
-        total_motion_mask_fraction = 0.0
-        total_kl = 0.0
+        window_frames = self.model.latent_frames_to_pixel_frames(self.model.dynamics.cfg.max_frames)
+        stride_frames = self.model.dynamics.cfg.num_action_per_chunk
         total_frames = int(frames.shape[0])
-        for start in range(0, total_frames, chunk_size):
-            stop = min(start + chunk_size, total_frames)
-            frame_chunk = frames[start:stop]
-            chunk_indices = torch.arange(start, stop, device=frames.device)
-            prev_chunk = frames.index_select(0, torch.clamp(chunk_indices - 1, min=0))
-            next_chunk = frames.index_select(
-                0,
-                torch.clamp(chunk_indices + 1, max=total_frames - 1),
-            )
-            output = self.model.autoencode(frame_chunk, sample_posterior=False)
-            chunk_frames = int(frame_chunk.shape[0])
-            recon_terms = reconstruction_loss_terms(
-                output.reconstructed,
-                frame_chunk,
-                mse_weight=self.cfg.recon_mse_weight,
-                l1_weight=self.cfg.recon_l1_weight,
-                edge_weight=self.cfg.recon_edge_weight,
-                motion_weight=self.cfg.recon_motion_weight,
-                motion_threshold=self.cfg.recon_motion_threshold,
-                motion_dilation_kernel_size=self.cfg.recon_motion_dilation_kernel_size,
-                prev_frame=prev_chunk,
-                next_frame=next_chunk,
-            )
-            reconstructed_chunks.append(output.reconstructed.detach().cpu())
-            total_recon_loss += float(recon_terms["recon_loss"].item()) * chunk_frames
-            total_recon_mse += float(recon_terms["recon_mse"].item()) * chunk_frames
-            total_recon_l1 += float(recon_terms["recon_l1"].item()) * chunk_frames
-            total_edge_l1 += float(recon_terms["edge_l1"].item()) * chunk_frames
-            total_motion_l1 += float(recon_terms["motion_l1"].item()) * chunk_frames
-            total_motion_mask_fraction += float(recon_terms["motion_mask_fraction"].item()) * chunk_frames
-            total_kl += float(output.kl_loss.item()) * chunk_frames
+        reconstructed_chunks: list[torch.Tensor] = []
+        kl_weighted_sum = 0.0
+        total_unique_frames = 0
+        for start in range(0, total_frames, stride_frames):
+            actual_stop = min(start + window_frames, total_frames)
+            frame_chunk = frames[start:actual_stop]
+            if frame_chunk.shape[0] < window_frames:
+                pad_frame = frame_chunk[-1:].expand(window_frames - frame_chunk.shape[0], -1, -1, -1)
+                frame_chunk = torch.cat([frame_chunk, pad_frame], dim=0)
+            output = self.model.autoencode_video(frame_chunk.unsqueeze(0), sample_posterior=False)
+            reconstructed_chunk = output.reconstructed[0, : actual_stop - start]
+            if start == 0:
+                reconstructed_chunks.append(reconstructed_chunk.detach().cpu())
+                unique_frames = int(reconstructed_chunk.shape[0])
+            else:
+                reconstructed_chunks.append(reconstructed_chunk[1:].detach().cpu())
+                unique_frames = max(int(reconstructed_chunk.shape[0]) - 1, 0)
+            kl_weighted_sum += float(output.kl_loss.item()) * unique_frames
+            total_unique_frames += unique_frames
+            if actual_stop == total_frames:
+                break
         reconstructed = torch.cat(reconstructed_chunks, dim=0)
-        recon_loss = total_recon_loss / total_frames
-        recon_mse = total_recon_mse / total_frames
-        recon_l1 = total_recon_l1 / total_frames
-        edge_l1 = total_edge_l1 / total_frames
-        motion_l1 = total_motion_l1 / total_frames
-        motion_mask_fraction = total_motion_mask_fraction / total_frames
-        kl_loss = total_kl / total_frames
+        prev_frames = frames.index_select(
+            0,
+            torch.clamp(torch.arange(total_frames, device=frames.device) - 1, min=0),
+        )
+        next_frames = frames.index_select(
+            0,
+            torch.clamp(torch.arange(total_frames, device=frames.device) + 1, max=total_frames - 1),
+        )
+        recon_terms = reconstruction_loss_terms(
+            reconstructed.to(device=frames.device),
+            frames,
+            mse_weight=self.cfg.recon_mse_weight,
+            l1_weight=self.cfg.recon_l1_weight,
+            edge_weight=self.cfg.recon_edge_weight,
+            motion_weight=self.cfg.recon_motion_weight,
+            motion_threshold=self.cfg.recon_motion_threshold,
+            motion_dilation_kernel_size=self.cfg.recon_motion_dilation_kernel_size,
+            prev_frame=prev_frames,
+            next_frame=next_frames,
+        )
+        recon_loss = float(recon_terms["recon_loss"].item())
+        recon_mse = float(recon_terms["recon_mse"].item())
+        recon_l1 = float(recon_terms["recon_l1"].item())
+        edge_l1 = float(recon_terms["edge_l1"].item())
+        motion_l1 = float(recon_terms["motion_l1"].item())
+        motion_mask_fraction = float(recon_terms["motion_mask_fraction"].item())
+        kl_loss = kl_weighted_sum / max(total_unique_frames, 1)
         ae_loss = recon_loss + self.cfg.kl_beta * kl_loss
         return (
             reconstructed,
@@ -2314,47 +2456,57 @@ class Experiment:
         """Validate dynamics with teacher-forced predictions for one conditioning length."""
 
         supported_counts = self.model.dynamics.cfg.conditioning_frame_choices
-        context_frames = (
+        context_latent_frames = (
             min(supported_counts)
             if num_conditional_frames is None
             else num_conditional_frames
         )
-        if context_frames not in supported_counts:
+        if context_latent_frames not in supported_counts:
             raise ValueError(
-                f"Expected num_conditional_frames from {supported_counts}, received {context_frames}."
+                f"Expected num_conditional_frames from {supported_counts}, received {context_latent_frames}."
             )
-        target_frames = self.model.dynamics.cfg.max_frames - context_frames
-        if frames.shape[0] < self.model.dynamics.cfg.max_frames:
+        target_latent_frames = self.model.dynamics.cfg.max_frames - context_latent_frames
+        context_pixel_frames = self.model.latent_frames_to_pixel_frames(context_latent_frames)
+        target_pixel_frames = self.model.temporal_downsample_factor * target_latent_frames
+        full_chunk_pixel_frames = self.model.latent_frames_to_pixel_frames(
+            self.model.dynamics.cfg.max_frames
+        )
+        if frames.shape[0] < full_chunk_pixel_frames:
             raise ValueError(
-                f"Dynamics validation requires at least {self.model.dynamics.cfg.max_frames} frames."
+                f"Dynamics validation requires at least {full_chunk_pixel_frames} pixel frames."
             )
-        predicted_frames = [frames[:context_frames].detach().cpu()]
+        predicted_frames = [frames[:context_pixel_frames].detach().cpu()]
         total_frame_squared_error = 0.0
         total_frame_values = 0
         total_latent_squared_error = 0.0
         total_latent_values = 0
-        per_target_frame_squared_error = [0.0 for _ in range(target_frames)]
-        per_target_frame_values = [0 for _ in range(target_frames)]
-        per_target_latent_squared_error = [0.0 for _ in range(target_frames)]
-        per_target_latent_values = [0 for _ in range(target_frames)]
+        per_target_frame_squared_error = [0.0 for _ in range(target_pixel_frames)]
+        per_target_frame_values = [0 for _ in range(target_pixel_frames)]
+        per_target_latent_squared_error = [0.0 for _ in range(target_latent_frames)]
+        per_target_latent_values = [0 for _ in range(target_latent_frames)]
         predicted_motion_l1_total = 0.0
         ground_truth_motion_l1_total = 0.0
         motion_value_count = 0
-        for target_start in range(context_frames, int(frames.shape[0]), target_frames):
-            current_frames = frames[target_start - context_frames : target_start].unsqueeze(0)
-            target_stop = min(target_start + target_frames, int(frames.shape[0]))
+        for target_start in range(context_pixel_frames, int(frames.shape[0]), target_pixel_frames):
+            target_stop = min(target_start + target_pixel_frames, int(frames.shape[0]))
             target_chunk = frames[target_start:target_stop]
             padded_target_chunk = target_chunk
-            if target_chunk.shape[0] < target_frames:
-                pad_frame = target_chunk[-1:].expand(target_frames - target_chunk.shape[0], -1, -1, -1)
+            if target_chunk.shape[0] < target_pixel_frames:
+                pad_frame = target_chunk[-1:].expand(
+                    target_pixel_frames - target_chunk.shape[0],
+                    -1,
+                    -1,
+                    -1,
+                )
                 padded_target_chunk = torch.cat([target_chunk, pad_frame], dim=0)
-            current_latent = self.model.encode_context_frames(current_frames, deterministic=True)
-            clean_chunk_frames = torch.cat([current_frames[0], padded_target_chunk], dim=0).unsqueeze(0)
+            current_frames = frames[target_start - context_pixel_frames : target_start]
+            clean_chunk_frames = torch.cat([current_frames, padded_target_chunk], dim=0).unsqueeze(0)
             clean_chunk_latent = self.model.encode_frame_sequence(clean_chunk_frames, deterministic=True)
-            target_latent = clean_chunk_latent[:, :, context_frames:]
+            current_latent = clean_chunk_latent[:, :, :context_latent_frames]
+            target_latent = clean_chunk_latent[:, :, context_latent_frames:]
             action_window = None
             if actions is not None:
-                action_start = target_start - context_frames
+                action_start = target_start - context_pixel_frames
                 action_stop = action_start + self.model.dynamics.cfg.num_action_per_chunk
                 action_window = actions[action_start:min(action_stop, int(actions.shape[0]))]
                 if action_window.shape[0] < self.model.dynamics.cfg.num_action_per_chunk:
@@ -2367,26 +2519,32 @@ class Experiment:
                     action_window = torch.cat([action_window, pad_actions], dim=0)
                 action_window = action_window.unsqueeze(0)
             generator = torch.Generator(device=current_latent.device.type)
-            generator.manual_seed(target_start + context_frames * 1000)
+            generator.manual_seed(target_start + context_latent_frames * 1000)
             predicted_latent = self.model.predict_next_latent(
                 current_latent,
                 actions=action_window,
                 generator=generator,
             )
-            predicted_frame = self.model.decode_frame_sequence(predicted_latent)[0, : target_chunk.shape[0]]
+            predicted_frame = self.model.decode_target_latents(
+                current_latent,
+                predicted_latent,
+                context_pixel_frames=context_pixel_frames,
+                target_pixel_frames=int(target_chunk.shape[0]),
+            )[0]
             predicted_frames.append(predicted_frame.detach().cpu())
             total_frame_squared_error += float(
                 F.mse_loss(predicted_frame, target_chunk, reduction="sum").item()
             )
             total_frame_values += int(target_chunk.numel())
-            total_latent_squared_error += float(
-                F.mse_loss(
-                    predicted_latent[:, :, : target_chunk.shape[0]],
-                    target_latent[:, :, : target_chunk.shape[0]],
-                    reduction="sum",
-                ).item()
-            )
-            total_latent_values += int(target_latent[:, :, : target_chunk.shape[0]].numel())
+            if target_chunk.shape[0] == target_pixel_frames:
+                total_latent_squared_error += float(
+                    F.mse_loss(
+                        predicted_latent,
+                        target_latent,
+                        reduction="sum",
+                    ).item()
+                )
+                total_latent_values += int(target_latent.numel())
             for offset in range(int(target_chunk.shape[0])):
                 per_target_frame_squared_error[offset] += float(
                     F.mse_loss(
@@ -2396,14 +2554,16 @@ class Experiment:
                     ).item()
                 )
                 per_target_frame_values[offset] += int(target_chunk[offset:offset + 1].numel())
-                per_target_latent_squared_error[offset] += float(
-                    F.mse_loss(
-                        predicted_latent[:, :, offset:offset + 1],
-                        target_latent[:, :, offset:offset + 1],
-                        reduction="sum",
-                    ).item()
-                )
-                per_target_latent_values[offset] += int(target_latent[:, :, offset:offset + 1].numel())
+            if target_chunk.shape[0] == target_pixel_frames:
+                for offset in range(target_latent_frames):
+                    per_target_latent_squared_error[offset] += float(
+                        F.mse_loss(
+                            predicted_latent[:, :, offset:offset + 1],
+                            target_latent[:, :, offset:offset + 1],
+                            reduction="sum",
+                        ).item()
+                    )
+                    per_target_latent_values[offset] += int(target_latent[:, :, offset:offset + 1].numel())
             if target_chunk.shape[0] > 1:
                 predicted_motion_l1_total += float(
                     torch.abs(predicted_frame[1:] - predicted_frame[:-1]).sum().item()
@@ -2417,19 +2577,23 @@ class Experiment:
             "input_frame_count": int(frames.shape[0]),
             "decoded_frame_count": int(preview_frames.shape[0]),
             "predicted_frame_count": int(preview_frames.shape[0]),
-            "seed_frames": int(context_frames),
-            "loss_frames": int(frames.shape[0] - context_frames),
+            "seed_frames": int(context_pixel_frames),
+            "loss_frames": int(frames.shape[0] - context_pixel_frames),
+            "conditioning_latent_frames": int(context_latent_frames),
+            "target_latent_frames": int(target_latent_frames),
+            "target_pixel_frames": int(target_pixel_frames),
             "next_frame_mse": total_frame_squared_error / max(total_frame_values, 1),
             "next_latent_mse": total_latent_squared_error / max(total_latent_values, 1),
             "validation_style": (
-                f"teacher_forced_{context_frames}_context_{target_frames}_target"
+                f"teacher_forced_{context_latent_frames}_context_{target_latent_frames}_target"
             ),
         }
-        for offset in range(target_frames):
+        for offset in range(target_pixel_frames):
             if per_target_frame_values[offset] > 0:
                 stats[f"next_frame_mse_target_{offset}"] = (
                     per_target_frame_squared_error[offset] / per_target_frame_values[offset]
                 )
+        for offset in range(target_latent_frames):
             if per_target_latent_values[offset] > 0:
                 stats[f"next_latent_mse_target_{offset}"] = (
                     per_target_latent_squared_error[offset] / per_target_latent_values[offset]
@@ -2450,23 +2614,26 @@ class Experiment:
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Validate dynamics with a fully autoregressive open rollout."""
 
-        context_frames = self.model.dynamics.cfg.open_rollout_context_frames
-        if frames.shape[0] <= context_frames:
+        context_latent_frames = self.model.dynamics.cfg.open_rollout_context_frames
+        context_pixel_frames = self.model.latent_frames_to_pixel_frames(context_latent_frames)
+        if frames.shape[0] <= context_pixel_frames:
             raise ValueError(
-                f"Open-rollout validation requires more than {context_frames} frames."
+                f"Open-rollout validation requires more than {context_pixel_frames} pixel frames."
             )
-        rollout_steps = int(frames.shape[0]) - context_frames
-        seed_frames = frames[:context_frames].unsqueeze(0)
+        rollout_steps = int(frames.shape[0]) - context_pixel_frames
+        seed_frames = frames[:context_pixel_frames].unsqueeze(0)
         rollout_actions = None if actions is None else actions.unsqueeze(0)
-        initial_stride_frames = self.model.resolved_rollout_stride_frames(context_frames)
+        initial_stride_latent_frames = self.model.resolved_rollout_stride_frames(
+            context_latent_frames
+        )
         predicted = self.model.rollout(
             seed_frames,
             steps=rollout_steps,
             actions=rollout_actions,
             stride_frames=self.model.dynamics.cfg.open_rollout_stride_frames,
         )[0]
-        predicted_targets = predicted[context_frames:]
-        target_frames = frames[context_frames:]
+        predicted_targets = predicted[context_pixel_frames:]
+        target_frames = frames[context_pixel_frames:]
         predicted_motion_l1 = 0.0
         ground_truth_motion_l1 = 0.0
         frame_mse = float(F.mse_loss(predicted_targets, target_frames).item())
@@ -2481,14 +2648,17 @@ class Experiment:
             )
             motion_ratio = compute_motion_ratio(predicted_motion_l1, ground_truth_motion_l1)
         stats = {
-            "open_rollout_seed_frames": int(context_frames),
+            "open_rollout_seed_frames": int(context_pixel_frames),
             "open_rollout_loss_frames": int(rollout_steps),
             "open_rollout_stride_frames": (
                 int(self.model.dynamics.cfg.open_rollout_stride_frames)
                 if self.model.dynamics.cfg.open_rollout_stride_frames is not None
                 else None
             ),
-            "open_rollout_initial_stride_frames": int(initial_stride_frames),
+            "open_rollout_initial_stride_frames": int(
+                self.model.temporal_downsample_factor * initial_stride_latent_frames
+            ),
+            "open_rollout_context_latent_frames": int(context_latent_frames),
             "open_rollout_decoded_frame_count": int(predicted.shape[0]),
             "open_rollout_predicted_frame_count": int(predicted.shape[0]),
             "open_rollout_frame_mse": frame_mse,
@@ -2561,11 +2731,11 @@ class Experiment:
 
         clip_actions = batch.get("actions")
         validation_context_choices = self.model.dynamics.cfg.validation_conditioning_frame_choices
-        primary_context_frames = validation_context_choices[0]
+        primary_context_latent_frames = validation_context_choices[0]
         preview_frames, dynamics_stats = self._validate_dynamics_one_step(
             frames,
             actions=None if clip_actions is None else clip_actions[0],
-            num_conditional_frames=primary_context_frames,
+            num_conditional_frames=primary_context_latent_frames,
         )
         auxiliary_stats = {}
         for validation_context_frames in validation_context_choices[1:]:
@@ -2588,16 +2758,21 @@ class Experiment:
                 )
             )
             auxiliary_stats[f"validation_style_{suffix}"] = extra_context_stats["validation_style"]
-        _, open_rollout_stats = self._validate_dynamics_open_rollout(
-            frames,
-            actions=None if clip_actions is None else clip_actions[0],
-        )
+        open_rollout_stats: dict[str, Any] = {}
+        if self.cfg.resolved_run_open_rollout_validation():
+            _, open_rollout_stats = self._validate_dynamics_open_rollout(
+                frames,
+                actions=None if clip_actions is None else clip_actions[0],
+            )
         stats = {
             "episode": int(batch["episode_idx"].reshape(-1)[0].item()),
             **dynamics_stats,
             **self._suffix_validation_stats(
                 dynamics_stats,
-                f"{primary_context_frames}to{self.model.dynamics.cfg.max_frames - primary_context_frames}",
+                (
+                    f"{primary_context_latent_frames}to"
+                    f"{self.model.dynamics.cfg.max_frames - primary_context_latent_frames}"
+                ),
             ),
             **auxiliary_stats,
             **open_rollout_stats,
@@ -2623,7 +2798,12 @@ class Experiment:
         teacher_forced_frame_metrics = teacher_forced_next_frame_mse_stats(stats)
         if teacher_forced_frame_metrics:
             stats["worst_case_next_frame_mse"] = max(teacher_forced_frame_metrics.values())
-        return frames, preview_frames, primary_context_frames, stats
+        return (
+            frames,
+            preview_frames,
+            self.model.latent_frames_to_pixel_frames(primary_context_latent_frames),
+            stats,
+        )
 
     def _aggregate_validation_stats(
         self,
@@ -2664,6 +2844,68 @@ class Experiment:
         return aggregated
 
     @torch.no_grad()
+    def _compute_latent_normalization_stats(self) -> LatentNormalizationStats:
+        """Compute DreamDojo-style latent normalization stats from the AE training clips."""
+
+        if len(self.train_dataset) < 1:
+            raise ValueError("Cannot compute latent normalization stats from an empty dataset.")
+        stats_loader = DataLoader(
+            self.train_dataset,
+            batch_size=max(int(self.cfg.batch_size), 1),
+            shuffle=False,
+            num_workers=0,
+        )
+        img_sum = torch.zeros(self.model.latent_channels, device=self.device)
+        img_sum_sq = torch.zeros_like(img_sum)
+        video_sum = torch.zeros_like(img_sum)
+        video_sum_sq = torch.zeros_like(img_sum)
+        img_count = 0
+        video_count = 0
+        for raw_batch in stats_loader:
+            batch = self._move_batch_to_device(raw_batch)
+            frames = batch["frames"]
+            image_mu, _ = self.model.encode_posterior(frames[:, 0])
+            video = rearrange(frames, "b t c h w -> b c t h w")
+            raw_video_mu, _ = self.model.encoder(video)
+            img_sum += image_mu.sum(dim=(0, 2, 3))
+            img_sum_sq += image_mu.square().sum(dim=(0, 2, 3))
+            video_sum += raw_video_mu.sum(dim=(0, 2, 3, 4))
+            video_sum_sq += raw_video_mu.square().sum(dim=(0, 2, 3, 4))
+            img_count += int(image_mu.shape[0] * image_mu.shape[2] * image_mu.shape[3])
+            video_count += int(
+                raw_video_mu.shape[0]
+                * raw_video_mu.shape[2]
+                * raw_video_mu.shape[3]
+                * raw_video_mu.shape[4]
+            )
+
+        def _finalize(sum_tensor: torch.Tensor, sum_sq_tensor: torch.Tensor, count: int) -> tuple[list[float], list[float]]:
+            """Convert accumulated moments into per-channel mean/std lists."""
+
+            mean = sum_tensor / max(count, 1)
+            variance = (sum_sq_tensor / max(count, 1) - mean.square()).clamp_min(1e-6)
+            std = torch.sqrt(variance)
+            return mean.detach().cpu().tolist(), std.detach().cpu().tolist()
+
+        img_mean, img_std = _finalize(img_sum, img_sum_sq, img_count)
+        video_mean, video_std = _finalize(video_sum, video_sum_sq, video_count)
+        return LatentNormalizationStats(
+            img_mean=tuple(img_mean),
+            img_std=tuple(img_std),
+            video_mean=tuple(video_mean),
+            video_std=tuple(video_std),
+        )
+
+    @torch.no_grad()
+    def _refresh_best_autoencoder_checkpoint_stats(self, step: int) -> None:
+        """Recompute latent normalization stats and rewrite the best AE checkpoint."""
+
+        if self.cfg.mode != "ae_only":
+            return
+        self.model.set_latent_normalization_stats(self._compute_latent_normalization_stats())
+        self._save_checkpoint(self.checkpoints_dir / "best.pt", step)
+
+    @torch.no_grad()
     def _validate(self, step: int) -> dict[str, Any]:
         """Run validation, export artifacts, and update the best checkpoint."""
 
@@ -2687,6 +2929,7 @@ class Experiment:
         if is_best_checkpoint:
             self.best_metric = metric_value
             self._save_checkpoint(self.checkpoints_dir / "best.pt", step)
+            self._refresh_best_autoencoder_checkpoint_stats(step)
         output_dir = self.run_dir / "samples" / f"step_{step:06d}"
         output_dir.mkdir(parents=True, exist_ok=True)
         exported_frame_counts: list[int] = []

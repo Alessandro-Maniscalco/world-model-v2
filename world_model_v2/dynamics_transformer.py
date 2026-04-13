@@ -21,6 +21,7 @@ class DynamicsFrameLayout:
 
     context_frames: int = 1
     target_frames: int = 3
+    temporal_compression_ratio: int = 4
 
     @property
     def max_frames(self) -> int:
@@ -32,7 +33,39 @@ class DynamicsFrameLayout:
     def num_action_per_chunk(self) -> int:
         """Return the number of transition actions aligned to one frame chunk."""
 
-        return self.max_frames - 1
+        return self.temporal_compression_ratio * (self.max_frames - 1)
+
+    def pixel_frames_for_latent_frames(self, latent_frames: int) -> int:
+        """Return the Wan-style pixel-frame count for one latent-frame count."""
+
+        if latent_frames < 1:
+            raise ValueError("latent_frames must be positive.")
+        return 1 + (int(latent_frames) - 1) * self.temporal_compression_ratio
+
+    def latent_frames_for_pixel_frames(self, pixel_frames: int) -> int:
+        """Return the Wan-style latent-frame count for one pixel-frame count."""
+
+        if pixel_frames < 1:
+            raise ValueError("pixel_frames must be positive.")
+        return 1 + (int(pixel_frames) - 1) // self.temporal_compression_ratio
+
+    @property
+    def context_pixel_frames(self) -> int:
+        """Return the pixel-frame count represented by the context latent frames."""
+
+        return self.pixel_frames_for_latent_frames(self.context_frames)
+
+    @property
+    def target_pixel_frames(self) -> int:
+        """Return the pixel-frame count represented by the target latent frames."""
+
+        return self.temporal_compression_ratio * self.target_frames
+
+    @property
+    def max_pixel_frames(self) -> int:
+        """Return the total pixel-frame count represented by one latent chunk."""
+
+        return self.pixel_frames_for_latent_frames(self.max_frames)
 
     @property
     def conditioning_frame_choices(self) -> tuple[int, ...]:
@@ -45,7 +78,7 @@ class DynamicsFrameLayout:
 
 
 DYNAMICS_FRAME_LAYOUT = DynamicsFrameLayout()
-DREAMDOJO_DYNAMICS_ARCHITECTURE_VERSION = "dreamdojo_torch_small_v1"
+DREAMDOJO_DYNAMICS_ARCHITECTURE_VERSION = "dreamdojo_torch_small_v2_temporal4"
 
 
 def _normalize_conditioning_frame_choices(
@@ -137,6 +170,7 @@ class DynamicsTransformerConfig:
     validation_conditioning_frame_choices: tuple[int, ...] | None = None
     open_rollout_context_frames: int | None = None
     open_rollout_stride_frames: int | None = None
+    temporal_compression_ratio: int = DYNAMICS_FRAME_LAYOUT.temporal_compression_ratio
     in_channels: int = 32
     out_channels: int = 32
     patch_spatial: int = 2
@@ -162,7 +196,7 @@ class DynamicsTransformerConfig:
     timestep_scale: float = 1.0
     conditional_frame_timestep: float = -1.0
     conditional_frame_sigma: float = 0.0
-    dynamics_infer_steps: int = 35
+    dynamics_infer_steps: int = 20
     dynamics_train_timesteps: int = 1000
     dynamics_rf_shift: float = 5.0
     dynamics_video_condition_dropout: float = 0.0
@@ -176,6 +210,8 @@ class DynamicsTransformerConfig:
             raise ValueError("context_frames must be positive.")
         if self.target_frames < 1:
             raise ValueError("target_frames must be positive.")
+        if self.temporal_compression_ratio < 1:
+            raise ValueError("temporal_compression_ratio must be positive.")
         if self.max_frames is None:
             object.__setattr__(self, "max_frames", resolved_max_frames)
         elif self.max_frames != resolved_max_frames:
@@ -316,7 +352,7 @@ class DynamicsTransformerConfig:
     def num_action_per_chunk(self) -> int:
         """Return the DreamDojo-style number of transition actions in one frame chunk."""
 
-        return int(self.max_frames) - 1
+        return int(self.temporal_compression_ratio) * (int(self.max_frames) - 1)
 
     @property
     def architecture_version(self) -> str:
@@ -1092,7 +1128,7 @@ class ActionConditionedDynamicsTransformer(nn.Module):
 
         super().__init__()
         self.cfg = cfg
-        self._num_action_per_latent_frame = 1
+        self._num_action_per_latent_frame = cfg.temporal_compression_ratio
         self.x_embedder = PatchEmbed(
             spatial_patch_size=cfg.patch_spatial,
             temporal_patch_size=cfg.patch_temporal,

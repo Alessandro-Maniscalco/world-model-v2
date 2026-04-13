@@ -28,4 +28,8 @@ assets/**
 /preprocessed
 /tmp_vace/
 /outputs/
-/saved_checkpoints/
+/saved_checkpoints/*
+!/saved_checkpoints/checkpoints_on_github.md
+!/saved_checkpoints/vae_pickplace_z32_8x/
+/saved_checkpoints/vae_pickplace_z32_8x/*
+!/saved_checkpoints/vae_pickplace_z32_8x/best.pt

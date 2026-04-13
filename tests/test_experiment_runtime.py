@@ -18,9 +18,9 @@ from world_model_v2.experiment import (
 )
 
 
-DEBUG_FRAME_KWARGS = {"frame_start": 111, "frame_end": 116}
-DYNAMICS_FIVE_FRAME_KWARGS = {"frame_start": 111, "frame_end": 115}
-DYNAMICS_TWO_FRAME_KWARGS = {"frame_start": 111, "frame_end": 112}
+DEBUG_FRAME_KWARGS = {"frame_start": 111, "frame_end": 123}
+DYNAMICS_FIVE_FRAME_KWARGS = {"frame_start": 111, "frame_end": 123}
+DYNAMICS_TWO_FRAME_KWARGS = {"frame_start": 111, "frame_end": 115}
 
 
 def test_wan_ae_only_training_step_reports_kl_terms(
@@ -100,8 +100,8 @@ def test_wan_dynamics_only_training_step_reports_rf_terms(
 @pytest.mark.parametrize(
     ("mode", "expected_stat_key", "frame_kwargs", "expected_predicted_count"),
     [
-        ("ae_only", "ae_loss", DEBUG_FRAME_KWARGS, 6),
-        ("dynamics_only", "next_frame_mse", DYNAMICS_FIVE_FRAME_KWARGS, 5),
+        ("ae_only", "ae_loss", DEBUG_FRAME_KWARGS, 13),
+        ("dynamics_only", "next_frame_mse", DYNAMICS_FIVE_FRAME_KWARGS, 13),
     ],
 )
 def test_wan_experiment_run_writes_artifacts_for_each_mode(
@@ -162,18 +162,13 @@ def test_wan_experiment_run_writes_artifacts_for_each_mode(
         assert '"kl_loss"' in payload
     else:
         assert saved_stats["predicted_frame_count"] == expected_predicted_count
-        assert '"predicted_frame_count": 5' in payload
+        assert '"predicted_frame_count": 13' in payload
         assert '"next_latent_mse"' in payload
-        assert '"open_rollout_frame_mse"' in payload
-        assert saved_stats["seed_frames"] == DYNAMICS_FRAME_LAYOUT.conditioning_frame_choices[0]
+        assert '"open_rollout_frame_mse"' not in payload
+        assert saved_stats["seed_frames"] == DYNAMICS_FRAME_LAYOUT.context_pixel_frames
         assert saved_stats["loss_frames"] == (
-            saved_stats["input_frame_count"] - DYNAMICS_FRAME_LAYOUT.conditioning_frame_choices[0]
+            saved_stats["input_frame_count"] - DYNAMICS_FRAME_LAYOUT.context_pixel_frames
         )
-        assert saved_stats["open_rollout_seed_frames"] == DYNAMICS_FRAME_LAYOUT.context_frames
-        assert saved_stats["open_rollout_loss_frames"] == (
-            saved_stats["input_frame_count"] - DYNAMICS_FRAME_LAYOUT.context_frames
-        )
-        assert saved_stats["open_rollout_validation_style"] == "open_rollout_autoregressive"
         assert saved_stats["validation_style"] == "teacher_forced_1_context_3_target"
         assert "next_frame_mse_1to3" in saved_stats
         assert saved_stats["validation_style_1to3"] == "teacher_forced_1_context_3_target"
@@ -181,6 +176,46 @@ def test_wan_experiment_run_writes_artifacts_for_each_mode(
             saved_stats["next_frame_mse_1to3"]
         )
         assert stats["dynamics_backend"] == "rf_dit"
+
+
+def test_dynamics_run_can_opt_into_open_rollout_validation_stats(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Dynamics runs should only record open-rollout stats when requested or required."""
+
+    config = ExperimentConfig(
+        mode="dynamics_only",
+        data_root=str(fake_long_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="smoke_dynamics_open_rollout_opt_in",
+        **DYNAMICS_FIVE_FRAME_KWARGS,
+        max_steps=1,
+        validation_interval=1,
+        checkpoint_interval=1,
+        device="cpu",
+        load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+        dynamics_run_open_rollout_validation=True,
+    )
+    experiment = Experiment(config)
+    experiment.run()
+    saved_stats = json.loads(
+        (
+            tmp_path
+            / "outputs"
+            / "smoke_dynamics_open_rollout_opt_in"
+            / "samples"
+            / "step_000001"
+            / "episode_0_stats.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert saved_stats["open_rollout_seed_frames"] == DYNAMICS_FRAME_LAYOUT.context_pixel_frames
+    assert saved_stats["open_rollout_loss_frames"] == (
+        saved_stats["input_frame_count"] - DYNAMICS_FRAME_LAYOUT.context_pixel_frames
+    )
+    assert saved_stats["open_rollout_validation_style"] == "open_rollout_autoregressive"
 
 
 def test_dynamics_run_can_select_best_checkpoint_by_open_rollout_metric(
@@ -229,7 +264,7 @@ def test_dynamics_run_can_average_validation_across_multiple_episodes(
         validation_split="train",
         validation_episodes=(0, 1),
         frame_start=100,
-        frame_end=104,
+        frame_end=112,
         max_steps=1,
         validation_interval=1,
         checkpoint_interval=1,
@@ -264,10 +299,7 @@ def test_dynamics_run_can_average_validation_across_multiple_episodes(
     assert summary_stats["next_frame_mse"] == pytest.approx(
         (episode_0_stats["next_frame_mse"] + episode_1_stats["next_frame_mse"]) / 2.0
     )
-    assert summary_stats["open_rollout_frame_mse"] == pytest.approx(
-        (episode_0_stats["open_rollout_frame_mse"] + episode_1_stats["open_rollout_frame_mse"])
-        / 2.0
-    )
+    assert "open_rollout_frame_mse" not in summary_stats
     assert checkpoint["best_metric"] == pytest.approx(summary_stats["next_frame_mse"])
 
 
@@ -308,6 +340,7 @@ def test_dynamics_run_supports_one_context_layouts(
         dynamics_validation_conditioning_frame_choices=(1,),
         dynamics_open_rollout_context_frames=1,
         dynamics_open_rollout_stride_frames=1,
+        dynamics_run_open_rollout_validation=True,
     )
     experiment = Experiment(config)
     experiment.run()
@@ -320,10 +353,10 @@ def test_dynamics_run_supports_one_context_layouts(
 
     assert checkpoint["best_metric"] == pytest.approx(saved_stats["next_frame_mse"])
     assert saved_stats["seed_frames"] == 1
-    assert saved_stats["loss_frames"] == 5
+    assert saved_stats["loss_frames"] == 12
     assert saved_stats["open_rollout_seed_frames"] == 1
-    assert saved_stats["open_rollout_loss_frames"] == 5
-    assert saved_stats["predicted_frame_count"] == 6
+    assert saved_stats["open_rollout_loss_frames"] == 12
+    assert saved_stats["predicted_frame_count"] == 13
     assert saved_stats["validation_style"] == expected_validation_style
     assert saved_stats[f"next_frame_mse_1to{target_frames}"] == pytest.approx(
         saved_stats["next_frame_mse"]
@@ -332,7 +365,7 @@ def test_dynamics_run_supports_one_context_layouts(
     assert saved_stats["validation_conditioning_frame_choices"] == [1]
     assert saved_stats["open_rollout_context_frames"] == 1
     assert saved_stats["open_rollout_stride_frames"] == 1
-    assert saved_stats["open_rollout_initial_stride_frames"] == 1
+    assert saved_stats["open_rollout_initial_stride_frames"] == 4
 
 
 def test_runtime_records_initial_default_open_rollout_stride(
@@ -360,6 +393,7 @@ def test_runtime_records_initial_default_open_rollout_stride(
         dynamics_conditioning_frame_probabilities=(1.0,),
         dynamics_validation_conditioning_frame_choices=(1,),
         dynamics_open_rollout_context_frames=1,
+        dynamics_run_open_rollout_validation=True,
     )
     experiment = Experiment(config)
     experiment.run()
@@ -370,7 +404,7 @@ def test_runtime_records_initial_default_open_rollout_stride(
     )
 
     assert saved_stats["open_rollout_stride_frames"] is None
-    assert saved_stats["open_rollout_initial_stride_frames"] == 3
+    assert saved_stats["open_rollout_initial_stride_frames"] == 12
 
 
 def test_resume_rebuilds_best_metric_for_changed_dynamics_validation_metric(
@@ -391,6 +425,7 @@ def test_resume_rebuilds_best_metric_for_changed_dynamics_validation_metric(
         checkpoint_interval=1,
         device="cpu",
         load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+        dynamics_run_open_rollout_validation=True,
     )
     initial_experiment = Experiment(initial_config)
     initial_experiment.run()
@@ -433,6 +468,7 @@ def test_resume_rebuilds_derived_rollout_consistency_metric_from_older_logs(
         checkpoint_interval=1,
         device="cpu",
         load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+        dynamics_run_open_rollout_validation=True,
     )
     initial_experiment = Experiment(initial_config)
     initial_experiment.run()
@@ -533,6 +569,7 @@ def test_resume_best_metric_ignores_future_source_validation_records(
         checkpoint_interval=1,
         device="cpu",
         load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+        dynamics_run_open_rollout_validation=True,
     )
     initial_experiment = Experiment(initial_config)
     initial_experiment.run()
@@ -606,7 +643,7 @@ def test_resume_resets_best_metric_when_validation_episodes_change(
         validation_split="train",
         validation_episode=0,
         frame_start=100,
-        frame_end=104,
+        frame_end=112,
         max_steps=1,
         validation_interval=1,
         checkpoint_interval=1,
@@ -623,14 +660,14 @@ def test_resume_resets_best_metric_when_validation_episodes_change(
             data_root=str(fake_multi_episode_dataset_root),
             output_dir=str(tmp_path / "outputs"),
             run_name="resume_multi_target",
-            split="train",
-            validation_split="train",
-            validation_episodes=(0, 1),
-            frame_start=100,
-            frame_end=104,
-            max_steps=1,
-            validation_interval=1,
-            checkpoint_interval=1,
+                split="train",
+                validation_split="train",
+                validation_episodes=(0, 1),
+                frame_start=100,
+                frame_end=112,
+                max_steps=1,
+                validation_interval=1,
+                checkpoint_interval=1,
             device="cpu",
             resume=str(source_run_dir / "checkpoints" / "best.pt"),
         )

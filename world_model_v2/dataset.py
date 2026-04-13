@@ -261,6 +261,109 @@ class FrameDataset(Dataset[dict[str, Any]]):
         return sample
 
 
+class AutoencoderClipDataset(Dataset[dict[str, Any]]):
+    """Expose one clip as sliding autoencoder video-training windows."""
+
+    def __init__(
+        self,
+        data_root: str | Path,
+        task: str = "single_grasp",
+        split: str = "val",
+        episode: int = 0,
+        camera: str = "camera_1_color",
+        frame_start: int | None = None,
+        frame_end: int | None = None,
+        resolution: int = 128,
+        height: int | None = None,
+        width: int | None = None,
+        all_episodes: bool = False,
+        exclude_episodes: tuple[int, ...] = (),
+        frame_layout: DynamicsFrameLayout = DYNAMICS_FRAME_LAYOUT,
+    ) -> None:
+        """Cache one clip or flatten all split clips for AE video windows."""
+
+        self.all_episodes = all_episodes
+        self.frame_layout = frame_layout
+        self.required_frames = self.frame_layout.max_pixel_frames
+        excluded_episodes = set(int(episode_index) for episode_index in exclude_episodes)
+        if all_episodes:
+            self.clips = []
+            self.cumulative_lengths: list[int] = []
+            running_total = 0
+            for episode_idx in list_episode_indices(data_root=data_root, task=task, split=split):
+                if episode_idx in excluded_episodes:
+                    continue
+                try:
+                    clip = load_clip(
+                        data_root=data_root,
+                        task=task,
+                        split=split,
+                        episode=episode_idx,
+                        camera=camera,
+                        frame_start=frame_start,
+                        frame_end=frame_end,
+                        resolution=resolution,
+                        height=height,
+                        width=width,
+                        clamp_frame_end=True,
+                    )
+                except ValueError:
+                    continue
+                available_windows = max(int(clip["frames"].shape[0]) - self.required_frames + 1, 0)
+                if available_windows < 1:
+                    continue
+                self.clips.append(clip)
+                running_total += available_windows
+                self.cumulative_lengths.append(running_total)
+            if not self.clips:
+                raise ValueError(
+                    "No episodes in the requested split contain any valid AE clip windows "
+                    "for the requested range."
+                )
+        else:
+            self.clip = load_clip(
+                data_root=data_root,
+                task=task,
+                split=split,
+                episode=episode,
+                camera=camera,
+                frame_start=frame_start,
+                frame_end=frame_end,
+                resolution=resolution,
+                height=height,
+                width=width,
+            )
+
+    def _sample_from_clip(self, clip: dict[str, Any], index: int) -> dict[str, Any]:
+        """Return one AE clip window from one cached clip."""
+
+        stop = index + self.required_frames
+        return {
+            "frames": clip["frames"][index:stop],
+            "frame_idx": clip["frame_idx"][index:stop],
+            "episode_idx": clip["episode_idx"],
+        }
+
+    def __len__(self) -> int:
+        """Return the number of cached AE clip windows."""
+
+        if self.all_episodes:
+            return self.cumulative_lengths[-1]
+        return max(int(self.clip["frames"].shape[0]) - self.required_frames + 1, 0)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        """Return one cached AE clip window."""
+
+        if self.all_episodes:
+            if index < 0 or index >= len(self):
+                raise IndexError("AutoencoderClipDataset index out of range.")
+            clip_index = bisect_right(self.cumulative_lengths, index)
+            clip_start = 0 if clip_index == 0 else self.cumulative_lengths[clip_index - 1]
+            window_index = index - clip_start
+            return self._sample_from_clip(self.clips[clip_index], window_index)
+        return self._sample_from_clip(self.clip, index)
+
+
 class TransitionDataset(Dataset[dict[str, Any]]):
     """Expose one clip as sliding dynamics training windows."""
 
@@ -298,7 +401,13 @@ class TransitionDataset(Dataset[dict[str, Any]]):
             raise ValueError("rollout_chunks must be non-negative.")
         self.rollout_chunks = int(rollout_chunks)
         self.rollout_target_frames = self.frame_layout.max_frames - self.rollout_context_frames
-        self.required_frames = self.frame_layout.max_frames + self.rollout_chunks * self.rollout_target_frames
+        self.context_pixel_frames = self.frame_layout.context_pixel_frames
+        self.target_pixel_frames = self.frame_layout.target_pixel_frames
+        self.rollout_target_pixel_frames = (
+            self.frame_layout.temporal_compression_ratio * self.rollout_target_frames
+        )
+        total_latent_frames = self.frame_layout.max_frames + self.rollout_chunks * self.rollout_target_frames
+        self.required_frames = self.frame_layout.pixel_frames_for_latent_frames(total_latent_frames)
         if all_episodes:
             self.clips = []
             self.cumulative_lengths: list[int] = []
@@ -355,11 +464,11 @@ class TransitionDataset(Dataset[dict[str, Any]]):
     def _sample_from_clip(self, clip: dict[str, Any], index: int) -> dict[str, Any]:
         """Return one configured `(context, target)` training sample from one cached clip."""
 
-        context_stop = index + self.frame_layout.context_frames
-        target_stop = context_stop + self.frame_layout.target_frames
-        future_target_stop = target_stop + self.rollout_chunks * self.rollout_target_frames
+        context_stop = index + self.context_pixel_frames
+        target_stop = context_stop + self.target_pixel_frames
+        future_target_stop = target_stop + self.rollout_chunks * self.rollout_target_pixel_frames
         action_stop = index + self.frame_layout.num_action_per_chunk
-        future_action_stop = action_stop + self.rollout_chunks * self.rollout_target_frames
+        future_action_stop = action_stop + self.rollout_chunks * self.rollout_target_pixel_frames
         return {
             "context_frames": clip["frames"][index:context_stop],
             "target_frames": clip["frames"][context_stop:target_stop],

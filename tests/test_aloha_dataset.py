@@ -91,7 +91,11 @@ def test_aloha_transition_dataset_returns_sliding_windows(
         split="train",
         episode=0,
         resolution=8,
-        frame_layout=DynamicsFrameLayout(context_frames=1, target_frames=1),
+        frame_layout=DynamicsFrameLayout(
+            context_frames=1,
+            target_frames=1,
+            temporal_compression_ratio=1,
+        ),
     )
     assert len(dataset) == 4
     sample = dataset[0]
@@ -118,7 +122,11 @@ def test_aloha_transition_dataset_exposes_future_rollout_targets(
         resolution=8,
         frame_start=0,
         frame_end=4,
-        frame_layout=DynamicsFrameLayout(context_frames=1, target_frames=2),
+        frame_layout=DynamicsFrameLayout(
+            context_frames=1,
+            target_frames=2,
+            temporal_compression_ratio=1,
+        ),
         rollout_context_frames=1,
         rollout_chunks=1,
     )

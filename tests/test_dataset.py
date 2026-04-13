@@ -33,11 +33,11 @@ def test_transition_dataset_defaults_to_full_episode_pairs(
     """The transition dataset should default to all canonical dynamics windows."""
 
     dataset = TransitionDataset(data_root=str(fake_long_dataset_root))
-    assert len(dataset) == 130 - DYNAMICS_FRAME_LAYOUT.max_frames + 1
+    assert len(dataset) == 130 - DYNAMICS_FRAME_LAYOUT.max_pixel_frames + 1
     first = dataset[0]
     last = dataset[len(dataset) - 1]
-    assert first["context_frames"].shape == (DYNAMICS_FRAME_LAYOUT.context_frames, 3, 128, 128)
-    assert first["target_frames"].shape == (DYNAMICS_FRAME_LAYOUT.target_frames, 3, 128, 128)
+    assert first["context_frames"].shape == (DYNAMICS_FRAME_LAYOUT.context_pixel_frames, 3, 128, 128)
+    assert first["target_frames"].shape == (DYNAMICS_FRAME_LAYOUT.target_pixel_frames, 3, 128, 128)
     assert first["actions"].shape == (DYNAMICS_FRAME_LAYOUT.num_action_per_chunk, 4)
     assert torch.equal(
         first["actions"],
@@ -50,13 +50,13 @@ def test_transition_dataset_defaults_to_full_episode_pairs(
     )
     assert torch.equal(
         first["context_frame_idx"],
-        torch.arange(DYNAMICS_FRAME_LAYOUT.context_frames, dtype=torch.long),
+        torch.arange(DYNAMICS_FRAME_LAYOUT.context_pixel_frames, dtype=torch.long),
     )
     assert torch.equal(
         first["target_frame_idx"],
         torch.arange(
-            DYNAMICS_FRAME_LAYOUT.context_frames,
-            DYNAMICS_FRAME_LAYOUT.max_frames,
+            DYNAMICS_FRAME_LAYOUT.context_pixel_frames,
+            DYNAMICS_FRAME_LAYOUT.max_pixel_frames,
             dtype=torch.long,
         ),
     )
@@ -66,15 +66,15 @@ def test_transition_dataset_defaults_to_full_episode_pairs(
         last["context_frame_idx"],
         torch.arange(
             last_start,
-            last_start + DYNAMICS_FRAME_LAYOUT.context_frames,
+            last_start + DYNAMICS_FRAME_LAYOUT.context_pixel_frames,
             dtype=torch.long,
         ),
     )
     assert torch.equal(
         last["target_frame_idx"],
         torch.arange(
-            last_start + DYNAMICS_FRAME_LAYOUT.context_frames,
-            last_start + DYNAMICS_FRAME_LAYOUT.max_frames,
+            last_start + DYNAMICS_FRAME_LAYOUT.context_pixel_frames,
+            last_start + DYNAMICS_FRAME_LAYOUT.max_pixel_frames,
             dtype=torch.long,
         ),
     )
@@ -96,21 +96,21 @@ def test_datasets_preserve_explicit_frame_slice(fake_long_dataset_root: Path) ->
     frame_dataset = FrameDataset(
         data_root=str(fake_long_dataset_root),
         frame_start=111,
-        frame_end=116,
+        frame_end=123,
     )
     transition_dataset = TransitionDataset(
         data_root=str(fake_long_dataset_root),
         frame_start=111,
-        frame_end=116,
+        frame_end=123,
     )
     validation_dataset = ValidationClipDataset(
         data_root=str(fake_long_dataset_root),
         frame_start=111,
-        frame_end=116,
+        frame_end=123,
     )
 
-    assert len(frame_dataset) == 6
-    assert len(transition_dataset) == 6 - DYNAMICS_FRAME_LAYOUT.max_frames + 1
+    assert len(frame_dataset) == 13
+    assert len(transition_dataset) == 1
     assert torch.equal(
         transition_dataset[0]["actions"],
         torch.tensor(
@@ -120,8 +120,8 @@ def test_datasets_preserve_explicit_frame_slice(fake_long_dataset_root: Path) ->
             ]
         ),
     )
-    assert validation_dataset[0]["actions"].shape == (5, 4)
-    assert torch.equal(validation_dataset[0]["frame_idx"], torch.arange(111, 117))
+    assert validation_dataset[0]["actions"].shape == (12, 4)
+    assert torch.equal(validation_dataset[0]["frame_idx"], torch.arange(111, 124))
 
 
 def test_dataset_supports_rectangular_resize(fake_long_dataset_root: Path) -> None:
@@ -144,17 +144,17 @@ def test_transition_dataset_supports_custom_frame_layout(
     dataset = TransitionDataset(
         data_root=str(fake_long_dataset_root),
         frame_start=111,
-        frame_end=112,
+        frame_end=115,
         frame_layout=DynamicsFrameLayout(context_frames=1, target_frames=1),
     )
 
     assert len(dataset) == 1
     sample = dataset[0]
     assert sample["context_frames"].shape == (1, 3, 128, 128)
-    assert sample["target_frames"].shape == (1, 3, 128, 128)
-    assert sample["actions"].shape == (1, 4)
+    assert sample["target_frames"].shape == (4, 3, 128, 128)
+    assert sample["actions"].shape == (4, 4)
     assert torch.equal(sample["context_frame_idx"], torch.tensor([111]))
-    assert torch.equal(sample["target_frame_idx"], torch.tensor([112]))
+    assert torch.equal(sample["target_frame_idx"], torch.tensor([112, 113, 114, 115]))
 
 
 def test_transition_dataset_exposes_future_rollout_targets_when_requested(
@@ -165,7 +165,7 @@ def test_transition_dataset_exposes_future_rollout_targets_when_requested(
     dataset = TransitionDataset(
         data_root=str(fake_long_dataset_root),
         frame_start=111,
-        frame_end=115,
+        frame_end=127,
         frame_layout=DynamicsFrameLayout(context_frames=1, target_frames=2),
         rollout_context_frames=1,
         rollout_chunks=1,
@@ -173,17 +173,16 @@ def test_transition_dataset_exposes_future_rollout_targets_when_requested(
 
     assert len(dataset) == 1
     sample = dataset[0]
-    assert sample["future_target_frames"].shape == (2, 3, 128, 128)
-    assert sample["future_actions"].shape == (2, 4)
-    assert torch.equal(sample["future_target_frame_idx"], torch.tensor([114, 115]))
+    assert sample["future_target_frames"].shape == (8, 3, 128, 128)
+    assert sample["future_actions"].shape == (8, 4)
+    assert torch.equal(sample["future_target_frame_idx"], torch.arange(120, 128))
     assert torch.equal(
-        sample["future_actions"],
-        torch.tensor(
-            [
-                [113.0, 114.0, 115.0, 116.0],
-                [114.0, 115.0, 116.0, 117.0],
-            ]
-        ),
+        sample["future_actions"][0],
+        torch.tensor([119.0, 120.0, 121.0, 122.0]),
+    )
+    assert torch.equal(
+        sample["future_actions"][-1],
+        torch.tensor([126.0, 127.0, 128.0, 129.0]),
     )
 
 
@@ -197,19 +196,19 @@ def test_transition_dataset_can_span_all_episodes(
         split="train",
         all_episodes=True,
     )
-    assert len(dataset) == 239
+    assert len(dataset) == 221
     first = dataset[0]
-    second_episode_first = dataset[127]
-    last = dataset[238]
+    second_episode_first = dataset[118]
+    last = dataset[220]
     assert first["episode_idx"].item() == 0
     assert first["context_frame_idx"].tolist() == [0]
-    assert first["target_frame_idx"].tolist() == [1, 2, 3]
+    assert first["target_frame_idx"].tolist() == list(range(1, 13))
     assert second_episode_first["episode_idx"].item() == 1
     assert second_episode_first["context_frame_idx"].tolist() == [0]
-    assert second_episode_first["target_frame_idx"].tolist() == [1, 2, 3]
+    assert second_episode_first["target_frame_idx"].tolist() == list(range(1, 13))
     assert last["episode_idx"].item() == 1
-    assert last["context_frame_idx"].tolist() == [111]
-    assert last["target_frame_idx"].tolist() == [112, 113, 114]
+    assert last["context_frame_idx"].tolist() == [102]
+    assert last["target_frame_idx"].tolist() == list(range(103, 115))
 
 
 def test_transition_dataset_can_exclude_episodes_from_all_episode_training(
@@ -223,13 +222,13 @@ def test_transition_dataset_can_exclude_episodes_from_all_episode_training(
         all_episodes=True,
         exclude_episodes=(0,),
     )
-    assert len(dataset) == 112
+    assert len(dataset) == 103
     first = dataset[0]
-    last = dataset[111]
+    last = dataset[102]
     assert first["episode_idx"].item() == 1
     assert first["context_frame_idx"].tolist() == [0]
     assert last["episode_idx"].item() == 1
-    assert last["context_frame_idx"].tolist() == [111]
+    assert last["context_frame_idx"].tolist() == [102]
 
 
 def test_list_episode_indices_returns_sorted_episode_numbers(

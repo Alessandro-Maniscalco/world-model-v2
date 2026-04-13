@@ -90,8 +90,9 @@ def test_world_model_rollout_supports_multi_target_layouts() -> None:
         context_frames=1,
         target_frames=3,
         max_frames=4,
-        num_action_per_chunk=3,
+        num_action_per_chunk=12,
         action_dim=4,
+        temporal_compression_ratio=4,
         open_rollout_context_frames=1,
         open_rollout_stride_frames=None,
     )
@@ -100,6 +101,29 @@ def test_world_model_rollout_supports_multi_target_layouts() -> None:
         """Minimal rollout harness that exercises the shared rollout logic."""
 
         dynamics = SimpleNamespace(cfg=cfg)
+        temporal_downsample_factor = 4
+
+        def pixel_frames_to_latent_frames(self, pixel_frames: int, *, exact: bool = False) -> int:
+            """Map Wan pixel-frame counts into latent-frame counts for the rollout harness."""
+
+            latent_frames = 1 + (pixel_frames - 1) // self.temporal_downsample_factor
+            if exact and (1 + (latent_frames - 1) * self.temporal_downsample_factor) != pixel_frames:
+                raise ValueError("pixel_frames must align to the harness temporal ratio.")
+            return latent_frames
+
+        def latent_frames_to_pixel_frames(self, latent_frames: int) -> int:
+            """Map harness latent-frame counts back into Wan pixel-frame counts."""
+
+            return 1 + (latent_frames - 1) * self.temporal_downsample_factor
+
+        def resolved_rollout_stride_frames(
+            self,
+            context_frames: int,
+            stride_frames: int | None = None,
+        ) -> int:
+            """Delegate stride resolution to the shared world-model helper."""
+
+            return WorldModel.resolved_rollout_stride_frames(self, context_frames, stride_frames)
 
         def encode_context_frames(self, images: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
             """Encode images into a fake latent tensor with matching frame order."""
@@ -132,16 +156,38 @@ def test_world_model_rollout_supports_multi_target_layouts() -> None:
 
             return latents.permute(0, 2, 1, 3, 4)
 
+        def decode_target_latents(
+            self,
+            context_latents: torch.Tensor,
+            target_latents: torch.Tensor,
+            *,
+            context_pixel_frames: int,
+            target_pixel_frames: int | None = None,
+        ) -> torch.Tensor:
+            """Expand each predicted latent into four pixel frames for rollout assertions."""
+
+            del context_latents, context_pixel_frames
+            expanded = torch.cat(
+                [
+                    target_latents[:, :, index : index + 1]
+                    .permute(0, 2, 1, 3, 4)
+                    .repeat(1, self.temporal_downsample_factor, 1, 1, 1)
+                    for index in range(target_latents.shape[2])
+                ],
+                dim=1,
+            )
+            return expanded[:, :target_pixel_frames]
+
     seed_frames = torch.zeros(1, 1, 3, 2, 2)
-    actions = torch.arange(16, dtype=torch.float32).view(1, 4, 4)
+    actions = torch.arange(64, dtype=torch.float32).view(1, 16, 4)
 
-    rollout = WorldModel.rollout(DummyWorldModel(), seed_frames, steps=4, actions=actions)
+    rollout = WorldModel.rollout(DummyWorldModel(), seed_frames, steps=16, actions=actions)
 
-    assert rollout.shape == (1, 5, 3, 2, 2)
+    assert rollout.shape == (1, 17, 3, 2, 2)
     assert len(captured_action_windows) == 2
-    assert torch.equal(captured_action_windows[0], actions[:, :3])
-    assert torch.equal(captured_action_windows[1][:, :1], actions[:, 3:4])
-    assert torch.count_nonzero(captured_action_windows[1][:, 1:]) == 0
+    assert torch.equal(captured_action_windows[0], actions[:, :12])
+    assert torch.equal(captured_action_windows[1][:, :4], actions[:, 12:16])
+    assert torch.count_nonzero(captured_action_windows[1][:, 4:]) == 0
 
 
 def test_world_model_resolves_default_rollout_stride_from_layout() -> None:
@@ -178,8 +224,9 @@ def test_world_model_rollout_can_use_overlap_stride() -> None:
         context_frames=1,
         target_frames=2,
         max_frames=3,
-        num_action_per_chunk=2,
+        num_action_per_chunk=8,
         action_dim=4,
+        temporal_compression_ratio=4,
         open_rollout_context_frames=1,
         open_rollout_stride_frames=1,
     )
@@ -188,6 +235,29 @@ def test_world_model_rollout_can_use_overlap_stride() -> None:
         """Minimal rollout harness that exercises overlap-stride logic."""
 
         dynamics = SimpleNamespace(cfg=cfg)
+        temporal_downsample_factor = 4
+
+        def pixel_frames_to_latent_frames(self, pixel_frames: int, *, exact: bool = False) -> int:
+            """Map Wan pixel-frame counts into latent-frame counts for the rollout harness."""
+
+            latent_frames = 1 + (pixel_frames - 1) // self.temporal_downsample_factor
+            if exact and (1 + (latent_frames - 1) * self.temporal_downsample_factor) != pixel_frames:
+                raise ValueError("pixel_frames must align to the harness temporal ratio.")
+            return latent_frames
+
+        def latent_frames_to_pixel_frames(self, latent_frames: int) -> int:
+            """Map harness latent-frame counts back into Wan pixel-frame counts."""
+
+            return 1 + (latent_frames - 1) * self.temporal_downsample_factor
+
+        def resolved_rollout_stride_frames(
+            self,
+            context_frames: int,
+            stride_frames: int | None = None,
+        ) -> int:
+            """Delegate stride resolution to the shared world-model helper."""
+
+            return WorldModel.resolved_rollout_stride_frames(self, context_frames, stride_frames)
 
         def encode_context_frames(self, images: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
             """Encode images into a fake latent tensor with matching frame order."""
@@ -219,22 +289,45 @@ def test_world_model_rollout_can_use_overlap_stride() -> None:
 
             return latents.permute(0, 2, 1, 3, 4)
 
+        def decode_target_latents(
+            self,
+            context_latents: torch.Tensor,
+            target_latents: torch.Tensor,
+            *,
+            context_pixel_frames: int,
+            target_pixel_frames: int | None = None,
+        ) -> torch.Tensor:
+            """Expand each predicted latent into four pixel frames for rollout assertions."""
+
+            del context_latents, context_pixel_frames
+            expanded = torch.cat(
+                [
+                    target_latents[:, :, index : index + 1]
+                    .permute(0, 2, 1, 3, 4)
+                    .repeat(1, self.temporal_downsample_factor, 1, 1, 1)
+                    for index in range(target_latents.shape[2])
+                ],
+                dim=1,
+            )
+            return expanded[:, :target_pixel_frames]
+
     seed_frames = torch.zeros(1, 1, 3, 2, 2)
-    actions = torch.arange(12, dtype=torch.float32).view(1, 3, 4)
+    actions = torch.arange(36, dtype=torch.float32).view(1, 9, 4)
 
     rollout = WorldModel.rollout(
         DummyWorldModel(),
         seed_frames,
-        steps=3,
+        steps=9,
         actions=actions,
         stride_frames=1,
     )
 
-    assert rollout.shape == (1, 4, 3, 2, 2)
+    assert rollout.shape == (1, 10, 3, 2, 2)
     assert len(captured_action_windows) == 3
-    assert torch.equal(captured_action_windows[0], actions[:, 0:2])
-    assert torch.equal(captured_action_windows[1], actions[:, 1:3])
-    assert torch.equal(captured_action_windows[2][:, :1], actions[:, 2:3])
+    assert torch.equal(captured_action_windows[0], actions[:, 0:8])
+    assert torch.equal(captured_action_windows[1][:, :5], actions[:, 4:9])
+    assert torch.count_nonzero(captured_action_windows[1][:, 5:]) == 0
+    assert torch.equal(captured_action_windows[2][:, :1], actions[:, 8:9])
     assert torch.count_nonzero(captured_action_windows[2][:, 1:]) == 0
 
 
@@ -248,8 +341,9 @@ def test_world_model_rollout_respects_fixed_open_rollout_context() -> None:
         context_frames=1,
         target_frames=3,
         max_frames=4,
-        num_action_per_chunk=3,
+        num_action_per_chunk=12,
         action_dim=4,
+        temporal_compression_ratio=4,
         open_rollout_context_frames=1,
         open_rollout_stride_frames=None,
     )
@@ -258,6 +352,29 @@ def test_world_model_rollout_respects_fixed_open_rollout_context() -> None:
         """Minimal rollout harness that records the actual context length per chunk."""
 
         dynamics = SimpleNamespace(cfg=cfg)
+        temporal_downsample_factor = 4
+
+        def pixel_frames_to_latent_frames(self, pixel_frames: int, *, exact: bool = False) -> int:
+            """Map Wan pixel-frame counts into latent-frame counts for the rollout harness."""
+
+            latent_frames = 1 + (pixel_frames - 1) // self.temporal_downsample_factor
+            if exact and (1 + (latent_frames - 1) * self.temporal_downsample_factor) != pixel_frames:
+                raise ValueError("pixel_frames must align to the harness temporal ratio.")
+            return latent_frames
+
+        def latent_frames_to_pixel_frames(self, latent_frames: int) -> int:
+            """Map harness latent-frame counts back into Wan pixel-frame counts."""
+
+            return 1 + (latent_frames - 1) * self.temporal_downsample_factor
+
+        def resolved_rollout_stride_frames(
+            self,
+            context_frames: int,
+            stride_frames: int | None = None,
+        ) -> int:
+            """Delegate stride resolution to the shared world-model helper."""
+
+            return WorldModel.resolved_rollout_stride_frames(self, context_frames, stride_frames)
 
         def encode_context_frames(self, images: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
             """Encode images into a fake latent tensor with matching frame order."""
@@ -291,14 +408,36 @@ def test_world_model_rollout_respects_fixed_open_rollout_context() -> None:
 
             return latents.permute(0, 2, 1, 3, 4)
 
+        def decode_target_latents(
+            self,
+            context_latents: torch.Tensor,
+            target_latents: torch.Tensor,
+            *,
+            context_pixel_frames: int,
+            target_pixel_frames: int | None = None,
+        ) -> torch.Tensor:
+            """Expand each predicted latent into four pixel frames for rollout assertions."""
+
+            del context_latents, context_pixel_frames
+            expanded = torch.cat(
+                [
+                    target_latents[:, :, index : index + 1]
+                    .permute(0, 2, 1, 3, 4)
+                    .repeat(1, self.temporal_downsample_factor, 1, 1, 1)
+                    for index in range(target_latents.shape[2])
+                ],
+                dim=1,
+            )
+            return expanded[:, :target_pixel_frames]
+
     seed_frames = torch.zeros(1, 1, 3, 2, 2)
-    actions = torch.arange(16, dtype=torch.float32).view(1, 4, 4)
+    actions = torch.arange(64, dtype=torch.float32).view(1, 16, 4)
 
-    rollout = WorldModel.rollout(DummyWorldModel(), seed_frames, steps=4, actions=actions)
+    rollout = WorldModel.rollout(DummyWorldModel(), seed_frames, steps=16, actions=actions)
 
-    assert rollout.shape == (1, 5, 3, 2, 2)
+    assert rollout.shape == (1, 17, 3, 2, 2)
     assert captured_context_lengths == [1, 1]
     assert len(captured_action_windows) == 2
-    assert torch.equal(captured_action_windows[0], actions[:, :3])
-    assert torch.equal(captured_action_windows[1][:, :1], actions[:, 3:4])
-    assert torch.count_nonzero(captured_action_windows[1][:, 1:]) == 0
+    assert torch.equal(captured_action_windows[0], actions[:, :12])
+    assert torch.equal(captured_action_windows[1][:, :4], actions[:, 12:16])
+    assert torch.count_nonzero(captured_action_windows[1][:, 4:]) == 0
