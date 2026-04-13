@@ -44,3 +44,5 @@ After that, train the action pathway to map raw robot actions into that latent-a
 
 
 Now changed so VAE termoal downsample of 4x.
+
+if i look at step 4000 and step 6500 video, for both the first image is missing outputs/so101_base_pickplace_wan_ae_temporal4_192x256_8x_z32_mse_motion_30k/samples/step_007250/episode_0.mp4
