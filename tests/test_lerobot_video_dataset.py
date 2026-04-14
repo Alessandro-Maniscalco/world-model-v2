@@ -8,13 +8,18 @@ import torch
 
 from world_model_v2.dynamics_transformer import DynamicsFrameLayout
 from world_model_v2.lerobot_video_dataset import (
+    LeRobotEpisodeVideoRepository,
     LeRobotVideoFrameDataset,
     LeRobotVideoTransitionDataset,
     LeRobotVideoValidationClipDataset,
     SO101_BASE_SIM_PICKPLACE_ACTION_DIM,
+    SO101_BASE_SIM_PICKPLACE_DATASET_ID,
+    crop_bgr_frame,
     load_lerobot_video_clip,
+    resolve_default_lerobot_crop_bounds,
     resolve_lerobot_video_split,
 )
+from world_model_v2.metaworld_dataset import bgr_frame_to_tensor
 
 
 def test_load_lerobot_video_clip_returns_requested_slice(
@@ -43,6 +48,44 @@ def test_load_lerobot_video_clip_returns_requested_slice(
     assert torch.equal(clip["frame_idx"], torch.tensor([1, 2], dtype=torch.long))
     assert clip["episode_idx"].item() == 0
     assert float(clip["frames"][1, 0].mean()) > float(clip["frames"][0, 0].mean())
+
+
+def test_load_lerobot_video_clip_applies_default_so101_crop(
+    fake_lerobot_so101_base_sim_pickplace_root: Path,
+) -> None:
+    """SO101 clips should apply the default crop before resizing."""
+
+    repository = LeRobotEpisodeVideoRepository(
+        data_root=str(fake_lerobot_so101_base_sim_pickplace_root),
+        repo_id=SO101_BASE_SIM_PICKPLACE_DATASET_ID,
+    )
+    record = repository.episode_record(0)
+    raw_frame = repository._read_video_frame(record, 0)
+    crop_bounds = resolve_default_lerobot_crop_bounds(
+        SO101_BASE_SIM_PICKPLACE_DATASET_ID,
+        raw_frame.shape[0],
+        raw_frame.shape[1],
+    )
+
+    assert crop_bounds == (0, 14, 1, 15)
+
+    manual = bgr_frame_to_tensor(
+        crop_bgr_frame(raw_frame, crop_bounds),
+        height=16,
+        width=16,
+    )
+    clip = load_lerobot_video_clip(
+        data_root=str(fake_lerobot_so101_base_sim_pickplace_root),
+        split="train",
+        episode=0,
+        frame_start=0,
+        frame_end=0,
+        resolution=16,
+        height=16,
+        width=16,
+    )
+
+    assert torch.allclose(clip["frames"][0], manual)
 
 
 def test_lerobot_video_frame_dataset_flattens_all_episodes(

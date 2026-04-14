@@ -45,4 +45,33 @@ After that, train the action pathway to map raw robot actions into that latent-a
 
 Now changed so VAE termoal downsample of 4x.
 
-if i look at step 4000 and step 6500 video, for both the first image is missing outputs/so101_base_pickplace_wan_ae_temporal4_192x256_8x_z32_mse_motion_30k/samples/step_007250/episode_0.mp4
+  --kl-beta 1e-5 \
+  --recon-mse-weight 1.0 \
+  --recon-l1-weight 0.1 \
+  --recon-edge-weight 0.05 \
+  --recon-motion-weight 2.0 \
+  --recon-motion-threshold 0.02 \
+  --recon-motion-dilation-kernel-size 7 \
+
+
+full episode 0, after seeing the 13 frame window 30 times works well
+outputs/so101_episode0_full_ae_resume_from_f113_137_crop_120x160_4xspatial_z32/samples/step_016000/episode_0.mp4
+stopped at validation not improving
+
+  --lr 1e-5 \
+  --kl-beta 1e-5 \
+  --recon-mse-weight 1.0 \
+  --recon-l1-weight 0.1 \
+  --recon-edge-weight 0.05 \
+  --recon-motion-weight 2.0 \
+  --recon-motion-threshold 0.02 \
+  --recon-motion-dilation-kernel-size 7 \
+
+
+
+sudo apt install -y git-lfs
+git lfs install
+git clone https://github.com/Alessandro-Maniscalco/world-model-v2.git
+cd world-model-v2
+git lfs pull
+

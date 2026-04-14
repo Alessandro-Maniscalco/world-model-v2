@@ -17,12 +17,12 @@ CACHE_T = 2
 class WanVAEConfig:
     """Configure the local Wan2.1-style video autoencoder."""
 
-    dim: int = 96
+    dim: int = 128
     z_dim: int = 32
-    dim_mult: tuple[int, ...] = (1, 2, 2, 4)
-    num_res_blocks: int = 1
+    dim_mult: tuple[int, ...] = (1, 2, 4)
+    num_res_blocks: int = 2
     attn_scales: tuple[float, ...] = ()
-    temperal_downsample: tuple[bool, ...] = (False, True, True)
+    temperal_downsample: tuple[bool, ...] = (True, True)
     dropout: float = 0.0
 
     def __post_init__(self) -> None:
@@ -94,13 +94,13 @@ class WanVAEConfig:
         """Build a config from serialized checkpoint metadata."""
 
         return cls(
-            dim=int(payload.get("dim", 96)),
+            dim=int(payload.get("dim", 128)),
             z_dim=int(payload.get("z_dim", 32)),
-            dim_mult=tuple(int(value) for value in payload.get("dim_mult", [1, 2, 2, 4])),
-            num_res_blocks=int(payload.get("num_res_blocks", 1)),
+            dim_mult=tuple(int(value) for value in payload.get("dim_mult", [1, 2, 4])),
+            num_res_blocks=int(payload.get("num_res_blocks", 2)),
             attn_scales=tuple(float(value) for value in payload.get("attn_scales", [])),
             temperal_downsample=tuple(
-                bool(value) for value in payload.get("temperal_downsample", [False, True, True])
+                bool(value) for value in payload.get("temperal_downsample", [True, True])
             ),
             dropout=float(payload.get("dropout", 0.0)),
         )

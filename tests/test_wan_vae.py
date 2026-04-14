@@ -32,7 +32,7 @@ def test_wan_video_tokenizer_preserves_expected_temporal_shapes() -> None:
         latents = model.encode_frame_sequence(images, deterministic=True)
         reconstructed = model.decode_frame_sequence(latents)
 
-        assert latents.shape == (1, 32, latent_frames, 4, 4)
+        assert latents.shape == (1, 32, latent_frames, 8, 8)
         assert reconstructed.shape == (1, pixel_frames, 3, 32, 32)
 
 
@@ -45,7 +45,7 @@ def test_wan_image_wrappers_still_support_single_frames() -> None:
     latents = model.encode(images, deterministic=True)
     reconstructed = model.decode(latents)
 
-    assert latents.shape == (2, 32, 4, 4)
+    assert latents.shape == (2, 32, 8, 8)
     assert reconstructed.shape == (2, 3, 32, 32)
 
 
@@ -59,8 +59,8 @@ def test_latent_normalization_stats_round_trip_for_image_and_video_latents() -> 
         video_std=tuple(float(index + 3) for index in range(32)),
     )
     model = WorldModel(resolution=32, latent_normalization_stats=stats)
-    image_latents = torch.randn(2, 32, 4, 4)
-    video_latents = torch.randn(2, 32, 4, 4, 4)
+    image_latents = torch.randn(2, 32, 8, 8)
+    video_latents = torch.randn(2, 32, 4, 8, 8)
 
     normalized_images = model._normalize_image_latents(image_latents)
     normalized_videos = model._normalize_video_latents(video_latents)

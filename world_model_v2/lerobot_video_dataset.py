@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 import json
+import math
 from pathlib import Path
 import random
 import subprocess
@@ -28,6 +29,9 @@ from world_model_v2.metaworld_dataset import (
 SO101_BASE_SIM_PICKPLACE_DATASET_ID = "davidlinjiahao/lerobot_so101_base_sim_pickplace"
 SO101_BASE_SIM_PICKPLACE_IMAGE_COLUMN = "observation.images.front"
 SO101_BASE_SIM_PICKPLACE_ACTION_DIM = 6
+SO101_DEFAULT_CROP_LEFT_KEEP_FRACTION = 23.0 / 320.0
+SO101_DEFAULT_CROP_RIGHT_KEEP_FRACTION = 297.0 / 320.0
+SO101_DEFAULT_CROP_BOTTOM_KEEP_FRACTION = 208.0 / 240.0
 LEROBOT_VIDEO_EPISODES_PATH = "meta/episodes.jsonl"
 LEROBOT_VIDEO_TASKS_PATH = "meta/tasks.jsonl"
 LEROBOT_VIDEO_ACTION_COLUMN_CANDIDATES = ("action", "actions")
@@ -42,6 +46,39 @@ def resolve_lerobot_video_split(split: str) -> str:
             f"but received split={split!r}."
         )
     return "train"
+
+
+def resolve_default_lerobot_crop_bounds(
+    repo_id: str,
+    frame_height: int,
+    frame_width: int,
+) -> tuple[int, int, int, int] | None:
+    """Return one dataset-specific `(top, bottom, left, right)` crop box if configured."""
+
+    if repo_id != SO101_BASE_SIM_PICKPLACE_DATASET_ID:
+        return None
+    top = 0
+    bottom = min(max(math.ceil(frame_height * SO101_DEFAULT_CROP_BOTTOM_KEEP_FRACTION), 1), frame_height)
+    left = min(max(math.floor(frame_width * SO101_DEFAULT_CROP_LEFT_KEEP_FRACTION), 0), frame_width - 1)
+    right = min(
+        max(math.ceil(frame_width * SO101_DEFAULT_CROP_RIGHT_KEEP_FRACTION), left + 1),
+        frame_width,
+    )
+    if bottom <= top or right <= left:
+        return None
+    return top, bottom, left, right
+
+
+def crop_bgr_frame(
+    frame_bgr: np.ndarray,
+    crop_bounds: tuple[int, int, int, int] | None,
+) -> np.ndarray:
+    """Crop one OpenCV BGR frame to the requested keep bounds."""
+
+    if crop_bounds is None:
+        return frame_bgr
+    top, bottom, left, right = crop_bounds
+    return frame_bgr[top:bottom, left:right]
 
 
 def read_jsonl_records(path: Path) -> list[dict[str, Any]]:
@@ -384,8 +421,17 @@ class LeRobotEpisodeVideoRepository:
         """Load and resize one frame tensor from the backing episode MP4."""
 
         resolved_height, resolved_width = resolve_resize_shape(resolution, height, width)
+        frame_bgr = self._read_video_frame(frame.episode, frame.frame_index)
+        cropped_frame_bgr = crop_bgr_frame(
+            frame_bgr,
+            resolve_default_lerobot_crop_bounds(
+                self.repo_id,
+                frame_bgr.shape[0],
+                frame_bgr.shape[1],
+            ),
+        )
         return bgr_frame_to_tensor(
-            self._read_video_frame(frame.episode, frame.frame_index),
+            cropped_frame_bgr,
             height=resolved_height,
             width=resolved_width,
         )

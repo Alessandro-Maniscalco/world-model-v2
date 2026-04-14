@@ -28,8 +28,7 @@ def annotate_frame(
     image = Image.fromarray(frame)
     image = ImageOps.expand(image, border=4, fill=border_color)
     draw = ImageDraw.Draw(image)
-    draw.rectangle((6, 6, min(240, image.width - 6), 32), fill=(0, 0, 0))
-    draw.text((10, 10), label, fill=(255, 255, 255))
+    draw.text((10, 10), label, fill=(255, 0, 0))
     return image
 
 

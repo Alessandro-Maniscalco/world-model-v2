@@ -9,7 +9,11 @@ import numpy as np
 import pytest
 import torch
 
-from world_model_v2.utils.visualization import build_side_by_side_grid, write_side_by_side_mp4
+from world_model_v2.utils.visualization import (
+    annotate_frame,
+    build_side_by_side_grid,
+    write_side_by_side_mp4,
+)
 
 
 def read_mp4_frames(output_path: Path) -> tuple[list[np.ndarray], dict[str, object]]:
@@ -32,6 +36,21 @@ def test_build_side_by_side_grid_returns_image() -> None:
     grid = build_side_by_side_grid(images, reconstructed, max_frames=3)
     assert grid.size[0] > 0
     assert grid.size[1] > 0
+
+
+def test_annotate_frame_uses_red_text_without_background_banner() -> None:
+    """Labels should be red text overlays without an opaque header strip."""
+
+    frame = np.full((64, 160, 3), 128, dtype=np.uint8)
+    annotated = np.asarray(annotate_frame(frame, "gt 0"))
+
+    assert tuple(int(value) for value in annotated[20, 120]) == (128, 128, 128)
+    text_region = annotated[10:28, 10:60]
+    assert np.any(
+        (text_region[..., 0] > 180)
+        & (text_region[..., 1] < 100)
+        & (text_region[..., 2] < 100)
+    )
 
 
 def test_write_side_by_side_mp4_exports_all_frames(tmp_path: Path) -> None:
