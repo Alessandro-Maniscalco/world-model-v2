@@ -13,12 +13,13 @@ Episode 18, frames 0-63 as it has good action variation.
 Total frames seen should be XXXX. The number of steps is divided by the batch size hat doesn't OOM.
 
 ## Vae used
---load-encoder-decoder saved_checkpoints/vae_pickplace_z32_8x/best.pt
-mp4: saved_checkpoints/vae_pickplace_z32_8x/episode_0.mp4
+--load-encoder-decoder saved_checkpoints/github/vae_pickplace_z32_8x.pt
+mp4: saved_checkpoints/github/vae_pickplace_z32_8x_episode_0.mp4
 
 Validations:
 Best `z32` / `8x` motion-weighted validation on episode 0 landed at step `15250`: `ae_loss=0.006813`, `recon_loss=0.006752`, `recon_mse=8.23e-5`, `motion_l1=1.34e-2`, `motion_mask_fraction=7.83%`.
 Transform diagnostics for the new `z32` / `8x` VAE are in `outputs/checks/vae_pickplace_z32_8x_transforms/summary.json`.
+The promoted checkpoint at `saved_checkpoints/github/vae_pickplace_z32_8x.pt` was copied from `outputs/so101_episode0_full_ae_resume_from_f113_137_crop_120x160_4xspatial_z32/checkpoints/best.pt`, while the previous file was archived under `saved_checkpoints/old/old_vae_pickplace_z32_8x/`.
 
 Future: 16x downsamplling with z64.
 
@@ -75,3 +76,42 @@ git clone https://github.com/Alessandro-Maniscalco/world-model-v2.git
 cd world-model-v2
 git lfs pull
 
+
+to run for next training: 
+
+source .venv/bin/activate
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python -m world_model_v2.run \
+  --mode ae_only \
+  --dataset-format lerobot_so101_base_sim_pickplace \
+  --data-root data/so101_base_sim_pickplace_cache \
+  --task single_grasp \
+  --split train \
+  --episode 0 \
+  --train-all-episodes \
+  --validation-split train \
+  --validation-episode 0 \
+  --resolution 120 \
+  --height 120 \
+  --width 160 \
+  --latent-channels 32 \
+  --batch-size 1 \
+  --lr 1e-5 \
+  --max-steps 200000 \
+  --validation-interval 250 \
+  --checkpoint-interval 250 \
+  --log-interval 10 \
+  --dynamics-context-frames 1 \
+  --dynamics-target-frames 3 \
+  --kl-beta 1e-5 \
+  --recon-mse-weight 1.0 \
+  --recon-l1-weight 0.1 \
+  --recon-edge-weight 0.05 \
+  --recon-motion-weight 2.0 \
+  --recon-motion-threshold 0.02 \
+  --recon-motion-dilation-kernel-size 7 \
+  --resume saved_checkpoints/github/vae_pickplace_z32_8x.pt \
+  --run-name so101_all_episodes_ae_resume_from_episode0_crop_120x160_4xspatial_z32 \
+  --output-dir outputs \
+  --seed 7
