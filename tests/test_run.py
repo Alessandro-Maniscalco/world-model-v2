@@ -26,7 +26,9 @@ def test_run_parse_args_uses_expected_defaults() -> None:
     assert config.resolution == 128
     assert config.height is None
     assert config.width is None
-    assert config.latent_channels == 32
+    assert config.wan_dim == 64
+    assert config.latent_channels == 64
+    assert config.wan_num_res_blocks == 1
     assert config.hidden_channels == 64
     assert config.ae_backend == "wan"
     assert config.dynamics_infer_steps == 35
@@ -69,10 +71,15 @@ def test_run_parse_args_uses_expected_defaults() -> None:
     assert config.recon_motion_weight == 0.0
     assert config.recon_motion_threshold == 0.02
     assert config.recon_motion_dilation_kernel_size == 5
-    assert config.batch_size == 32
+    assert config.batch_size == 64
+    assert config.dataloader_num_workers is None
+    assert config.dataloader_prefetch_factor == 2
+    assert config.dataloader_pin_memory is None
     assert config.auto_batch_size is False
     assert config.lr == 1e-4
+    assert config.optimizer_beta1 == 0.95
     assert config.validation_interval == 250
+    assert config.validation_start_step == 0
     assert config.checkpoint_interval == 250
     assert config.early_stop_window_size == 1
     assert config.early_stop_patience_windows == 5
@@ -97,6 +104,59 @@ def test_run_build_config_preserves_load_flags() -> None:
     assert config.mode == "dynamics_only"
     assert config.load_encoder_decoder == "encoder_decoder.pt"
     assert config.load_dynamics == "dynamics.pt"
+
+
+def test_run_build_config_preserves_validation_start_step() -> None:
+    """The config builder should keep the requested validation delay step."""
+
+    args = parse_args(
+        [
+            "--validation-interval",
+            "250",
+            "--validation-start-step",
+            "30000",
+        ]
+    )
+    config = build_config(args)
+    assert config.validation_interval == 250
+    assert config.validation_start_step == 30000
+
+
+def test_run_build_config_preserves_wan_autoencoder_shape() -> None:
+    """The config builder should keep the requested Wan autoencoder shape knobs."""
+
+    args = parse_args(
+        [
+            "--wan-dim",
+            "96",
+            "--latent-channels",
+            "64",
+            "--wan-num-res-blocks",
+            "1",
+        ]
+    )
+    config = build_config(args)
+    assert config.wan_dim == 96
+    assert config.latent_channels == 64
+    assert config.wan_num_res_blocks == 1
+
+
+def test_run_build_config_preserves_dataloader_flags() -> None:
+    """The config builder should keep the requested dataloader performance knobs."""
+
+    args = parse_args(
+        [
+            "--dataloader-num-workers",
+            "4",
+            "--dataloader-prefetch-factor",
+            "3",
+            "--dataloader-pin-memory",
+        ]
+    )
+    config = build_config(args)
+    assert config.dataloader_num_workers == 4
+    assert config.dataloader_prefetch_factor == 3
+    assert config.dataloader_pin_memory is True
 
 
 def test_run_build_config_preserves_rf_dynamics_flags() -> None:
@@ -298,6 +358,14 @@ def test_run_build_config_preserves_auto_batch_flag() -> None:
     args = parse_args(["--auto-batch-size"])
     config = build_config(args)
     assert config.auto_batch_size is True
+
+
+def test_run_build_config_preserves_optimizer_beta1() -> None:
+    """The config builder should keep the requested AdamW beta1 override."""
+
+    args = parse_args(["--optimizer-beta1", "0.9"])
+    config = build_config(args)
+    assert config.optimizer_beta1 == 0.9
 
 
 def test_run_build_config_preserves_all_episode_training_flags() -> None:

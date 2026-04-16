@@ -11,16 +11,19 @@ import torch.nn.functional as F
 
 
 CACHE_T = 2
+DEFAULT_WAN_DIM = 64
+DEFAULT_WAN_Z_DIM = 64
+DEFAULT_WAN_NUM_RES_BLOCKS = 1
 
 
 @dataclass(frozen=True)
 class WanVAEConfig:
     """Configure the local Wan2.1-style video autoencoder."""
 
-    dim: int = 128
-    z_dim: int = 32
+    dim: int = DEFAULT_WAN_DIM
+    z_dim: int = DEFAULT_WAN_Z_DIM
     dim_mult: tuple[int, ...] = (1, 2, 4)
-    num_res_blocks: int = 2
+    num_res_blocks: int = DEFAULT_WAN_NUM_RES_BLOCKS
     attn_scales: tuple[float, ...] = ()
     temperal_downsample: tuple[bool, ...] = (True, True)
     dropout: float = 0.0
@@ -94,10 +97,10 @@ class WanVAEConfig:
         """Build a config from serialized checkpoint metadata."""
 
         return cls(
-            dim=int(payload.get("dim", 128)),
-            z_dim=int(payload.get("z_dim", 32)),
+            dim=int(payload.get("dim", DEFAULT_WAN_DIM)),
+            z_dim=int(payload.get("z_dim", DEFAULT_WAN_Z_DIM)),
             dim_mult=tuple(int(value) for value in payload.get("dim_mult", [1, 2, 4])),
-            num_res_blocks=int(payload.get("num_res_blocks", 2)),
+            num_res_blocks=int(payload.get("num_res_blocks", DEFAULT_WAN_NUM_RES_BLOCKS)),
             attn_scales=tuple(float(value) for value in payload.get("attn_scales", [])),
             temperal_downsample=tuple(
                 bool(value) for value in payload.get("temperal_downsample", [True, True])
@@ -166,12 +169,12 @@ class RMSNorm(nn.Module):
 
 
 class Upsample(nn.Upsample):
-    """Nearest-neighbor upsampling that preserves bf16 compatibility."""
+    """Nearest-neighbor upsampling that preserves the input activation dtype."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Upsample in fp32 and cast back to the original dtype."""
+        """Return one nearest-exact upsampled tensor without promoting precision."""
 
-        return super().forward(x.float()).type_as(x)
+        return super().forward(x)
 
 
 class Resample(nn.Module):

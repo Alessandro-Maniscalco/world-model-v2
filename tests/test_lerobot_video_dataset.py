@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import pickle
 
 import torch
 
@@ -10,6 +11,7 @@ from world_model_v2.dynamics_transformer import DynamicsFrameLayout
 from world_model_v2.lerobot_video_dataset import (
     LeRobotEpisodeVideoRepository,
     LeRobotVideoFrameDataset,
+    LeRobotVideoFrameRecord,
     LeRobotVideoTransitionDataset,
     LeRobotVideoValidationClipDataset,
     SO101_BASE_SIM_PICKPLACE_ACTION_DIM,
@@ -86,6 +88,31 @@ def test_load_lerobot_video_clip_applies_default_so101_crop(
     )
 
     assert torch.allclose(clip["frames"][0], manual)
+
+
+def test_lerobot_video_repository_pickle_drops_cached_video_handles(
+    fake_lerobot_so101_base_sim_pickplace_root: Path,
+) -> None:
+    """Pickling should clear cached OpenCV handles so Windows workers can spawn safely."""
+
+    repository = LeRobotEpisodeVideoRepository(
+        data_root=str(fake_lerobot_so101_base_sim_pickplace_root),
+        repo_id=SO101_BASE_SIM_PICKPLACE_DATASET_ID,
+    )
+    record = repository.episode_record(0)
+    _ = repository._read_video_frame(record, 0)
+
+    round_tripped = pickle.loads(pickle.dumps(repository))
+
+    assert repository._video_captures
+    assert round_tripped._video_captures == {}
+    frame = round_tripped.load_frame_tensor(
+        frame=LeRobotVideoFrameRecord(episode=record, frame_index=0),
+        resolution=8,
+        height=None,
+        width=None,
+    )
+    assert frame.shape == (3, 8, 8)
 
 
 def test_lerobot_video_frame_dataset_flattens_all_episodes(

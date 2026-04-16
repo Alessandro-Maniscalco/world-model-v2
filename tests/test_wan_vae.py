@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from world_model_v2.model import LatentNormalizationStats, WorldModel
-from world_model_v2.wan_vae import WanVAEConfig
+from world_model_v2.wan_vae import Upsample, WanVAEConfig
 
 
 def test_wan_vae_config_uses_temporal_four_x_mapping() -> None:
@@ -13,6 +13,9 @@ def test_wan_vae_config_uses_temporal_four_x_mapping() -> None:
 
     cfg = WanVAEConfig()
 
+    assert cfg.dim == 64
+    assert cfg.z_dim == 64
+    assert cfg.num_res_blocks == 1
     assert cfg.temporal_downsample_factor() == 4
     assert cfg.pixel_frames_to_latent_frames(1) == 1
     assert cfg.pixel_frames_to_latent_frames(5) == 2
@@ -47,6 +50,19 @@ def test_wan_image_wrappers_still_support_single_frames() -> None:
 
     assert latents.shape == (2, 32, 8, 8)
     assert reconstructed.shape == (2, 3, 32, 32)
+
+
+def test_wan_upsample_preserves_input_dtype() -> None:
+    """The custom upsample wrapper should not silently widen activations."""
+
+    layer = Upsample(scale_factor=(2.0, 2.0), mode="nearest-exact")
+
+    for dtype in (torch.float16, torch.bfloat16, torch.float32):
+        images = torch.randn(2, 4, 8, 8, dtype=dtype)
+
+        upsampled = layer(images)
+
+        assert upsampled.dtype == dtype
 
 
 def test_latent_normalization_stats_round_trip_for_image_and_video_latents() -> None:

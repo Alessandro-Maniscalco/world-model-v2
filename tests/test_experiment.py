@@ -21,12 +21,14 @@ from world_model_v2.experiment import (
     motion_ratio_log_error,
     open_rollout_consistency_score,
     reconstruction_loss_terms,
+    resolved_training_autocast_dtype,
     restore_rng_state,
     save_training_checkpoint,
     validation_metric_value_from_stats,
 )
 from world_model_v2.dynamics_transformer import DynamicsTrainingInputs
 from world_model_v2.model import WorldModel
+from world_model_v2.wan_vae import WanVAEConfig
 from world_model_v2.utils.checkpointing import append_jsonl
 
 
@@ -173,6 +175,227 @@ def test_experiment_supports_custom_dynamics_layout_controls(
     assert experiment.model.dynamics.cfg.open_rollout_context_frames == 1
     assert experiment.model.dynamics.cfg.open_rollout_stride_frames == 1
     assert len(experiment.train_dataset) == 1
+
+
+def test_experiment_supports_custom_wan_autoencoder_shape(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """AE-only experiments should honor the requested Wan autoencoder shape knobs."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="custom_wan_shape",
+            wan_dim=96,
+            latent_channels=64,
+            wan_num_res_blocks=1,
+            **DEBUG_FRAME_KWARGS,
+            device="cpu",
+        )
+    )
+
+    assert experiment.model.wan_cfg == WanVAEConfig(dim=96, z_dim=64, num_res_blocks=1)
+
+
+def test_experiment_uses_requested_optimizer_beta1(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """AE-only experiments should apply the requested AdamW beta1 momentum."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="custom_optimizer_beta1",
+            optimizer_beta1=0.9,
+            **DEBUG_FRAME_KWARGS,
+            device="cpu",
+        )
+    )
+
+    assert experiment.optimizer.param_groups[0]["betas"] == (0.9, 0.999)
+
+
+def test_experiment_uses_requested_dataloader_training_options(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Training dataloaders should preserve the requested worker and pinning knobs."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="custom_dataloader",
+            dataloader_num_workers=2,
+            dataloader_prefetch_factor=3,
+            dataloader_pin_memory=True,
+            **DEBUG_FRAME_KWARGS,
+            device="cpu",
+        )
+    )
+
+    assert experiment.train_loader.num_workers == 2
+    assert experiment.train_loader.prefetch_factor == 3
+    assert experiment.train_loader.persistent_workers is True
+    assert experiment.train_loader.pin_memory is True
+
+
+def test_experiment_resolve_train_loader_num_workers_uses_explicit_override(
+    tmp_path: Path,
+) -> None:
+    """An explicit worker count should bypass auto benchmarking and caching."""
+
+    class DummyDataset:
+        """Expose the minimal length interface for worker-resolution tests."""
+
+        def __len__(self) -> int:
+            """Return a non-empty synthetic dataset size."""
+
+            return 10
+
+    experiment = object.__new__(Experiment)
+    experiment.cfg = ExperimentConfig(
+        dataloader_num_workers=3,
+        output_dir=str(tmp_path / "outputs"),
+    )
+    experiment.device = torch.device("cpu")
+    experiment._train_loader_worker_resolution_source = "explicit"
+
+    resolved = experiment._resolve_train_loader_num_workers(DummyDataset())
+
+    assert resolved == 3
+    assert experiment._train_loader_worker_resolution_source == "explicit"
+
+
+def test_experiment_resolve_train_loader_num_workers_defaults_to_zero_on_cpu(
+    tmp_path: Path,
+) -> None:
+    """CPU runs should keep the training loader single-process unless explicitly overridden."""
+
+    class DummyDataset:
+        """Expose the minimal length interface for worker-resolution tests."""
+
+        def __len__(self) -> int:
+            """Return a non-empty synthetic dataset size."""
+
+            return 10
+
+    experiment = object.__new__(Experiment)
+    experiment.cfg = ExperimentConfig(
+        dataloader_num_workers=None,
+        output_dir=str(tmp_path / "outputs"),
+        device="cpu",
+    )
+    experiment.device = torch.device("cpu")
+    experiment._train_loader_worker_resolution_source = "explicit"
+
+    resolved = experiment._resolve_train_loader_num_workers(DummyDataset())
+
+    assert resolved == 0
+    assert experiment._train_loader_worker_resolution_source == "cpu_default"
+
+
+def test_experiment_resolve_train_loader_num_workers_benchmarks_then_reuses_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Auto worker resolution should benchmark once and then reuse the shared cache."""
+
+    class DummyDataset:
+        """Expose the minimal length interface for worker autotune tests."""
+
+        def __len__(self) -> int:
+            """Return a non-empty synthetic dataset size."""
+
+            return 10
+
+    benchmarked: list[int] = []
+
+    def fake_benchmark(
+        dataset: DummyDataset,
+        candidates: tuple[int, ...],
+    ) -> int:
+        """Record the candidate set and return a synthetic best worker count."""
+
+        del dataset
+        benchmarked.extend(candidates)
+        return 2
+
+    first = object.__new__(Experiment)
+    first.cfg = ExperimentConfig(
+        dataloader_num_workers=None,
+        batch_size=2,
+        output_dir=str(tmp_path / "outputs"),
+        device="cuda",
+    )
+    first.device = torch.device("cuda")
+    first._train_loader_worker_resolution_source = "explicit"
+    first._benchmark_auto_train_loader_num_workers = fake_benchmark  # type: ignore[method-assign]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    first_resolved = first._resolve_train_loader_num_workers(DummyDataset())
+
+    second = object.__new__(Experiment)
+    second.cfg = ExperimentConfig(
+        dataloader_num_workers=None,
+        batch_size=2,
+        output_dir=str(tmp_path / "outputs"),
+        device="cuda",
+    )
+    second.device = torch.device("cuda")
+    second._train_loader_worker_resolution_source = "explicit"
+
+    def fail_benchmark(
+        dataset: DummyDataset,
+        candidates: tuple[int, ...],
+    ) -> int:
+        """The second resolution should never rebalance after the cache is populated."""
+
+        del dataset, candidates
+        raise AssertionError("Cached worker resolution should skip benchmarking.")
+
+    second._benchmark_auto_train_loader_num_workers = fail_benchmark  # type: ignore[method-assign]
+
+    second_resolved = second._resolve_train_loader_num_workers(DummyDataset())
+
+    assert first_resolved == 2
+    assert second_resolved == 2
+    assert benchmarked == [0, 2, 4]
+    assert first._train_loader_worker_resolution_source == "benchmark"
+    assert second._train_loader_worker_resolution_source == "cache"
+
+
+def test_resolved_training_autocast_dtype_disables_amp_on_cpu() -> None:
+    """CPU training should stay in full precision."""
+
+    assert resolved_training_autocast_dtype(torch.device("cpu")) is None
+
+
+def test_resolved_training_autocast_dtype_prefers_bfloat16_on_supported_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CUDA training should prefer bf16 when the device supports it."""
+
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+
+    assert resolved_training_autocast_dtype(torch.device("cuda")) == torch.bfloat16
+
+
+def test_resolved_training_autocast_dtype_falls_back_to_float16_on_older_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CUDA training should fall back to fp16 when bf16 is unavailable."""
+
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+
+    assert resolved_training_autocast_dtype(torch.device("cuda")) == torch.float16
 
 
 def test_open_rollout_consistency_score_penalizes_motion_ratio_mismatch() -> None:
@@ -1697,10 +1920,10 @@ def test_experiment_auto_batch_size_uses_requested_ceiling_on_cpu(
             device="cpu",
         )
     )
-    assert ae_experiment.cfg.batch_size == 32
-    assert ae_experiment.train_loader.batch_size == 32
-    assert dyn_experiment.cfg.batch_size == 32
-    assert dyn_experiment.train_loader.batch_size == 32
+    assert ae_experiment.cfg.batch_size == 64
+    assert ae_experiment.train_loader.batch_size == 64
+    assert dyn_experiment.cfg.batch_size == 64
+    assert dyn_experiment.train_loader.batch_size == 64
 
 
 def test_checkpoint_round_trip(tmp_path: Path, fake_long_dataset_root: Path) -> None:
@@ -2363,6 +2586,32 @@ def test_experiment_can_stop_early_on_dynamics_validation_plateau(
     stopped_records = [record for record in records if "stopped" in record]
     assert stopped_records
     assert stopped_records[-1]["step"] == 2
+
+
+def test_experiment_validation_start_step_delays_scheduled_validation(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Scheduled validation should not run before the configured start step."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="delayed_validation",
+            **DEBUG_FRAME_KWARGS,
+            validation_interval=250,
+            validation_start_step=30000,
+            device="cpu",
+        )
+    )
+
+    assert not experiment._should_run_validation(250)
+    assert not experiment._should_run_validation(29999)
+    assert experiment._should_run_validation(30000)
+    assert experiment._should_run_validation(30250)
+    assert not experiment._should_run_validation(30100)
 
 
 def test_experiment_restores_plateau_state_from_resume_metrics(

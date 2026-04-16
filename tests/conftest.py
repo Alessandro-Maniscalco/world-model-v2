@@ -17,6 +17,12 @@ import torch
 
 from world_model_v2.experiment import ExperimentConfig, save_training_checkpoint
 from world_model_v2.model import WorldModel
+from world_model_v2.wan_vae import (
+    DEFAULT_WAN_DIM,
+    DEFAULT_WAN_NUM_RES_BLOCKS,
+    DEFAULT_WAN_Z_DIM,
+    WanVAEConfig,
+)
 
 
 def write_episode(path: Path, frames: int = 6, height: int = 32, width: int = 32) -> None:
@@ -513,7 +519,15 @@ def saved_world_model_ae_checkpoint(fake_long_dataset_root: Path, tmp_path: Path
     """Create a deterministic Wan-AE checkpoint for loading tests."""
 
     checkpoint_path = tmp_path / "world_model_wan_ae.pt"
-    model = WorldModel(ae_backend="wan")
+    model = WorldModel(
+        ae_backend="wan",
+        latent_channels=DEFAULT_WAN_Z_DIM,
+        wan_config=WanVAEConfig(
+            dim=DEFAULT_WAN_DIM,
+            z_dim=DEFAULT_WAN_Z_DIM,
+            num_res_blocks=DEFAULT_WAN_NUM_RES_BLOCKS,
+        ),
+    )
     for parameter in model.encoder.parameters():
         torch.nn.init.constant_(parameter, 0.25)
     for parameter in model.decoder.parameters():

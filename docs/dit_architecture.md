@@ -23,6 +23,21 @@ The small DreamDojo-style backbone used for current dynamics work is:
 
 Important: the repo-level default frame layout helper still has `4 -> 1`, but the aligned controller recipe is `1 context latent -> 3 future latents`. The parameter counts below are for the DreamDojo-style small backbone and do not change between `4 -> 1` and `1 -> 3`, because the model does not keep trainable per-frame parameters.
 
+## Wan Cache Note
+
+The cache people usually ask about is not inside the DiT. It lives in the Wan VAE used before and after the DiT in `world_model_v2/wan_vae.py`.
+
+- During encoding, `WanPosteriorEncoder` processes a clip chunk by chunk, e.g. `[x0] [x1..x4] [x5..x8] [x9..x12]`.
+- Each causal conv and temporal resample layer stores a small hidden-state cache from the previous chunk.
+- The next chunk reuses that cached hidden state, so `z3` depends on earlier frames through cached encoder features, not by directly reading earlier latents.
+
+- During decoding, `WanVideoDecoder` processes latent chunks as `[z0] [z1] [z2] [z3]`.
+- The decoder keeps the same kind of hidden-state cache across latent chunks.
+- That is why the first latent decodes to `1` frame, while later latents can decode to `4` frames once the decoder cache is warm.
+- So decoded frames from `z3` depend on `z0`, `z1`, and `z2` through cached decoder features.
+
+This matters for the DiT boundary: the DiT predicts future latents, but the repo decodes them together with the context latents so the Wan decoder cache is initialized correctly before cropping away the context frames.
+
 ## What The Dynamics Model Does In This Repo
 
 At a high level, the model learns a rectified-flow velocity field over short latent video chunks:

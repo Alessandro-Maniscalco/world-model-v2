@@ -10,6 +10,11 @@ import torch
 
 from world_model_v2.dynamics_transformer import DYNAMICS_FRAME_LAYOUT
 from world_model_v2.experiment import Experiment, ExperimentConfig
+from world_model_v2.wan_vae import (
+    DEFAULT_WAN_DIM,
+    DEFAULT_WAN_NUM_RES_BLOCKS,
+    DEFAULT_WAN_Z_DIM,
+)
 
 
 def parse_int_csv(value: str | None) -> tuple[int, ...] | None:
@@ -75,7 +80,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resolution", type=int, default=128)
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
-    parser.add_argument("--latent-channels", type=int, default=32)
+    parser.add_argument("--wan-dim", type=int, default=DEFAULT_WAN_DIM)
+    parser.add_argument("--latent-channels", type=int, default=DEFAULT_WAN_Z_DIM)
+    parser.add_argument("--wan-num-res-blocks", type=int, default=DEFAULT_WAN_NUM_RES_BLOCKS)
     parser.add_argument("--hidden-channels", type=int, default=64)
     parser.add_argument("--dynamics-infer-steps", type=int, default=35)
     parser.add_argument("--dynamics-train-timesteps", type=int, default=1000)
@@ -153,11 +160,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--recon-motion-weight", type=float, default=0.0)
     parser.add_argument("--recon-motion-threshold", type=float, default=0.02)
     parser.add_argument("--recon-motion-dilation-kernel-size", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--dataloader-num-workers", type=int, default=None)
+    parser.add_argument("--dataloader-prefetch-factor", type=int, default=2)
+    parser.add_argument(
+        "--dataloader-pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--auto-batch-size", action="store_true")
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--optimizer-beta1", type=float, default=0.95)
     parser.add_argument("--max-steps", type=int, default=3000)
     parser.add_argument("--validation-interval", type=int, default=250)
+    parser.add_argument("--validation-start-step", type=int, default=0)
     parser.add_argument("--checkpoint-interval", type=int, default=250)
     parser.add_argument("--early-stop-window-size", type=int, default=1)
     parser.add_argument("--early-stop-patience-windows", type=int, default=5)
@@ -202,7 +218,9 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         resolution=args.resolution,
         height=args.height,
         width=args.width,
+        wan_dim=args.wan_dim,
         latent_channels=args.latent_channels,
+        wan_num_res_blocks=args.wan_num_res_blocks,
         hidden_channels=args.hidden_channels,
         ae_backend="wan",
         dynamics_infer_steps=args.dynamics_infer_steps,
@@ -252,10 +270,15 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         recon_motion_threshold=args.recon_motion_threshold,
         recon_motion_dilation_kernel_size=args.recon_motion_dilation_kernel_size,
         batch_size=args.batch_size,
+        dataloader_num_workers=args.dataloader_num_workers,
+        dataloader_prefetch_factor=args.dataloader_prefetch_factor,
+        dataloader_pin_memory=args.dataloader_pin_memory,
         auto_batch_size=args.auto_batch_size,
         lr=args.lr,
+        optimizer_beta1=args.optimizer_beta1,
         max_steps=args.max_steps,
         validation_interval=args.validation_interval,
+        validation_start_step=args.validation_start_step,
         checkpoint_interval=args.checkpoint_interval,
         early_stop_window_size=args.early_stop_window_size,
         early_stop_patience_windows=args.early_stop_patience_windows,

@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from types import MethodType
 
+import h5py
+import numpy as np
 import pytest
 import torch
 
@@ -176,6 +178,51 @@ def test_wan_experiment_run_writes_artifacts_for_each_mode(
             saved_stats["next_frame_mse_1to3"]
         )
         assert stats["dynamics_backend"] == "rf_dit"
+
+
+def test_ae_best_checkpoint_uses_validation_clip_normalization_stats(
+    fake_multi_episode_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """AE best checkpoints should reuse the configured validation clips for normalization stats."""
+
+    episode_one_path = fake_multi_episode_dataset_root / "single_grasp" / "train" / "episode_1.hdf5"
+    with h5py.File(episode_one_path, "r+") as handle:
+        image_stack = handle["obs"]["images"]["camera_1_color"][:]
+        image_stack[:, :, :, 0] = ((image_stack[:, :, :, 0].astype(np.uint16) + 60) % 256).astype(np.uint8)
+        handle["obs"]["images"]["camera_1_color"][...] = image_stack
+
+    config = ExperimentConfig(
+        mode="ae_only",
+        data_root=str(fake_multi_episode_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="ae_validation_stats_scope",
+        split="train",
+        train_all_episodes=True,
+        validation_split="train",
+        validation_episode=0,
+        frame_start=100,
+        frame_end=112,
+        batch_size=1,
+        max_steps=1,
+        validation_interval=1,
+        checkpoint_interval=1,
+        device="cpu",
+    )
+    experiment = Experiment(config)
+    experiment.run()
+
+    run_dir = tmp_path / "outputs" / "ae_validation_stats_scope"
+    checkpoint = load_training_checkpoint(run_dir / "checkpoints" / "best.pt", device="cpu")
+    validation_stats = experiment._compute_latent_normalization_stats_from_clips(
+        [batch["frames"][0] for batch in experiment.val_loader]
+    )
+    train_stats = experiment._compute_latent_normalization_stats_from_clips(
+        [sample["frames"] for sample in experiment.train_dataset]
+    )
+
+    assert checkpoint["autoencoder"]["normalization_stats"] == validation_stats.to_dict()
+    assert checkpoint["autoencoder"]["normalization_stats"] != train_stats.to_dict()
 
 
 def test_dynamics_run_can_opt_into_open_rollout_validation_stats(
@@ -625,6 +672,71 @@ def test_resume_best_metric_ignores_future_source_validation_records(
     )
     assert int(resumed_best_checkpoint["step"]) == 1
     assert float(resumed_best_checkpoint["best_metric"]) == pytest.approx(expected_consistency)
+
+
+def test_resume_prefers_checkpoint_best_metric_when_metrics_lag_checkpoint_step(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Resumes should preserve a newer checkpoint best metric when metrics.jsonl is behind."""
+
+    initial_config = ExperimentConfig(
+        mode="ae_only",
+        data_root=str(fake_long_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="resume_ae_lag_source",
+        **DEBUG_FRAME_KWARGS,
+        max_steps=1,
+        validation_interval=1,
+        checkpoint_interval=1,
+        device="cpu",
+    )
+    initial_experiment = Experiment(initial_config)
+    initial_experiment.run()
+    source_run_dir = tmp_path / "outputs" / "resume_ae_lag_source"
+    checkpoint = load_training_checkpoint(source_run_dir / "checkpoints" / "best.pt", device="cpu")
+    saved_stats = json.loads(
+        (source_run_dir / "samples" / "step_000001" / "episode_0_stats.json").read_text(encoding="utf-8")
+    )
+
+    metrics_path = source_run_dir / "metrics.jsonl"
+    patched_records = []
+    for line in metrics_path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        if "validation" in record:
+            continue
+        patched_records.append(record)
+    synthetic_validation = dict(saved_stats)
+    synthetic_validation["ae_loss"] = float(saved_stats["ae_loss"]) * 2.0
+    synthetic_validation["checkpoint"] = str(source_run_dir / "checkpoints" / "last.pt")
+    synthetic_validation["best_checkpoint"] = str(source_run_dir / "checkpoints" / "best.pt")
+    synthetic_validation["is_best_checkpoint"] = False
+    patched_records.append({"step": 0, "validation": synthetic_validation})
+    metrics_path.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in patched_records),
+        encoding="utf-8",
+    )
+
+    resumed_run_dir = tmp_path / "outputs" / "resume_ae_lag_target"
+    resumed_experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="resume_ae_lag_target",
+            **DEBUG_FRAME_KWARGS,
+            device="cpu",
+            resume=str(source_run_dir / "checkpoints" / "best.pt"),
+        )
+    )
+
+    assert resumed_experiment.best_metric == pytest.approx(float(checkpoint["best_metric"]))
+    resumed_best_checkpoint = load_training_checkpoint(
+        resumed_run_dir / "checkpoints" / "best.pt",
+        device="cpu",
+    )
+    assert int(resumed_best_checkpoint["step"]) == 1
+    assert float(resumed_best_checkpoint["best_metric"]) == pytest.approx(float(checkpoint["best_metric"]))
 
 
 def test_resume_resets_best_metric_when_validation_episodes_change(

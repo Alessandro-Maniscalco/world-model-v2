@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 import gc
 import json
 import math
+import os
 from numbers import Integral, Real
+import platform
 import random
 import re
 import time
@@ -65,7 +68,12 @@ from world_model_v2.metaworld_dataset import (
 from world_model_v2.model import LatentNormalizationStats, WorldModel
 from world_model_v2.utils.checkpointing import append_jsonl, save_json
 from world_model_v2.utils.visualization import build_side_by_side_grid, write_side_by_side_mp4
-from world_model_v2.wan_vae import WanVAEConfig
+from world_model_v2.wan_vae import (
+    DEFAULT_WAN_DIM,
+    DEFAULT_WAN_NUM_RES_BLOCKS,
+    DEFAULT_WAN_Z_DIM,
+    WanVAEConfig,
+)
 
 
 WORLD_MODEL_CHECKPOINT_KIND = "world_model_v2_v1"
@@ -77,6 +85,9 @@ LEGACY_WORLD_MODEL_CHECKPOINT_KINDS = frozenset(
 )
 AUTO_BATCH_SIZE_BACKOFF_DIVISOR = 2
 AUTO_BATCH_SIZE_GROWTH_FACTOR = 2
+AUTO_TRAIN_DATALOADER_BENCHMARK_BATCHES = 4
+AUTO_TRAIN_DATALOADER_CANDIDATES = (0, 2, 4)
+DATALOADER_AUTOTUNE_CACHE_FILENAME = ".dataloader_autotune_cache.json"
 _TEACHER_FORCED_NEXT_FRAME_MSE_PATTERN = re.compile(r"^next_frame_mse(?:_\d+to\d+)?$")
 _OPEN_ROLLOUT_VALIDATION_METRICS = frozenset(
     {
@@ -90,6 +101,14 @@ def validation_metric_requires_open_rollout(metric_name: str) -> bool:
     """Return whether one validation metric depends on open-rollout stats."""
 
     return metric_name in _OPEN_ROLLOUT_VALIDATION_METRICS
+
+
+def resolved_training_autocast_dtype(device: torch.device) -> torch.dtype | None:
+    """Return the preferred mixed-precision dtype for training on one device."""
+
+    if device.type != "cuda":
+        return None
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
 @dataclass
@@ -120,7 +139,9 @@ class ExperimentConfig:
     resolution: int = 128
     height: int | None = None
     width: int | None = None
-    latent_channels: int = 32
+    wan_dim: int = DEFAULT_WAN_DIM
+    latent_channels: int = DEFAULT_WAN_Z_DIM
+    wan_num_res_blocks: int = DEFAULT_WAN_NUM_RES_BLOCKS
     hidden_channels: int = 64
     ae_backend: str = "wan"
     dynamics_infer_steps: int = 16
@@ -163,11 +184,16 @@ class ExperimentConfig:
     recon_motion_weight: float = 0.0
     recon_motion_threshold: float = 0.02
     recon_motion_dilation_kernel_size: int = 5
-    batch_size: int = 32
+    batch_size: int = 64
+    dataloader_num_workers: int | None = None
+    dataloader_prefetch_factor: int = 2
+    dataloader_pin_memory: bool | None = None
     auto_batch_size: bool = False
     lr: float = 1e-4
+    optimizer_beta1: float = 0.95
     max_steps: int = 3000
     validation_interval: int = 250
+    validation_start_step: int = 0
     checkpoint_interval: int = 250
     early_stop_window_size: int = 1
     early_stop_patience_windows: int = 5
@@ -622,9 +648,19 @@ class Experiment:
                 resolved_batch_size=self.cfg.batch_size,
                 max_dataset_batch=max(len(self.train_dataset), 1),
             )
+        self._train_loader_worker_resolution_source = "explicit"
+        self._resolved_train_loader_num_workers = self._resolve_train_loader_num_workers(
+            self.train_dataset
+        )
         self.train_loader = self._build_train_loader(self.train_dataset)
         self.val_loader = self._build_val_loader()
         self.optimizer = self._build_optimizer()
+        self.training_autocast_dtype = resolved_training_autocast_dtype(self.device)
+        self.grad_scaler = (
+            torch.amp.GradScaler("cuda", enabled=True)
+            if self.training_autocast_dtype == torch.float16
+            else None
+        )
         self.scheduler = None
         self.best_metric: float | None = None
         self.early_stop_window_losses: deque[float] = deque(
@@ -666,7 +702,11 @@ class Experiment:
     def _requested_wan_config(self) -> WanVAEConfig:
         """Return the fixed local Wan2.1-style tokenizer config requested by the run."""
 
-        return WanVAEConfig(z_dim=self.cfg.latent_channels)
+        return WanVAEConfig(
+            dim=self.cfg.wan_dim,
+            z_dim=self.cfg.latent_channels,
+            num_res_blocks=self.cfg.wan_num_res_blocks,
+        )
 
     def _extract_checkpoint_autoencoder_metadata(
         self,
@@ -884,6 +924,14 @@ class Experiment:
             raise ValueError("--load-encoder-decoder is required for mode dynamics_only.")
         if self._early_stop_enabled() and self.cfg.validation_interval <= 0:
             raise ValueError("Validation-based early stopping requires validation_interval > 0.")
+        if self.cfg.validation_start_step < 0:
+            raise ValueError("validation_start_step must be non-negative.")
+        if not 0.0 <= self.cfg.optimizer_beta1 < 1.0:
+            raise ValueError("optimizer_beta1 must be in [0, 1).")
+        if self.cfg.dataloader_num_workers is not None and self.cfg.dataloader_num_workers < 0:
+            raise ValueError("dataloader_num_workers must be non-negative.")
+        if self.cfg.dataloader_prefetch_factor < 1:
+            raise ValueError("dataloader_prefetch_factor must be greater than or equal to one.")
         if self.cfg.dataset_format == "lerobot_metaworld":
             if self.cfg.split not in {"train", "val"}:
                 raise ValueError("MetaWorld MT50 only supports train/val aliases for split.")
@@ -1100,6 +1148,19 @@ class Experiment:
     def _build_train_loader(self, dataset: Dataset[dict[str, Any]]) -> DataLoader[Any]:
         """Build the training dataloader for the resolved batch size."""
 
+        return self._build_train_loader_for_num_workers(
+            dataset,
+            num_workers=self._resolved_train_loader_num_workers,
+        )
+
+    def _build_train_loader_for_num_workers(
+        self,
+        dataset: Dataset[dict[str, Any]],
+        *,
+        num_workers: int,
+    ) -> DataLoader[Any]:
+        """Build one training dataloader for a specific worker-count setting."""
+
         sampler_factory = getattr(dataset, "training_sampler", None)
         if callable(sampler_factory):
             sampler = sampler_factory()
@@ -1109,9 +1170,14 @@ class Experiment:
                     batch_size=self.cfg.batch_size,
                     sampler=sampler,
                     shuffle=False,
-                    num_workers=0,
+                    **self._train_loader_options(num_workers=num_workers),
                 )
-        return DataLoader(dataset, batch_size=self.cfg.batch_size, shuffle=True, num_workers=0)
+        return DataLoader(
+            dataset,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,
+            **self._train_loader_options(num_workers=num_workers),
+        )
 
     def _build_validation_dataset_for_episode(self, episode: int) -> Dataset[dict[str, Any]]:
         """Build one full-clip validation dataset for the requested episode."""
@@ -1195,7 +1261,278 @@ class Experiment:
             dataset = validation_datasets[0]
         else:
             dataset = ConcatDataset(validation_datasets)
-        return DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+        return DataLoader(dataset, batch_size=1, shuffle=False, **self._eval_loader_options())
+
+    def _pin_memory_enabled(self) -> bool:
+        """Return whether dataloaders should stage tensors in pinned host memory."""
+
+        if self.cfg.dataloader_pin_memory is not None:
+            return bool(self.cfg.dataloader_pin_memory)
+        return self.device.type == "cuda"
+
+    def _train_loader_options(self, *, num_workers: int | None = None) -> dict[str, Any]:
+        """Return the training `DataLoader` options derived from the config."""
+
+        resolved_num_workers = (
+            int(self._resolved_train_loader_num_workers)
+            if num_workers is None
+            else int(num_workers)
+        )
+        options: dict[str, Any] = {
+            "num_workers": resolved_num_workers,
+            "pin_memory": self._pin_memory_enabled(),
+        }
+        if options["num_workers"] > 0:
+            options["persistent_workers"] = True
+            options["prefetch_factor"] = int(self.cfg.dataloader_prefetch_factor)
+        return options
+
+    def _eval_loader_options(self) -> dict[str, Any]:
+        """Return the lightweight evaluation `DataLoader` options."""
+
+        return {
+            "num_workers": 0,
+            "pin_memory": self._pin_memory_enabled(),
+        }
+
+    def _resolve_train_loader_num_workers(self, dataset: Dataset[dict[str, Any]]) -> int:
+        """Return the explicit or auto-tuned worker count for the training loader."""
+
+        if self.cfg.dataloader_num_workers is not None:
+            resolved = int(self.cfg.dataloader_num_workers)
+            self._train_loader_worker_resolution_source = "explicit"
+            self._log_train_loader_num_workers_resolution(
+                resolved_num_workers=resolved,
+                source=self._train_loader_worker_resolution_source,
+                candidates=(resolved,),
+            )
+            return resolved
+        if self.device.type != "cuda":
+            resolved = 0
+            self._train_loader_worker_resolution_source = "cpu_default"
+            self._log_train_loader_num_workers_resolution(
+                resolved_num_workers=resolved,
+                source=self._train_loader_worker_resolution_source,
+                candidates=(resolved,),
+            )
+            return resolved
+        candidates = self._auto_train_loader_worker_candidates()
+        if len(candidates) == 1:
+            resolved = candidates[0]
+            self._train_loader_worker_resolution_source = "single_candidate"
+            self._log_train_loader_num_workers_resolution(
+                resolved_num_workers=resolved,
+                source=self._train_loader_worker_resolution_source,
+                candidates=candidates,
+            )
+            return resolved
+        cache_key = self._dataloader_autotune_cache_key()
+        cached_num_workers = self._load_cached_train_loader_num_workers(cache_key)
+        if cached_num_workers in candidates:
+            resolved = int(cached_num_workers)
+            self._train_loader_worker_resolution_source = "cache"
+            self._log_train_loader_num_workers_resolution(
+                resolved_num_workers=resolved,
+                source=self._train_loader_worker_resolution_source,
+                candidates=candidates,
+            )
+            return resolved
+        resolved = self._benchmark_auto_train_loader_num_workers(dataset, candidates)
+        self._save_cached_train_loader_num_workers(cache_key, resolved)
+        self._train_loader_worker_resolution_source = "benchmark"
+        self._log_train_loader_num_workers_resolution(
+            resolved_num_workers=resolved,
+            source=self._train_loader_worker_resolution_source,
+            candidates=candidates,
+        )
+        return resolved
+
+    def _auto_train_loader_worker_candidates(self) -> tuple[int, ...]:
+        """Return the capped candidate worker counts considered during autotuning."""
+
+        cpu_count = max(int(os.cpu_count() or 1), 1)
+        candidates = sorted(
+            candidate
+            for candidate in AUTO_TRAIN_DATALOADER_CANDIDATES
+            if candidate <= cpu_count and candidate >= 0
+        )
+        if 0 not in candidates:
+            candidates.insert(0, 0)
+        return tuple(candidates)
+
+    def _benchmark_auto_train_loader_num_workers(
+        self,
+        dataset: Dataset[dict[str, Any]],
+        candidates: tuple[int, ...],
+    ) -> int:
+        """Benchmark a small worker-count set and return the fastest steady-state choice."""
+
+        timings: dict[int, float] = {}
+        failures: dict[int, str] = {}
+        for num_workers in candidates:
+            try:
+                timings[num_workers] = self._benchmark_train_loader_num_workers(
+                    dataset,
+                    num_workers=num_workers,
+                )
+            except Exception as error:
+                if num_workers == 0:
+                    raise
+                failures[num_workers] = f"{type(error).__name__}: {error}"
+        if not timings:
+            raise RuntimeError("Automatic dataloader worker tuning did not produce any usable result.")
+        resolved = min(
+            timings.items(),
+            key=lambda item: (float(item[1]), int(item[0])),
+        )[0]
+        print(
+            json.dumps(
+                {
+                    "benchmark_seconds": {str(key): value for key, value in timings.items()},
+                    "candidates": list(candidates),
+                    "event": "auto_dataloader_workers_benchmarked",
+                    "failed_candidates": failures,
+                    "resolved_num_workers": resolved,
+                },
+                sort_keys=True,
+            )
+        )
+        return int(resolved)
+
+    def _benchmark_train_loader_num_workers(
+        self,
+        dataset: Dataset[dict[str, Any]],
+        *,
+        num_workers: int,
+    ) -> float:
+        """Measure one worker setting using a few steady-state batch fetch timings."""
+
+        loader = self._build_train_loader_for_num_workers(dataset, num_workers=num_workers)
+        iterator = iter(loader)
+        all_timings: list[float] = []
+        measured_timings: list[float] = []
+        try:
+            for batch_index in range(AUTO_TRAIN_DATALOADER_BENCHMARK_BATCHES):
+                started_at = time.perf_counter()
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    break
+                elapsed = time.perf_counter() - started_at
+                all_timings.append(elapsed)
+                if batch_index > 0:
+                    measured_timings.append(elapsed)
+                del batch
+        finally:
+            self._shutdown_dataloader_iterator(iterator)
+            del iterator
+            del loader
+            gc.collect()
+        active_timings = measured_timings or all_timings
+        if not active_timings:
+            raise RuntimeError("Cannot benchmark dataloader workers on an empty training iterator.")
+        return float(sum(active_timings) / len(active_timings))
+
+    def _shutdown_dataloader_iterator(self, iterator: Any) -> None:
+        """Shut down one transient dataloader iterator after an autotune benchmark."""
+
+        shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown_workers):
+            shutdown_workers()
+
+    def _dataloader_autotune_cache_path(self) -> Path:
+        """Return the shared JSON cache path for worker autotune decisions."""
+
+        return Path(self.cfg.output_dir) / DATALOADER_AUTOTUNE_CACHE_FILENAME
+
+    def _dataloader_autotune_cache_key(self) -> str:
+        """Return one stable cache key for the current dataset and machine signature."""
+
+        device_name: str | None = None
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            device_index = self.device.index if self.device.index is not None else torch.cuda.current_device()
+            device_name = torch.cuda.get_device_name(device_index)
+        signature = {
+            "batch_size": int(self.cfg.batch_size),
+            "clip_metadata": self.cfg.clip_metadata(),
+            "cpu_count": int(os.cpu_count() or 1),
+            "dataset_format": self.cfg.dataset_format,
+            "device_name": device_name,
+            "device_type": self.device.type,
+            "dynamics_context_frames": self.cfg.dynamics_context_frames,
+            "dynamics_target_frames": self.cfg.dynamics_target_frames,
+            "mode": self.cfg.mode,
+            "platform": platform.platform(),
+            "prefetch_factor": int(self.cfg.dataloader_prefetch_factor),
+            "resolved_split": self.cfg.resolved_split(),
+            "train_all_episodes": bool(self.cfg.train_all_episodes),
+        }
+        return json.dumps(signature, sort_keys=True)
+
+    def _load_cached_train_loader_num_workers(self, cache_key: str) -> int | None:
+        """Return a cached worker resolution when one exists for the current signature."""
+
+        cache_path = self._dataloader_autotune_cache_path()
+        if not cache_path.exists():
+            return None
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        entries = payload.get("entries")
+        if not isinstance(entries, dict):
+            return None
+        entry = entries.get(cache_key)
+        if not isinstance(entry, dict):
+            return None
+        cached_num_workers = entry.get("num_workers")
+        if not isinstance(cached_num_workers, Integral) or isinstance(cached_num_workers, bool):
+            return None
+        return int(cached_num_workers)
+
+    def _save_cached_train_loader_num_workers(self, cache_key: str, num_workers: int) -> None:
+        """Persist one successful worker-count resolution for future matching runs."""
+
+        cache_path = self._dataloader_autotune_cache_path()
+        payload: dict[str, Any] = {"entries": {}, "version": 1}
+        if cache_path.exists():
+            try:
+                existing_payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                existing_payload = None
+            if isinstance(existing_payload, dict):
+                payload["version"] = int(existing_payload.get("version", 1))
+                existing_entries = existing_payload.get("entries")
+                if isinstance(existing_entries, dict):
+                    payload["entries"] = dict(existing_entries)
+        payload["entries"][cache_key] = {
+            "num_workers": int(num_workers),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        save_json(cache_path, payload)
+
+    def _log_train_loader_num_workers_resolution(
+        self,
+        *,
+        resolved_num_workers: int,
+        source: str,
+        candidates: tuple[int, ...],
+    ) -> None:
+        """Emit one JSON event describing the active training-loader worker decision."""
+
+        print(
+            json.dumps(
+                {
+                    "candidates": list(candidates),
+                    "event": "train_loader_num_workers_resolved",
+                    "requested_num_workers": self.cfg.dataloader_num_workers,
+                    "resolved_num_workers": int(resolved_num_workers),
+                    "source": source,
+                },
+                sort_keys=True,
+            )
+        )
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         """Build the optimizer over trainable parameters."""
@@ -1206,7 +1543,7 @@ class Experiment:
         return torch.optim.AdamW(
             parameters,
             lr=self.cfg.lr,
-            betas=(0.9, 0.999),
+            betas=(self.cfg.optimizer_beta1, 0.999),
             weight_decay=0.01,
         )
 
@@ -1305,7 +1642,7 @@ class Experiment:
         probe_optimizer = torch.optim.AdamW(
             [parameter for parameter in self.model.parameters() if parameter.requires_grad],
             lr=self.cfg.lr,
-            betas=(0.9, 0.999),
+            betas=(self.cfg.optimizer_beta1, 0.999),
             weight_decay=0.0,
         )
         parameter_backup = {
@@ -1381,7 +1718,18 @@ class Experiment:
         """Run one optimizer step and return the detached metric tensors."""
 
         self.optimizer.zero_grad(set_to_none=True)
-        loss_dict = self._train_step(batch)
+        autocast_context = (
+            torch.autocast(device_type=self.device.type, dtype=self.training_autocast_dtype)
+            if self.training_autocast_dtype is not None
+            else nullcontext()
+        )
+        with autocast_context:
+            loss_dict = self._train_step(batch)
+        if self.grad_scaler is not None:
+            self.grad_scaler.scale(loss_dict["loss"]).backward()
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+            return loss_dict
         loss_dict["loss"].backward()
         self.optimizer.step()
         return loss_dict
@@ -1843,12 +2191,22 @@ class Experiment:
             restored_best_metric, restored_best_step = self._restore_best_metric_record_from_metrics(
                 up_to_step=checkpoint_step
             )
-            self.best_metric = (
-                checkpoint.get("best_metric")
-                if restored_best_metric is None
-                else restored_best_metric
-            )
-            if restored_best_metric is None or restored_best_step == checkpoint_step:
+            checkpoint_best_metric = checkpoint.get("best_metric")
+            active_best_metric = checkpoint_best_metric if restored_best_metric is None else restored_best_metric
+            active_best_step = checkpoint_step if restored_best_metric is None else restored_best_step
+            # Interrupted validations can leave a newer checkpoint on disk before the matching
+            # validation summary lands in metrics.jsonl. Preserve that newer checkpoint-best value
+            # when it clearly beats the replayed history.
+            if (
+                restored_best_metric is not None
+                and checkpoint_best_metric is not None
+                and (restored_best_step is None or checkpoint_step > restored_best_step)
+                and float(checkpoint_best_metric) < float(restored_best_metric)
+            ):
+                active_best_metric = float(checkpoint_best_metric)
+                active_best_step = checkpoint_step
+            self.best_metric = active_best_metric
+            if active_best_step == checkpoint_step:
                 self._materialize_resumed_best_checkpoint(step=checkpoint_step)
         else:
             self.best_metric = None
@@ -1859,6 +2217,8 @@ class Experiment:
 
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = float(self.cfg.lr)
+            beta2 = float(param_group.get("betas", (self.cfg.optimizer_beta1, 0.999))[1])
+            param_group["betas"] = (float(self.cfg.optimizer_beta1), beta2)
             if "initial_lr" in param_group:
                 param_group["initial_lr"] = float(self.cfg.lr)
 
@@ -2008,9 +2368,14 @@ class Experiment:
     def _move_batch_to_device(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Move tensor leaves in one batch to the configured device."""
 
+        non_blocking = self.device.type == "cuda" and self._pin_memory_enabled()
         moved: dict[str, Any] = {}
         for key, value in batch.items():
-            moved[key] = value.to(self.device) if isinstance(value, torch.Tensor) else value
+            moved[key] = (
+                value.to(self.device, non_blocking=non_blocking)
+                if isinstance(value, torch.Tensor)
+                else value
+            )
         return moved
 
     def _validation_metric_name(self) -> str:
@@ -2844,26 +3209,26 @@ class Experiment:
         return aggregated
 
     @torch.no_grad()
-    def _compute_latent_normalization_stats(self) -> LatentNormalizationStats:
-        """Compute DreamDojo-style latent normalization stats from the AE training clips."""
+    def _compute_latent_normalization_stats_from_clips(
+        self,
+        clips: list[torch.Tensor],
+    ) -> LatentNormalizationStats:
+        """Compute DreamDojo-style latent normalization stats from full validation clips."""
 
-        if len(self.train_dataset) < 1:
-            raise ValueError("Cannot compute latent normalization stats from an empty dataset.")
-        stats_loader = DataLoader(
-            self.train_dataset,
-            batch_size=max(int(self.cfg.batch_size), 1),
-            shuffle=False,
-            num_workers=0,
-        )
+        if not clips:
+            raise ValueError("Cannot compute latent normalization stats from an empty clip collection.")
         img_sum = torch.zeros(self.model.latent_channels, device=self.device)
         img_sum_sq = torch.zeros_like(img_sum)
         video_sum = torch.zeros_like(img_sum)
         video_sum_sq = torch.zeros_like(img_sum)
         img_count = 0
         video_count = 0
-        for raw_batch in stats_loader:
-            batch = self._move_batch_to_device(raw_batch)
-            frames = batch["frames"]
+        for clip_frames in clips:
+            if clip_frames.ndim != 4:
+                raise ValueError(
+                    "Expected each latent-normalization clip to have shape [frames, channels, height, width]."
+                )
+            frames = clip_frames.unsqueeze(0).to(self.device)
             image_mu, _ = self.model.encode_posterior(frames[:, 0])
             video = rearrange(frames, "b t c h w -> b c t h w")
             raw_video_mu, _ = self.model.encoder(video)
@@ -2897,12 +3262,23 @@ class Experiment:
         )
 
     @torch.no_grad()
-    def _refresh_best_autoencoder_checkpoint_stats(self, step: int) -> None:
+    def _refresh_best_autoencoder_checkpoint_stats(
+        self,
+        step: int,
+        validation_results: list[dict[str, Any]],
+    ) -> None:
         """Recompute latent normalization stats and rewrite the best AE checkpoint."""
 
         if self.cfg.mode != "ae_only":
             return
-        self.model.set_latent_normalization_stats(self._compute_latent_normalization_stats())
+        validation_clips = [
+            result["frames"]
+            for result in validation_results
+            if isinstance(result.get("frames"), torch.Tensor)
+        ]
+        self.model.set_latent_normalization_stats(
+            self._compute_latent_normalization_stats_from_clips(validation_clips)
+        )
         self._save_checkpoint(self.checkpoints_dir / "best.pt", step)
 
     @torch.no_grad()
@@ -2929,7 +3305,7 @@ class Experiment:
         if is_best_checkpoint:
             self.best_metric = metric_value
             self._save_checkpoint(self.checkpoints_dir / "best.pt", step)
-            self._refresh_best_autoencoder_checkpoint_stats(step)
+            self._refresh_best_autoencoder_checkpoint_stats(step, validation_results)
         output_dir = self.run_dir / "samples" / f"step_{step:06d}"
         output_dir.mkdir(parents=True, exist_ok=True)
         exported_frame_counts: list[int] = []
@@ -3037,6 +3413,15 @@ class Experiment:
         print(json.dumps(stopped_record, sort_keys=True))
         return True
 
+    def _should_run_validation(self, step: int) -> bool:
+        """Return whether validation should run at the current training step."""
+
+        return (
+            self.cfg.validation_interval > 0
+            and step >= self.cfg.validation_start_step
+            and step % self.cfg.validation_interval == 0
+        )
+
     def run(self) -> None:
         """Execute the configured training loop end to end."""
 
@@ -3051,6 +3436,10 @@ class Experiment:
                     "config": self.cfg.to_dict(),
                     "mode": self.cfg.mode,
                     "clip_metadata": self.cfg.clip_metadata(),
+                    "resolved_train_loader_num_workers": int(
+                        self._resolved_train_loader_num_workers
+                    ),
+                    "train_loader_num_workers_source": self._train_loader_worker_resolution_source,
                 }
             },
         )
@@ -3094,10 +3483,7 @@ class Experiment:
             ):
                 print(json.dumps(metric_record, sort_keys=True))
 
-            if (
-                self.cfg.validation_interval > 0
-                and self.current_step % self.cfg.validation_interval == 0
-            ):
+            if self._should_run_validation(self.current_step):
                 validation_stats = self._validate(self.current_step)
                 last_validation_step = self.current_step
                 print(json.dumps({"step": self.current_step, "validation": validation_stats}, sort_keys=True))
@@ -3110,7 +3496,10 @@ class Experiment:
             ):
                 self._save_checkpoint(self.checkpoints_dir / "last.pt", self.current_step)
 
-        if last_validation_step != self.current_step:
+        if (
+            last_validation_step != self.current_step
+            and self.current_step >= self.cfg.validation_start_step
+        ):
             validation_stats = self._validate(self.current_step)
             print(json.dumps({"step": self.current_step, "validation": validation_stats}, sort_keys=True))
             self._handle_validation_early_stop(self.current_step, validation_stats)

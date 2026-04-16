@@ -167,6 +167,19 @@ class LeRobotEpisodeVideoRepository:
             self.cache_dir = None
         self._video_captures: dict[int, cv2.VideoCapture] = {}
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Drop unpicklable OpenCV state before the repository is serialized."""
+
+        state = dict(self.__dict__)
+        state["_video_captures"] = {}
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore one repository after worker-process deserialization."""
+
+        self.__dict__.update(state)
+        self._video_captures = {}
+
     def __del__(self) -> None:
         """Release cached OpenCV captures when the repository is destroyed."""
 
@@ -411,6 +424,70 @@ class LeRobotEpisodeVideoRepository:
             )
         return frame
 
+    def _frame_tensor_from_bgr(
+        self,
+        frame_bgr: Any,
+        *,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        """Crop and resize one decoded BGR frame into the training tensor format."""
+
+        cropped_frame_bgr = crop_bgr_frame(
+            frame_bgr,
+            resolve_default_lerobot_crop_bounds(
+                self.repo_id,
+                frame_bgr.shape[0],
+                frame_bgr.shape[1],
+            ),
+        )
+        return bgr_frame_to_tensor(
+            cropped_frame_bgr,
+            height=height,
+            width=width,
+        )
+
+    def load_frame_tensors(
+        self,
+        record: LeRobotVideoEpisodeRecord,
+        frame_start: int,
+        frame_end: int,
+        resolution: int,
+        height: int | None,
+        width: int | None,
+    ) -> list[torch.Tensor]:
+        """Load one contiguous frame range with a single sequential decode pass."""
+
+        if frame_end < frame_start:
+            return []
+        resolved_height, resolved_width = resolve_resize_shape(resolution, height, width)
+        capture = self._video_capture(record)
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_start)
+        frames: list[torch.Tensor] = []
+        next_frame_index = frame_start
+        while next_frame_index <= frame_end:
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                capture.release()
+                self._video_captures.pop(record.episode_index, None)
+                capture = self._video_capture(record)
+                capture.set(cv2.CAP_PROP_POS_FRAMES, next_frame_index)
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    raise ValueError(
+                        f"Failed to decode frame {next_frame_index} from episode "
+                        f"{record.episode_index}."
+                    )
+            frames.append(
+                self._frame_tensor_from_bgr(
+                    frame,
+                    height=resolved_height,
+                    width=resolved_width,
+                )
+            )
+            next_frame_index += 1
+        return frames
+
     def load_frame_tensor(
         self,
         frame: LeRobotVideoFrameRecord,
@@ -422,16 +499,8 @@ class LeRobotEpisodeVideoRepository:
 
         resolved_height, resolved_width = resolve_resize_shape(resolution, height, width)
         frame_bgr = self._read_video_frame(frame.episode, frame.frame_index)
-        cropped_frame_bgr = crop_bgr_frame(
+        return self._frame_tensor_from_bgr(
             frame_bgr,
-            resolve_default_lerobot_crop_bounds(
-                self.repo_id,
-                frame_bgr.shape[0],
-                frame_bgr.shape[1],
-            ),
-        )
-        return bgr_frame_to_tensor(
-            cropped_frame_bgr,
             height=resolved_height,
             width=resolved_width,
         )
@@ -457,6 +526,34 @@ class LeRobotEpisodeVideoRepository:
                 f"Expected LeRobot action shape ({expected_dim},), received {tuple(action.shape)}."
             )
         return action
+
+    def load_action_tensors(
+        self,
+        record: LeRobotVideoEpisodeRecord,
+        frame_start: int,
+        frame_end_exclusive: int,
+    ) -> torch.Tensor:
+        """Load a contiguous action slice for the requested episode frame range."""
+
+        expected_dim = self.action_dim()
+        if frame_end_exclusive <= frame_start:
+            return torch.zeros((0, expected_dim), dtype=torch.float32)
+        column_name = self.action_column_name(record.data_relative_path)
+        table = self.episode_table(record.data_relative_path)
+        if frame_end_exclusive > table.num_rows:
+            raise IndexError(
+                f"Requested action rows {frame_start}:{frame_end_exclusive} exceed parquet rows for "
+                f"episode {record.episode_index}."
+            )
+        actions = torch.as_tensor(
+            table[column_name].slice(frame_start, frame_end_exclusive - frame_start).to_pylist(),
+            dtype=torch.float32,
+        )
+        if actions.ndim != 2 or actions.shape[1] != expected_dim:
+            raise ValueError(
+                f"Expected LeRobot action shape (N, {expected_dim}), received {tuple(actions.shape)}."
+            )
+        return actions
 
     def load_clip(
         self,
@@ -489,23 +586,14 @@ class LeRobotEpisodeVideoRepository:
                 f"Requested frames {resolved_frame_start}:{resolved_frame_end} exceed episode length "
                 f"{record.length}."
             )
-        frames: list[torch.Tensor] = []
-        actions: list[torch.Tensor] = []
-        for local_frame_index in range(resolved_frame_start, effective_frame_end + 1):
-            frame_record = LeRobotVideoFrameRecord(
-                episode=record,
-                frame_index=local_frame_index,
-            )
-            frames.append(
-                self.load_frame_tensor(
-                    frame_record,
-                    resolution=resolution,
-                    height=height,
-                    width=width,
-                )
-            )
-            if load_actions and local_frame_index < effective_frame_end:
-                actions.append(self.load_action_tensor(frame_record))
+        frames = self.load_frame_tensors(
+            record,
+            resolved_frame_start,
+            effective_frame_end,
+            resolution=resolution,
+            height=height,
+            width=width,
+        )
         clip = {
             "frames": torch.stack(frames, dim=0),
             "frame_idx": torch.arange(
@@ -518,11 +606,10 @@ class LeRobotEpisodeVideoRepository:
             "task_name": record.task_name,
         }
         if load_actions:
-            action_dim = self.action_dim()
-            clip["actions"] = (
-                torch.stack(actions, dim=0)
-                if actions
-                else torch.zeros((0, action_dim), dtype=torch.float32)
+            clip["actions"] = self.load_action_tensors(
+                record,
+                resolved_frame_start,
+                effective_frame_end,
             )
         return clip
 
