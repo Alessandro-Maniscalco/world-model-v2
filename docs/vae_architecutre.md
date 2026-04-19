@@ -45,10 +45,10 @@ The tests that verify the basic temporal mapping live in:
 
 `wan_vae.py` defines:
 
-- `dim = 64`
-- `z_dim = 64`
+- `dim = 128`
+- `z_dim = 32`
 - `dim_mult = (1, 2, 4)`
-- `num_res_blocks = 1`
+- `num_res_blocks = 2`
 - `attn_scales = ()`
 - `temperal_downsample = (True, True)`
 - `dropout = 0.0`
@@ -65,10 +65,10 @@ WanVAEConfig(z_dim=latent_channels)
 
 with `latent_channels = 32` by default, so the effective default tokenizer in the model is:
 
-- `dim = 64`
+- `dim = 128`
 - `z_dim = 32`
 - `dim_mult = (1, 2, 4)`
-- `num_res_blocks = 1`
+- `num_res_blocks = 2`
 - `attn_scales = ()`
 - `temperal_downsample = (True, True)`
 - `dropout = 0.0`
@@ -158,20 +158,6 @@ Examples:
 - `5` pixel frames -> `2` latent frames
 - `9` pixel frames -> `3` latent frames
 - `13` pixel frames -> `4` latent frames
-
-## Important Practical Note About Non-Aligned Lengths
-
-The helper formula uses a floor, but the actual chunked encoder/decoder path is only cleanly supported for `1 + 4k` pixel-frame counts.
-
-Observed behavior in the repo virtualenv:
-
-- `T = 1` works
-- `T = 5` works
-- `T = 9` works
-- `T = 13` works
-- `T = 2, 3, 4, 6, 7, 8` raise a runtime error in the current implementation
-
-So the codebase correctly uses `exact_latent_frames_for_pixels()` when it needs a strict Wan-aligned context length.
 
 ## Tensor Conventions
 

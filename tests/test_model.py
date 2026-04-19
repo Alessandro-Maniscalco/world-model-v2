@@ -43,6 +43,21 @@ def test_world_model_preserves_requested_dynamics_architecture() -> None:
     assert model.dynamics.cfg.rope_t_extrapolation_ratio == 1.5
 
 
+def test_world_model_keeps_first_dit_at_full_latent_resolution() -> None:
+    """The first DiT should not add extra spatial downsampling beyond the Wan VAE."""
+
+    model = WorldModel(
+        ae_backend="wan",
+        resolution=120,
+        height=120,
+        width=160,
+    )
+
+    assert model.dynamics.cfg.patch_spatial == 1
+    assert model.dynamics.cfg.max_img_h == 120 // model.spatial_downsample_factor
+    assert model.dynamics.cfg.max_img_w == 160 // model.spatial_downsample_factor
+
+
 def test_world_model_rejects_unsupported_dynamics_variants() -> None:
     """The world model should fail fast on removed non-DreamDojo dynamics options."""
 

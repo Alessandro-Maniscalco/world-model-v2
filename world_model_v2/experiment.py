@@ -95,12 +95,38 @@ _OPEN_ROLLOUT_VALIDATION_METRICS = frozenset(
         "open_rollout_consistency_score",
     }
 )
+_TORCH_SAVE_ZIP_WRITE_FAILURE_MARKERS = (
+    "PytorchStreamWriter failed writing file",
+    "unexpected pos",
+)
 
 
 def validation_metric_requires_open_rollout(metric_name: str) -> bool:
     """Return whether one validation metric depends on open-rollout stats."""
 
     return metric_name in _OPEN_ROLLOUT_VALIDATION_METRICS
+
+
+def is_retryable_torch_save_zip_error(error: RuntimeError) -> bool:
+    """Return whether one `torch.save` failure matches the known zip-writer write bug."""
+
+    message = str(error)
+    return any(marker in message for marker in _TORCH_SAVE_ZIP_WRITE_FAILURE_MARKERS)
+
+
+def remove_file_with_retries(path: Path, *, retries: int = 5, delay_seconds: float = 0.1) -> None:
+    """Delete one file while tolerating short-lived Windows file-handle lag after save failures."""
+
+    resolved_retries = max(int(retries), 1)
+    for attempt in range(resolved_retries):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            if attempt + 1 >= resolved_retries:
+                raise
+            gc.collect()
+            time.sleep(delay_seconds)
 
 
 def resolved_training_autocast_dtype(device: torch.device) -> torch.dtype | None:
@@ -133,6 +159,7 @@ class ExperimentConfig:
     validation_split: str = ""
     validation_episode: int = 0
     validation_episodes: tuple[int, ...] | None = None
+    validation_max_frames: int | None = None
     camera: str = "camera_1_color"
     frame_start: int | None = None
     frame_end: int | None = None
@@ -182,14 +209,17 @@ class ExperimentConfig:
     recon_l1_weight: float = 0.0
     recon_edge_weight: float = 0.0
     recon_motion_weight: float = 0.0
+    recon_motion_edge_weight: float = 0.0
     recon_motion_threshold: float = 0.02
     recon_motion_dilation_kernel_size: int = 5
     batch_size: int = 64
+    gradient_accumulation_steps: int = 1
     dataloader_num_workers: int | None = None
     dataloader_prefetch_factor: int = 2
     dataloader_pin_memory: bool | None = None
     auto_batch_size: bool = False
     lr: float = 1e-4
+    lr_warmup_steps: int = 200
     optimizer_beta1: float = 0.95
     max_steps: int = 3000
     validation_interval: int = 250
@@ -265,6 +295,17 @@ class ExperimentConfig:
             return (self.validation_episode,)
         return self.validation_episodes
 
+    def resolved_validation_frame_end(self) -> int | None:
+        """Return the effective validation-only frame end after applying the optional cap."""
+
+        if self.validation_max_frames is None:
+            return self.frame_end
+        validation_start = 0 if self.frame_start is None else int(self.frame_start)
+        capped_end = validation_start + int(self.validation_max_frames) - 1
+        if self.frame_end is None:
+            return capped_end
+        return min(int(self.frame_end), capped_end)
+
     def resolved_run_open_rollout_validation(self) -> bool:
         """Return whether validation should execute the expensive open rollout."""
 
@@ -320,29 +361,33 @@ def reconstruction_loss_terms(
     l1_weight: float,
     edge_weight: float,
     motion_weight: float = 0.0,
+    motion_edge_weight: float = 0.0,
     motion_threshold: float = 0.02,
     motion_dilation_kernel_size: int = 5,
     prev_frame: torch.Tensor | None = None,
     next_frame: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Compute mixed pixel and edge reconstruction losses for one image batch."""
+    """Compute mixed pixel, edge, and motion-focused reconstruction losses."""
 
     if (
         mse_weight < 0.0
         or l1_weight < 0.0
         or edge_weight < 0.0
         or motion_weight < 0.0
+        or motion_edge_weight < 0.0
     ):
         raise ValueError("Reconstruction loss weights must be non-negative.")
     if motion_threshold < 0.0:
         raise ValueError("recon_motion_threshold must be non-negative.")
     if motion_dilation_kernel_size < 1 or motion_dilation_kernel_size % 2 == 0:
         raise ValueError("recon_motion_dilation_kernel_size must be a positive odd integer.")
-    if motion_weight > 0.0 and (prev_frame is None or next_frame is None):
+    if (motion_weight > 0.0 or motion_edge_weight > 0.0) and (
+        prev_frame is None or next_frame is None
+    ):
         raise ValueError(
             "Motion-weighted reconstruction requires both prev_frame and next_frame tensors."
         )
-    total_weight = mse_weight + l1_weight + edge_weight + motion_weight
+    total_weight = mse_weight + l1_weight + edge_weight + motion_weight + motion_edge_weight
     if total_weight <= 0.0:
         raise ValueError("At least one reconstruction loss weight must be positive.")
     recon_mse = F.mse_loss(predicted, target)
@@ -353,8 +398,9 @@ def reconstruction_loss_terms(
         F.l1_loss(predicted_grad_x, target_grad_x) + F.l1_loss(predicted_grad_y, target_grad_y)
     )
     motion_l1 = predicted.new_zeros(())
+    motion_edge_l1 = predicted.new_zeros(())
     motion_mask_fraction = predicted.new_zeros(())
-    if motion_weight > 0.0:
+    if motion_weight > 0.0 or motion_edge_weight > 0.0:
         motion_prev = torch.mean(torch.abs(target - prev_frame), dim=1, keepdim=True)
         motion_next = torch.mean(torch.abs(next_frame - target), dim=1, keepdim=True)
         motion_signal = torch.maximum(motion_prev, motion_next)
@@ -368,14 +414,26 @@ def reconstruction_loss_terms(
             )
         expanded_motion_mask = motion_mask.expand(-1, predicted.shape[1], -1, -1)
         motion_mask_fraction = motion_mask.mean().detach()
-        motion_l1 = torch.sum(torch.abs(predicted - target) * expanded_motion_mask) / (
-            expanded_motion_mask.sum().clamp_min(1.0)
-        )
+        if motion_weight > 0.0:
+            motion_l1 = torch.sum(torch.abs(predicted - target) * expanded_motion_mask) / (
+                expanded_motion_mask.sum().clamp_min(1.0)
+            )
+        if motion_edge_weight > 0.0:
+            motion_mask_x = expanded_motion_mask[..., :, 1:]
+            motion_mask_y = expanded_motion_mask[..., 1:, :]
+            masked_edge_x = torch.sum(torch.abs(predicted_grad_x - target_grad_x) * motion_mask_x) / (
+                motion_mask_x.sum().clamp_min(1.0)
+            )
+            masked_edge_y = torch.sum(torch.abs(predicted_grad_y - target_grad_y) * motion_mask_y) / (
+                motion_mask_y.sum().clamp_min(1.0)
+            )
+            motion_edge_l1 = 0.5 * (masked_edge_x + masked_edge_y)
     recon_loss = (
         mse_weight * recon_mse
         + l1_weight * recon_l1
         + edge_weight * edge_l1
         + motion_weight * motion_l1
+        + motion_edge_weight * motion_edge_l1
     ) / total_weight
     return {
         "recon_loss": recon_loss,
@@ -383,6 +441,7 @@ def reconstruction_loss_terms(
         "recon_l1": recon_l1.detach(),
         "edge_l1": edge_l1.detach(),
         "motion_l1": motion_l1.detach(),
+        "motion_edge_l1": motion_edge_l1.detach(),
         "motion_mask_fraction": motion_mask_fraction,
     }
 
@@ -501,7 +560,14 @@ def save_training_checkpoint(
         "dynamics_backend": model.dynamics_backend,
         "dynamics": model.dynamics_config(),
     }
-    torch.save(payload, output_path)
+    try:
+        torch.save(payload, output_path)
+    except RuntimeError as error:
+        if not is_retryable_torch_save_zip_error(error):
+            raise
+        gc.collect()
+        remove_file_with_retries(output_path)
+        torch.save(payload, output_path, _use_new_zipfile_serialization=False)
 
 
 def load_training_checkpoint(path: str | Path, device: torch.device | str) -> dict[str, Any]:
@@ -708,6 +774,36 @@ class Experiment:
             num_res_blocks=self.cfg.wan_num_res_blocks,
         )
 
+    def _assert_checkpoint_wan_shape_matches_requested(
+        self,
+        checkpoint_config: WanVAEConfig,
+        path: str | Path,
+    ) -> None:
+        """Reject checkpoints whose CLI-exposed Wan shape differs from the request."""
+
+        requested_config = self._requested_wan_config()
+        mismatches: list[str] = []
+        if checkpoint_config.dim != requested_config.dim:
+            mismatches.append(
+                f"dim checkpoint={checkpoint_config.dim} requested={requested_config.dim}"
+            )
+        if checkpoint_config.z_dim != requested_config.z_dim:
+            mismatches.append(
+                f"z_dim checkpoint={checkpoint_config.z_dim} requested={requested_config.z_dim}"
+            )
+        if checkpoint_config.num_res_blocks != requested_config.num_res_blocks:
+            mismatches.append(
+                "num_res_blocks "
+                f"checkpoint={checkpoint_config.num_res_blocks} "
+                f"requested={requested_config.num_res_blocks}"
+            )
+        if mismatches:
+            mismatch_text = ", ".join(mismatches)
+            raise ValueError(
+                f"Checkpoint autoencoder config from {path} does not match the requested "
+                f"Wan temporal tokenizer shape: {mismatch_text}."
+            )
+
     def _extract_checkpoint_autoencoder_metadata(
         self,
         checkpoint: dict[str, Any],
@@ -754,12 +850,11 @@ class Experiment:
                 self.cfg.resume,
                 require_stats=True,
             )
-            if checkpoint_config.to_dict() != requested_config.to_dict():
-                raise ValueError(
-                    f"Checkpoint autoencoder config from {self.cfg.resume} does not match the "
-                    "requested Wan temporal tokenizer config."
-                )
-            return requested_config, checkpoint_stats
+            self._assert_checkpoint_wan_shape_matches_requested(
+                checkpoint_config,
+                self.cfg.resume,
+            )
+            return checkpoint_config, checkpoint_stats
         if self.cfg.load_encoder_decoder:
             checkpoint = load_training_checkpoint(self.cfg.load_encoder_decoder, self.device)
             checkpoint_config, checkpoint_stats = self._extract_checkpoint_autoencoder_metadata(
@@ -767,12 +862,11 @@ class Experiment:
                 self.cfg.load_encoder_decoder,
                 require_stats=True,
             )
-            if checkpoint_config.to_dict() != requested_config.to_dict():
-                raise ValueError(
-                    f"Checkpoint autoencoder config from {self.cfg.load_encoder_decoder} does not "
-                    "match the requested Wan temporal tokenizer config."
-                )
-            return requested_config, checkpoint_stats
+            self._assert_checkpoint_wan_shape_matches_requested(
+                checkpoint_config,
+                self.cfg.load_encoder_decoder,
+            )
+            return checkpoint_config, checkpoint_stats
         return requested_config, LatentNormalizationStats.identity(requested_config.z_dim)
 
     def _validate_config(self) -> None:
@@ -897,6 +991,8 @@ class Experiment:
             )
         if self.cfg.recon_motion_weight < 0.0:
             raise ValueError("recon_motion_weight must be non-negative.")
+        if self.cfg.recon_motion_edge_weight < 0.0:
+            raise ValueError("recon_motion_edge_weight must be non-negative.")
         if self.cfg.recon_motion_threshold < 0.0:
             raise ValueError("recon_motion_threshold must be non-negative.")
         if (
@@ -926,10 +1022,24 @@ class Experiment:
             raise ValueError("Validation-based early stopping requires validation_interval > 0.")
         if self.cfg.validation_start_step < 0:
             raise ValueError("validation_start_step must be non-negative.")
+        if self.cfg.validation_max_frames is not None and self.cfg.validation_max_frames < 1:
+            raise ValueError("validation_max_frames must be positive when provided.")
         if not 0.0 <= self.cfg.optimizer_beta1 < 1.0:
             raise ValueError("optimizer_beta1 must be in [0, 1).")
+        if self.cfg.gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be greater than or equal to one.")
+        if self.cfg.lr_warmup_steps < 0:
+            raise ValueError("lr_warmup_steps must be non-negative.")
         if self.cfg.dataloader_num_workers is not None and self.cfg.dataloader_num_workers < 0:
             raise ValueError("dataloader_num_workers must be non-negative.")
+        if (
+            self.cfg.mode == "dynamics_only"
+            and self.cfg.validation_max_frames is not None
+            and self.cfg.validation_max_frames < self.cfg.dynamics_frame_layout().max_pixel_frames
+        ):
+            raise ValueError(
+                "validation_max_frames must cover at least one full dynamics chunk in dynamics_only mode."
+            )
         if self.cfg.dataloader_prefetch_factor < 1:
             raise ValueError("dataloader_prefetch_factor must be greater than or equal to one.")
         if self.cfg.dataset_format == "lerobot_metaworld":
@@ -1012,7 +1122,11 @@ class Experiment:
     def _build_train_dataset(self) -> Dataset[dict[str, Any]]:
         """Build the mode-specific training dataset."""
 
-        frame_layout = self.cfg.dynamics_frame_layout()
+        frame_layout = DynamicsFrameLayout(
+            context_frames=self.cfg.dynamics_context_frames,
+            target_frames=self.cfg.dynamics_target_frames,
+            temporal_compression_ratio=self.model.temporal_downsample_factor,
+        )
         exclude_episodes = self._excluded_training_episodes()
         if self.cfg.dataset_format == "lerobot_metaworld":
             dataset_kwargs = {
@@ -1189,7 +1303,7 @@ class Experiment:
                 episode=episode,
                 task_index=self.cfg.metaworld_task_index,
                 frame_start=self.cfg.frame_start,
-                frame_end=self.cfg.frame_end,
+                frame_end=self.cfg.resolved_validation_frame_end(),
                 resolution=self.cfg.resolution,
                 height=self.cfg.height,
                 width=self.cfg.width,
@@ -1202,7 +1316,7 @@ class Experiment:
                 split=self.cfg.resolved_validation_split(),
                 episode=episode,
                 frame_start=self.cfg.frame_start,
-                frame_end=self.cfg.frame_end,
+                frame_end=self.cfg.resolved_validation_frame_end(),
                 resolution=self.cfg.resolution,
                 height=self.cfg.height,
                 width=self.cfg.width,
@@ -1215,7 +1329,7 @@ class Experiment:
                 split=self.cfg.resolved_validation_split(),
                 episode=episode,
                 frame_start=self.cfg.frame_start,
-                frame_end=self.cfg.frame_end,
+                frame_end=self.cfg.resolved_validation_frame_end(),
                 resolution=self.cfg.resolution,
                 height=self.cfg.height,
                 width=self.cfg.width,
@@ -1228,7 +1342,7 @@ class Experiment:
                 split=self.cfg.resolved_validation_split(),
                 episode=episode,
                 frame_start=self.cfg.frame_start,
-                frame_end=self.cfg.frame_end,
+                frame_end=self.cfg.resolved_validation_frame_end(),
                 resolution=self.cfg.resolution,
                 height=self.cfg.height,
                 width=self.cfg.width,
@@ -1243,7 +1357,7 @@ class Experiment:
             episode=episode,
             camera=self.cfg.camera,
             frame_start=self.cfg.frame_start,
-            frame_end=self.cfg.frame_end,
+            frame_end=self.cfg.resolved_validation_frame_end(),
             resolution=self.cfg.resolution,
             height=self.cfg.height,
             width=self.cfg.width,
@@ -1547,6 +1661,40 @@ class Experiment:
             weight_decay=0.01,
         )
 
+    def _active_learning_rate(self) -> float:
+        """Return the learning rate that should be used for the next optimizer update."""
+
+        if self.cfg.resume:
+            return float(self.cfg.lr)
+        warmup_steps = int(self.cfg.lr_warmup_steps)
+        if warmup_steps <= 1:
+            return float(self.cfg.lr)
+        return float(self.cfg.lr) * min((self.current_step + 1) / float(warmup_steps), 1.0)
+
+    def _set_optimizer_learning_rate(self, learning_rate: float) -> float:
+        """Apply one learning rate to every optimizer parameter group."""
+
+        resolved_learning_rate = float(learning_rate)
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = resolved_learning_rate
+        return resolved_learning_rate
+
+    def _prepare_learning_rate_for_update(self) -> float:
+        """Resolve and apply the learning rate for the next optimizer step."""
+
+        return self._set_optimizer_learning_rate(self._active_learning_rate())
+
+    def _attach_learning_rate_metric(
+        self,
+        loss_dict: dict[str, torch.Tensor],
+        learning_rate: float,
+    ) -> dict[str, torch.Tensor]:
+        """Attach the active optimizer learning rate to one training metric dictionary."""
+
+        metrics = dict(loss_dict)
+        metrics["learning_rate"] = metrics["loss"].detach().new_tensor(float(learning_rate))
+        return metrics
+
     def _resolve_train_batch_size(self, dataset: Dataset[dict[str, Any]]) -> int:
         """Return the configured or automatically probed training batch size."""
 
@@ -1569,7 +1717,7 @@ class Experiment:
         torch_rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         initial_batch_size = min(max(int(requested_batch_size), 1), max_batch_size)
-        best = 1
+        best = 0
         try:
             if self._batch_size_fits(dataset, initial_batch_size):
                 best = initial_batch_size
@@ -1602,9 +1750,18 @@ class Experiment:
                 else:
                     right = candidate - 1
         finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
             torch.set_rng_state(torch_rng_state)
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state_all(cuda_rng_state)
+        if best < 1:
+            raise RuntimeError(
+                "Automatic CUDA batch-size probing could not fit even batch size 1. "
+                "Free GPU memory may be exhausted by another process."
+            )
         return best
 
     def _log_auto_batch_size_resolution(
@@ -1650,8 +1807,16 @@ class Experiment:
             for name, parameter in self.model.named_parameters()
             if parameter.requires_grad
         }
+        loss_dict: dict[str, torch.Tensor] | None = None
+        probe_autocast_dtype = resolved_training_autocast_dtype(self.device)
+        autocast_context = (
+            torch.autocast(device_type=self.device.type, dtype=probe_autocast_dtype)
+            if probe_autocast_dtype is not None
+            else nullcontext()
+        )
         try:
-            loss_dict = self._train_step(moved_batch)
+            with autocast_context:
+                loss_dict = self._train_step(moved_batch)
             loss_dict["loss"].backward()
             probe_optimizer.step()
             return True
@@ -1660,18 +1825,25 @@ class Experiment:
                 raise
             return False
         finally:
-            with torch.no_grad():
-                for name, parameter in self.model.named_parameters():
-                    if name in parameter_backup:
-                        parameter.copy_(parameter_backup[name].to(parameter.device))
             self.model.zero_grad(set_to_none=True)
             probe_optimizer.zero_grad(set_to_none=True)
-            del probe_optimizer
-            del parameter_backup
+            del loss_dict
             del moved_batch
+            del batch
+            del probe_optimizer
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            with torch.no_grad():
+                for name, parameter in self.model.named_parameters():
+                    if name in parameter_backup:
+                        parameter.copy_(parameter_backup[name])
+            del parameter_backup
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
 
     def _is_cuda_oom(self, error: RuntimeError) -> bool:
         """Return whether the runtime error looks like a CUDA OOM."""
@@ -1718,6 +1890,7 @@ class Experiment:
         """Run one optimizer step and return the detached metric tensors."""
 
         self.optimizer.zero_grad(set_to_none=True)
+        active_learning_rate = self._prepare_learning_rate_for_update()
         autocast_context = (
             torch.autocast(device_type=self.device.type, dtype=self.training_autocast_dtype)
             if self.training_autocast_dtype is not None
@@ -1729,10 +1902,54 @@ class Experiment:
             self.grad_scaler.scale(loss_dict["loss"]).backward()
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
-            return loss_dict
+            return self._attach_learning_rate_metric(loss_dict, active_learning_rate)
         loss_dict["loss"].backward()
         self.optimizer.step()
-        return loss_dict
+        return self._attach_learning_rate_metric(loss_dict, active_learning_rate)
+
+    def _execute_accumulated_training_step(
+        self,
+        train_iterator: Any,
+    ) -> tuple[dict[str, torch.Tensor], Any]:
+        """Consume one or more microbatches and return one optimizer-update metric dict."""
+
+        accumulation_steps = self._gradient_accumulation_steps()
+        if accumulation_steps == 1:
+            train_iterator, batch = self._next_train_batch(train_iterator)
+            return self._execute_training_step(batch), train_iterator
+
+        self.optimizer.zero_grad(set_to_none=True)
+        active_learning_rate = self._prepare_learning_rate_for_update()
+        metric_sums: dict[str, torch.Tensor] = {}
+        for _ in range(accumulation_steps):
+            train_iterator, batch = self._next_train_batch(train_iterator)
+            autocast_context = (
+                torch.autocast(device_type=self.device.type, dtype=self.training_autocast_dtype)
+                if self.training_autocast_dtype is not None
+                else nullcontext()
+            )
+            with autocast_context:
+                loss_dict = self._train_step(batch)
+            scaled_loss = loss_dict["loss"] / float(accumulation_steps)
+            if self.grad_scaler is not None:
+                self.grad_scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+            for key, value in loss_dict.items():
+                detached_value = value.detach()
+                if key not in metric_sums:
+                    metric_sums[key] = detached_value.clone()
+                    continue
+                metric_sums[key] = metric_sums[key] + detached_value
+        if self.grad_scaler is not None:
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            self.optimizer.step()
+        averaged_metrics = {
+            key: value / float(accumulation_steps) for key, value in metric_sums.items()
+        }
+        return self._attach_learning_rate_metric(averaged_metrics, active_learning_rate), train_iterator
 
     def _assert_checkpoint_backend(self, checkpoint: dict[str, Any], path: str | Path) -> None:
         """Ensure the checkpoint backend matches the currently requested backend."""
@@ -1956,6 +2173,7 @@ class Experiment:
             "dataset_format": self.cfg.dataset_format,
             "validation_split": self.cfg.resolved_validation_split(),
             "validation_episodes": self.cfg.resolved_validation_episodes(),
+            "validation_max_frames": self.cfg.validation_max_frames,
             "task": self.cfg.task,
             "metaworld_task_index": self.cfg.metaworld_task_index,
             "metaworld_repo_id": self.cfg.metaworld_repo_id,
@@ -1965,6 +2183,7 @@ class Experiment:
             "camera": self.cfg.resolved_camera(),
             "frame_start": self.cfg.frame_start,
             "frame_end": self.cfg.frame_end,
+            "validation_frame_end": self.cfg.resolved_validation_frame_end(),
             "resolution": self.cfg.resolution,
             "height": self.cfg.resolved_height(),
             "width": self.cfg.resolved_width(),
@@ -1973,6 +2192,7 @@ class Experiment:
             "recon_l1_weight": self.cfg.recon_l1_weight,
             "recon_edge_weight": self.cfg.recon_edge_weight,
             "recon_motion_weight": self.cfg.recon_motion_weight,
+            "recon_motion_edge_weight": self.cfg.recon_motion_edge_weight,
             "recon_motion_threshold": self.cfg.recon_motion_threshold,
             "recon_motion_dilation_kernel_size": self.cfg.recon_motion_dilation_kernel_size,
             "dynamics_context_frames": (
@@ -2035,6 +2255,16 @@ class Experiment:
         resolution = int(checkpoint_config.get("resolution", 128))
         raw_height = checkpoint_config.get("height")
         raw_width = checkpoint_config.get("width")
+        raw_frame_start = checkpoint_config.get("frame_start")
+        raw_frame_end = checkpoint_config.get("frame_end")
+        raw_validation_max_frames = checkpoint_config.get("validation_max_frames")
+        resolved_validation_frame_end = raw_frame_end
+        if raw_validation_max_frames is not None:
+            validation_start = 0 if raw_frame_start is None else int(raw_frame_start)
+            capped_end = validation_start + int(raw_validation_max_frames) - 1
+            resolved_validation_frame_end = (
+                capped_end if raw_frame_end is None else min(int(raw_frame_end), capped_end)
+            )
         return {
             "mode": str(checkpoint.get("mode", checkpoint_config.get("mode", self.cfg.mode))),
             "dataset_format": dataset_format,
@@ -2042,6 +2272,9 @@ class Experiment:
             "validation_episodes": (
                 _normalized_optional_int_tuple(checkpoint_config.get("validation_episodes"))
                 or (int(checkpoint_config.get("validation_episode", 0)),)
+            ),
+            "validation_max_frames": (
+                None if raw_validation_max_frames is None else int(raw_validation_max_frames)
             ),
             "task": str(checkpoint_config.get("task", "single_grasp")),
             "metaworld_task_index": checkpoint_config.get("metaworld_task_index"),
@@ -2077,8 +2310,9 @@ class Experiment:
                     )
                 )
             ),
-            "frame_start": checkpoint_config.get("frame_start"),
-            "frame_end": checkpoint_config.get("frame_end"),
+            "frame_start": raw_frame_start,
+            "frame_end": raw_frame_end,
+            "validation_frame_end": resolved_validation_frame_end,
             "resolution": resolution,
             "height": resolution if raw_height is None else int(raw_height),
             "width": resolution if raw_width is None else int(raw_width),
@@ -2087,6 +2321,9 @@ class Experiment:
             "recon_l1_weight": float(checkpoint_config.get("recon_l1_weight", 0.0)),
             "recon_edge_weight": float(checkpoint_config.get("recon_edge_weight", 0.0)),
             "recon_motion_weight": float(checkpoint_config.get("recon_motion_weight", 0.0)),
+            "recon_motion_edge_weight": float(
+                checkpoint_config.get("recon_motion_edge_weight", 0.0)
+            ),
             "recon_motion_threshold": float(checkpoint_config.get("recon_motion_threshold", 0.02)),
             "recon_motion_dilation_kernel_size": int(
                 checkpoint_config.get("recon_motion_dilation_kernel_size", 5)
@@ -2378,6 +2615,26 @@ class Experiment:
             )
         return moved
 
+    def _gradient_accumulation_steps(self) -> int:
+        """Return the configured microbatch count per optimizer update."""
+
+        return max(int(self.cfg.gradient_accumulation_steps), 1)
+
+    def _effective_train_batch_size(self) -> int:
+        """Return the effective batch size seen by each optimizer update."""
+
+        return int(self.cfg.batch_size) * self._gradient_accumulation_steps()
+
+    def _next_train_batch(self, train_iterator: Any) -> tuple[Any, dict[str, Any]]:
+        """Return the next training batch, rewinding the iterator across epoch boundaries."""
+
+        try:
+            batch = next(train_iterator)
+        except StopIteration:
+            train_iterator = iter(self.train_loader)
+            batch = next(train_iterator)
+        return train_iterator, self._move_batch_to_device(batch)
+
     def _validation_metric_name(self) -> str:
         """Return the metric name used for best-checkpoint selection."""
 
@@ -2412,6 +2669,7 @@ class Experiment:
             l1_weight=self.cfg.recon_l1_weight,
             edge_weight=self.cfg.recon_edge_weight,
             motion_weight=self.cfg.recon_motion_weight,
+            motion_edge_weight=self.cfg.recon_motion_edge_weight,
             motion_threshold=self.cfg.recon_motion_threshold,
             motion_dilation_kernel_size=self.cfg.recon_motion_dilation_kernel_size,
             prev_frame=rearrange(prev_frames, "b t c h w -> (b t) c h w"),
@@ -2425,6 +2683,7 @@ class Experiment:
             "recon_l1": recon_terms["recon_l1"],
             "edge_l1": recon_terms["edge_l1"],
             "motion_l1": recon_terms["motion_l1"],
+            "motion_edge_l1": recon_terms["motion_edge_l1"],
             "motion_mask_fraction": recon_terms["motion_mask_fraction"],
             "kl_loss": output.kl_loss.detach(),
             "ae_loss": ae_loss.detach(),
@@ -2785,6 +3044,7 @@ class Experiment:
             l1_weight=self.cfg.recon_l1_weight,
             edge_weight=self.cfg.recon_edge_weight,
             motion_weight=self.cfg.recon_motion_weight,
+            motion_edge_weight=self.cfg.recon_motion_edge_weight,
             motion_threshold=self.cfg.recon_motion_threshold,
             motion_dilation_kernel_size=self.cfg.recon_motion_dilation_kernel_size,
             prev_frame=prev_frames,
@@ -2795,6 +3055,7 @@ class Experiment:
         recon_l1 = float(recon_terms["recon_l1"].item())
         edge_l1 = float(recon_terms["edge_l1"].item())
         motion_l1 = float(recon_terms["motion_l1"].item())
+        motion_edge_l1 = float(recon_terms["motion_edge_l1"].item())
         motion_mask_fraction = float(recon_terms["motion_mask_fraction"].item())
         kl_loss = kl_weighted_sum / max(total_unique_frames, 1)
         ae_loss = recon_loss + self.cfg.kl_beta * kl_loss
@@ -2805,6 +3066,7 @@ class Experiment:
             recon_l1,
             edge_l1,
             motion_l1,
+            motion_edge_l1,
             motion_mask_fraction,
             kl_loss,
             ae_loss,
@@ -3072,6 +3334,7 @@ class Experiment:
                 recon_l1,
                 edge_l1,
                 motion_l1,
+                motion_edge_l1,
                 motion_mask_fraction,
                 kl_loss,
                 ae_loss,
@@ -3085,6 +3348,7 @@ class Experiment:
                 "recon_l1": float(recon_l1),
                 "edge_l1": float(edge_l1),
                 "motion_l1": float(motion_l1),
+                "motion_edge_l1": float(motion_edge_l1),
                 "motion_mask_fraction": float(motion_mask_fraction),
                 "kl_loss": kl_loss,
                 "ae_loss": ae_loss,
@@ -3223,6 +3487,8 @@ class Experiment:
         video_sum_sq = torch.zeros_like(img_sum)
         img_count = 0
         video_count = 0
+        window_frames = self.model.latent_frames_to_pixel_frames(self.model.dynamics.cfg.max_frames)
+        stride_frames = self.model.dynamics.cfg.num_action_per_chunk
         for clip_frames in clips:
             if clip_frames.ndim != 4:
                 raise ValueError(
@@ -3230,19 +3496,36 @@ class Experiment:
                 )
             frames = clip_frames.unsqueeze(0).to(self.device)
             image_mu, _ = self.model.encode_posterior(frames[:, 0])
-            video = rearrange(frames, "b t c h w -> b c t h w")
-            raw_video_mu, _ = self.model.encoder(video)
             img_sum += image_mu.sum(dim=(0, 2, 3))
             img_sum_sq += image_mu.square().sum(dim=(0, 2, 3))
-            video_sum += raw_video_mu.sum(dim=(0, 2, 3, 4))
-            video_sum_sq += raw_video_mu.square().sum(dim=(0, 2, 3, 4))
             img_count += int(image_mu.shape[0] * image_mu.shape[2] * image_mu.shape[3])
-            video_count += int(
-                raw_video_mu.shape[0]
-                * raw_video_mu.shape[2]
-                * raw_video_mu.shape[3]
-                * raw_video_mu.shape[4]
-            )
+            total_frames = int(frames.shape[1])
+            for start in range(0, total_frames, stride_frames):
+                actual_stop = min(start + window_frames, total_frames)
+                frame_chunk = frames[:, start:actual_stop]
+                actual_chunk_frames = int(frame_chunk.shape[1])
+                if actual_chunk_frames < window_frames:
+                    pad_frame = frame_chunk[:, -1:].expand(-1, window_frames - actual_chunk_frames, -1, -1, -1)
+                    frame_chunk = torch.cat([frame_chunk, pad_frame], dim=1)
+                video = rearrange(frame_chunk, "b t c h w -> b c t h w")
+                raw_video_mu, _ = self.model.encoder(video)
+                actual_latent_frames = self.model.pixel_frames_to_latent_frames(actual_chunk_frames)
+                unique_latent_start = 0 if start == 0 else 1
+                if actual_latent_frames <= unique_latent_start:
+                    if actual_stop == total_frames:
+                        break
+                    continue
+                unique_video_mu = raw_video_mu[:, :, unique_latent_start:actual_latent_frames]
+                video_sum += unique_video_mu.sum(dim=(0, 2, 3, 4))
+                video_sum_sq += unique_video_mu.square().sum(dim=(0, 2, 3, 4))
+                video_count += int(
+                    unique_video_mu.shape[0]
+                    * unique_video_mu.shape[2]
+                    * unique_video_mu.shape[3]
+                    * unique_video_mu.shape[4]
+                )
+                if actual_stop == total_frames:
+                    break
 
         def _finalize(sum_tensor: torch.Tensor, sum_sq_tensor: torch.Tensor, count: int) -> tuple[list[float], list[float]]:
             """Convert accumulated moments into per-channel mean/std lists."""
@@ -3436,6 +3719,7 @@ class Experiment:
                     "config": self.cfg.to_dict(),
                     "mode": self.cfg.mode,
                     "clip_metadata": self.cfg.clip_metadata(),
+                    "effective_train_batch_size": int(self._effective_train_batch_size()),
                     "resolved_train_loader_num_workers": int(
                         self._resolved_train_loader_num_workers
                     ),
@@ -3447,21 +3731,14 @@ class Experiment:
         train_iterator = iter(self.train_loader)
         last_validation_step = -1
         while self.current_step < self.cfg.max_steps:
-            try:
-                batch = next(train_iterator)
-            except StopIteration:
-                train_iterator = iter(self.train_loader)
-                batch = next(train_iterator)
-            batch = self._move_batch_to_device(batch)
             self.model.train()
             loss_dict: dict[str, torch.Tensor] | None = None
             try:
-                loss_dict = self._execute_training_step(batch)
+                loss_dict, train_iterator = self._execute_accumulated_training_step(train_iterator)
             except RuntimeError as error:
                 if not self._is_cuda_oom(error):
                     raise
                 recovered = self._reduce_batch_size_after_oom()
-                batch = None
                 loss_dict = None
                 error = None
                 self._cleanup_after_cuda_oom()
@@ -3469,7 +3746,6 @@ class Experiment:
                     raise
                 train_iterator = iter(self.train_loader)
                 continue
-            batch = None
             self.current_step += 1
 
             metric_record = {"step": self.current_step, "loss": float(loss_dict["loss"].detach().cpu())}

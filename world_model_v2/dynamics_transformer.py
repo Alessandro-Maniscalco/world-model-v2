@@ -171,8 +171,8 @@ class DynamicsTransformerConfig:
     open_rollout_context_frames: int | None = None
     open_rollout_stride_frames: int | None = None
     temporal_compression_ratio: int = DYNAMICS_FRAME_LAYOUT.temporal_compression_ratio
-    in_channels: int = 32
-    out_channels: int = 32
+    in_channels: int = 16
+    out_channels: int = 16
     patch_spatial: int = 2
     patch_temporal: int = 1
     model_channels: int = 256

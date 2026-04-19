@@ -21,6 +21,7 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 from world_model_v2.dynamics_transformer import DYNAMICS_FRAME_LAYOUT, DynamicsFrameLayout
+from world_model_v2.image_resize import DEFAULT_RESIZE_FILTER, rgb_array_to_tensor
 
 
 METAWORLD_DATASET_ID = "lerobot/metaworld_mt50"
@@ -93,23 +94,40 @@ def resolve_resize_shape(
     return resolved_height, resolved_width
 
 
-def image_bytes_to_tensor(image_bytes: bytes, height: int, width: int) -> torch.Tensor:
+def image_bytes_to_tensor(
+    image_bytes: bytes,
+    height: int,
+    width: int,
+    *,
+    resize_filter: str | None = DEFAULT_RESIZE_FILTER,
+) -> torch.Tensor:
     """Decode one encoded RGB image and resize it to a float tensor."""
 
     image = Image.open(BytesIO(image_bytes)).convert("RGB")
-    resized = image.resize((width, height), resample=Image.Resampling.BILINEAR)
-    pixels = np.asarray(resized, dtype=np.float32) / 255.0
-    return torch.from_numpy(pixels).permute(2, 0, 1).contiguous()
+    return rgb_array_to_tensor(
+        np.asarray(image),
+        height=height,
+        width=width,
+        resize_filter=resize_filter,
+    )
 
 
-def bgr_frame_to_tensor(frame_bgr: np.ndarray, height: int, width: int) -> torch.Tensor:
+def bgr_frame_to_tensor(
+    frame_bgr: np.ndarray,
+    height: int,
+    width: int,
+    *,
+    resize_filter: str | None = DEFAULT_RESIZE_FILTER,
+) -> torch.Tensor:
     """Convert one OpenCV BGR frame into a resized RGB float tensor."""
 
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    if rgb.shape[0] != height or rgb.shape[1] != width:
-        rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_LINEAR)
-    pixels = np.asarray(rgb, dtype=np.float32) / 255.0
-    return torch.from_numpy(np.ascontiguousarray(pixels)).permute(2, 0, 1).contiguous()
+    return rgb_array_to_tensor(
+        rgb,
+        height=height,
+        width=width,
+        resize_filter=resize_filter,
+    )
 
 
 class MetaWorldRepository:

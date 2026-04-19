@@ -10,10 +10,10 @@ from typing import Any
 import h5py
 import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import Dataset
 
 from world_model_v2.dynamics_transformer import DYNAMICS_FRAME_LAYOUT, DynamicsFrameLayout
+from world_model_v2.image_resize import DEFAULT_RESIZE_FILTER, rgb_array_to_tensor
 
 
 def resolve_episode_path(
@@ -48,13 +48,16 @@ def list_episode_indices(
     return sorted(episode_indices)
 
 
-def resize_frame_to_tensor(frame: np.ndarray, height: int, width: int) -> torch.Tensor:
+def resize_frame_to_tensor(
+    frame: np.ndarray,
+    height: int,
+    width: int,
+    *,
+    resize_filter: str | None = DEFAULT_RESIZE_FILTER,
+) -> torch.Tensor:
     """Resize one RGB frame and return a float tensor in `[0, 1]`."""
 
-    image = Image.fromarray(frame)
-    resized = image.resize((width, height), resample=Image.Resampling.BILINEAR)
-    array = np.asarray(resized, dtype=np.float32) / 255.0
-    return torch.from_numpy(np.transpose(array, (2, 0, 1)))
+    return rgb_array_to_tensor(frame, height=height, width=width, resize_filter=resize_filter)
 
 
 def resolve_resize_shape(

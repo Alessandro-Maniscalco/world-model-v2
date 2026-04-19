@@ -25,6 +25,31 @@ from world_model_v2.wan_vae import (
 )
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register the opt-in flag for runtime-heavy slow tests."""
+
+    parser.addoption(
+        "--runslow",
+        action="store_true",
+        default=False,
+        help="run tests marked slow",
+    )
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    """Skip slow tests unless the caller explicitly asks for them."""
+
+    if config.getoption("--runslow"):
+        return
+    skip_slow = pytest.mark.skip(reason="need --runslow option to run")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip_slow)
+
+
 def write_episode(path: Path, frames: int = 6, height: int = 32, width: int = 32) -> None:
     """Create a small synthetic HDF5 episode file."""
 
@@ -514,11 +539,12 @@ def fake_lerobot_so101_base_sim_pickplace_root(tmp_path: Path) -> Path:
     return root
 
 
-@pytest.fixture()
-def saved_world_model_ae_checkpoint(fake_long_dataset_root: Path, tmp_path: Path) -> Path:
+@pytest.fixture(scope="session")
+def saved_world_model_ae_checkpoint(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Create a deterministic Wan-AE checkpoint for loading tests."""
 
-    checkpoint_path = tmp_path / "world_model_wan_ae.pt"
+    root = tmp_path_factory.mktemp("saved_world_model_ae_checkpoint")
+    checkpoint_path = root / "world_model_wan_ae.pt"
     model = WorldModel(
         ae_backend="wan",
         latent_channels=DEFAULT_WAN_Z_DIM,
@@ -537,8 +563,8 @@ def saved_world_model_ae_checkpoint(fake_long_dataset_root: Path, tmp_path: Path
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     config = ExperimentConfig(
         mode="ae_only",
-        data_root=str(fake_long_dataset_root),
-        output_dir=str(tmp_path / "outputs"),
+        data_root=str(root / "data"),
+        output_dir=str(root / "outputs"),
         run_name="fixture_wan_ae",
         ae_backend="wan",
         device="cpu",

@@ -28,7 +28,12 @@ from world_model_v2.experiment import (
 )
 from world_model_v2.dynamics_transformer import DynamicsTrainingInputs
 from world_model_v2.model import WorldModel
-from world_model_v2.wan_vae import WanVAEConfig
+from world_model_v2.wan_vae import (
+    DEFAULT_WAN_DIM,
+    DEFAULT_WAN_NUM_RES_BLOCKS,
+    DEFAULT_WAN_Z_DIM,
+    WanVAEConfig,
+)
 from world_model_v2.utils.checkpointing import append_jsonl
 
 
@@ -138,6 +143,54 @@ def test_experiment_dynamics_only_requires_at_least_one_temporal_window(
         )
 
 
+def test_experiment_dynamics_only_requires_validation_cap_to_cover_one_chunk(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Dynamics validation caps should still leave enough frames for one full chunk."""
+
+    with pytest.raises(ValueError, match="validation_max_frames"):
+        Experiment(
+            ExperimentConfig(
+                mode="dynamics_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="validation_cap_too_short",
+                load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+                validation_max_frames=12,
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_validation_max_frames_caps_validation_clip_length(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Validation should honor the requested validation-only frame cap."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="validation_cap_applied",
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            validation_max_frames=25,
+            max_steps=1,
+            validation_interval=1,
+            checkpoint_interval=1,
+            device="cpu",
+        )
+    )
+
+    batch = next(iter(experiment.val_loader))
+    assert int(batch["frames"].shape[1]) == 25
+    assert experiment.cfg.resolved_validation_frame_end() == 24
+
+
 def test_experiment_supports_custom_dynamics_layout_controls(
     fake_long_dataset_root: Path,
     saved_world_model_ae_checkpoint: Path,
@@ -200,6 +253,61 @@ def test_experiment_supports_custom_wan_autoencoder_shape(
     assert experiment.model.wan_cfg == WanVAEConfig(dim=96, z_dim=64, num_res_blocks=1)
 
 
+def test_experiment_resume_preserves_checkpoint_temporal_wan_metadata(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Resume should reuse hidden Wan tokenizer metadata serialized in the checkpoint."""
+
+    checkpoint_path = tmp_path / "temporal_wan_resume.pt"
+    checkpoint_wan_config = WanVAEConfig(
+        dim=DEFAULT_WAN_DIM,
+        z_dim=DEFAULT_WAN_Z_DIM,
+        num_res_blocks=DEFAULT_WAN_NUM_RES_BLOCKS,
+        dim_mult=(1, 2, 4),
+        temperal_downsample=(True, True),
+    )
+    model = WorldModel(
+        ae_backend="wan",
+        latent_channels=DEFAULT_WAN_Z_DIM,
+        wan_config=checkpoint_wan_config,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    source_config = ExperimentConfig(
+        mode="ae_only",
+        data_root=str(fake_long_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="temporal_wan_source",
+        ae_backend="wan",
+        device="cpu",
+    )
+    save_training_checkpoint(
+        path=checkpoint_path,
+        model=model,
+        optimizer=optimizer,
+        scheduler=None,
+        step=5,
+        config=source_config.to_dict(),
+        mode=source_config.mode,
+        clip_metadata=source_config.clip_metadata(),
+        best_metric=0.123,
+    )
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="temporal_wan_resume_target",
+            resume=str(checkpoint_path),
+            device="cpu",
+        )
+    )
+
+    assert experiment.current_step == 5
+    assert experiment.model.wan_cfg == checkpoint_wan_config
+
+
 def test_experiment_uses_requested_optimizer_beta1(
     fake_long_dataset_root: Path,
     tmp_path: Path,
@@ -219,6 +327,130 @@ def test_experiment_uses_requested_optimizer_beta1(
     )
 
     assert experiment.optimizer.param_groups[0]["betas"] == (0.9, 0.999)
+
+
+def test_experiment_rejects_non_positive_gradient_accumulation_steps(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Gradient accumulation factors below one should fail fast during config validation."""
+
+    with pytest.raises(ValueError, match="gradient_accumulation_steps"):
+        Experiment(
+            ExperimentConfig(
+                mode="ae_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="invalid_grad_accum",
+                gradient_accumulation_steps=0,
+                **DEBUG_FRAME_KWARGS,
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_execute_accumulated_training_step_averages_gradients() -> None:
+    """Accumulation should average microbatch gradients and reported metrics per update."""
+
+    experiment = object.__new__(Experiment)
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    experiment.cfg = ExperimentConfig(
+        data_root="unused",
+        batch_size=1,
+        gradient_accumulation_steps=2,
+        lr=1.0,
+        lr_warmup_steps=0,
+        device="cpu",
+    )
+    experiment.current_step = 0
+    experiment.device = torch.device("cpu")
+    experiment.training_autocast_dtype = None
+    experiment.grad_scaler = None
+    experiment.optimizer = torch.optim.SGD([parameter], lr=1.0)
+    experiment.train_loader = [
+        {"target": torch.tensor(1.0)},
+        {"target": torch.tensor(3.0)},
+    ]
+
+    def fake_train_step(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Return one quadratic loss whose gradient depends on the target value."""
+
+        target = batch["target"]
+        loss = 0.5 * (parameter - target).pow(2)
+        return {"loss": loss, "target_metric": target}
+
+    experiment._train_step = fake_train_step  # type: ignore[method-assign]
+
+    loss_dict, iterator = experiment._execute_accumulated_training_step(iter(experiment.train_loader))
+
+    assert parameter.item() == pytest.approx(2.0)
+    assert loss_dict["loss"].item() == pytest.approx(2.5)
+    assert loss_dict["target_metric"].item() == pytest.approx(2.0)
+    assert loss_dict["learning_rate"].item() == pytest.approx(1.0)
+    with pytest.raises(StopIteration):
+        next(iterator)
+
+
+def test_experiment_active_learning_rate_warms_up_then_plateaus() -> None:
+    """Fresh runs should ramp the optimizer LR up linearly before holding steady."""
+
+    experiment = object.__new__(Experiment)
+    experiment.cfg = ExperimentConfig(
+        data_root="unused",
+        lr=0.3,
+        lr_warmup_steps=3,
+        device="cpu",
+    )
+
+    experiment.current_step = 0
+    assert experiment._active_learning_rate() == pytest.approx(0.1)
+    experiment.current_step = 1
+    assert experiment._active_learning_rate() == pytest.approx(0.2)
+    experiment.current_step = 2
+    assert experiment._active_learning_rate() == pytest.approx(0.3)
+    experiment.current_step = 8
+    assert experiment._active_learning_rate() == pytest.approx(0.3)
+
+
+def test_experiment_execute_accumulated_training_step_uses_optimizer_step_warmup_count() -> None:
+    """Accumulation should advance LR warmup once per optimizer update, not per microbatch."""
+
+    experiment = object.__new__(Experiment)
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    experiment.cfg = ExperimentConfig(
+        data_root="unused",
+        batch_size=1,
+        gradient_accumulation_steps=2,
+        lr=1.0,
+        lr_warmup_steps=4,
+        device="cpu",
+    )
+    experiment.current_step = 1
+    experiment.device = torch.device("cpu")
+    experiment.training_autocast_dtype = None
+    experiment.grad_scaler = None
+    experiment.optimizer = torch.optim.SGD([parameter], lr=1.0)
+    experiment.train_loader = [
+        {"target": torch.tensor(1.0)},
+        {"target": torch.tensor(3.0)},
+    ]
+
+    def fake_train_step(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Return one quadratic loss whose gradient depends on the target value."""
+
+        target = batch["target"]
+        loss = 0.5 * (parameter - target).pow(2)
+        return {"loss": loss, "target_metric": target}
+
+    experiment._train_step = fake_train_step  # type: ignore[method-assign]
+
+    loss_dict, iterator = experiment._execute_accumulated_training_step(iter(experiment.train_loader))
+
+    assert parameter.item() == pytest.approx(1.0)
+    assert experiment.optimizer.param_groups[0]["lr"] == pytest.approx(0.5)
+    assert loss_dict["learning_rate"].item() == pytest.approx(0.5)
+    with pytest.raises(StopIteration):
+        next(iterator)
 
 
 def test_experiment_uses_requested_dataloader_training_options(
@@ -566,6 +798,39 @@ def test_experiment_probe_cuda_batch_size_grows_beyond_requested_start(
     assert 64 in observed_batch_sizes
 
 
+def test_experiment_probe_cuda_batch_size_raises_when_no_batch_fits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CUDA auto-batch probing should fail fast when even batch size one does not fit."""
+
+    class DummyDataset:
+        """Expose a fixed dataset length for auto-batch probing tests."""
+
+        def __len__(self) -> int:
+            """Return the synthetic dataset length."""
+
+            return 100
+
+    experiment = object.__new__(Experiment)
+
+    def fake_batch_size_fits(dataset: DummyDataset, batch_size: int) -> bool:
+        """Pretend every candidate batch size exhausts CUDA memory."""
+
+        return False
+
+    experiment._batch_size_fits = fake_batch_size_fits  # type: ignore[method-assign]
+    monkeypatch.setattr(torch, "get_rng_state", lambda: torch.arange(4, dtype=torch.uint8))
+    monkeypatch.setattr(torch, "set_rng_state", lambda _state: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="batch size 1"):
+        experiment._probe_cuda_batch_size(
+            DummyDataset(),
+            requested_batch_size=8,
+            max_batch_size=100,
+        )
+
+
 def test_experiment_rejects_negative_self_forcing_weight(
     fake_long_dataset_root: Path,
     tmp_path: Path,
@@ -618,6 +883,25 @@ def test_experiment_rejects_negative_self_forcing_warmup_steps(
                 output_dir=str(tmp_path / "outputs"),
                 run_name="negative_self_forcing_warmup",
                 dynamics_self_forcing_warmup_steps=-1,
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_rejects_negative_learning_rate_warmup_steps(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Negative LR warmup steps should fail fast during config validation."""
+
+    with pytest.raises(ValueError, match="lr_warmup_steps"):
+        Experiment(
+            ExperimentConfig(
+                mode="ae_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="negative_lr_warmup",
+                lr_warmup_steps=-1,
                 device="cpu",
             )
         )
@@ -1762,8 +2046,8 @@ def test_experiment_dynamics_only_can_train_all_episodes_with_separate_validatio
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 221
-    assert experiment.train_dataset[118]["episode_idx"].item() == 1
+    assert len(experiment.train_dataset) == 233
+    assert experiment.train_dataset[124]["episode_idx"].item() == 1
     validation_batch = next(iter(experiment.val_loader))
     assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
     assert validation_batch["frames"].shape[1] == 130
@@ -1858,7 +2142,7 @@ def test_experiment_excludes_validation_episodes_from_same_split_all_episode_tra
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 103
+    assert len(experiment.train_dataset) == 109
     assert experiment.train_dataset[0]["episode_idx"].item() == 1
 
 
@@ -1957,6 +2241,57 @@ def test_checkpoint_round_trip(tmp_path: Path, fake_long_dataset_root: Path) -> 
     assert set(checkpoint["rng_state"]) >= {"python", "numpy", "torch"}
     assert checkpoint_ae_backend(checkpoint) == "wan"
     assert checkpoint_dynamics_backend(checkpoint) == "rf_dit"
+
+
+def test_save_training_checkpoint_retries_with_legacy_format_after_zip_write_failure(
+    tmp_path: Path,
+    fake_long_dataset_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint saves should retry with legacy serialization after the known zip-writer failure."""
+
+    checkpoint_path = tmp_path / "fallback.pt"
+    model = WorldModel(ae_backend="wan")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    config = ExperimentConfig(
+        mode="ae_only",
+        data_root=str(fake_long_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        ae_backend="wan",
+        device="cpu",
+    )
+    original_torch_save = torch.save
+    save_kwargs: list[dict[str, object]] = []
+
+    def _fake_torch_save(obj: object, path: str | Path, **kwargs: object) -> None:
+        """Raise once with the zip-writer error and then simulate a successful retry."""
+
+        del obj
+        resolved_path = Path(path)
+        save_kwargs.append(dict(kwargs))
+        if len(save_kwargs) == 1:
+            raise RuntimeError(
+                "[enforce fail at inline_container.cc:862] . "
+                "PytorchStreamWriter failed writing file data/51: file write failed"
+            )
+        original_torch_save({"legacy_retry": True}, resolved_path, **kwargs)
+
+    monkeypatch.setattr(torch, "save", _fake_torch_save)
+
+    save_training_checkpoint(
+        path=checkpoint_path,
+        model=model,
+        optimizer=optimizer,
+        scheduler=None,
+        step=3,
+        config=config.to_dict(),
+        mode=config.mode,
+        clip_metadata=config.clip_metadata(),
+        best_metric=0.5,
+    )
+
+    assert save_kwargs == [{}, {"_use_new_zipfile_serialization": False}]
+    assert torch.load(checkpoint_path, map_location="cpu", weights_only=False) == {"legacy_retry": True}
 
 
 def test_experiment_resume_restores_rng_state(
@@ -2158,6 +2493,35 @@ def test_reconstruction_loss_terms_upweight_motion_regions() -> None:
     assert float(motion_terms["recon_loss"].item()) > float(base_terms["recon_loss"].item())
 
 
+def test_reconstruction_loss_terms_capture_moving_edge_errors() -> None:
+    """Motion-edge loss should penalize missing sharp structures inside moving regions."""
+
+    target = torch.zeros(1, 3, 8, 8)
+    target[:, :, 3:5, 3:5] = 1.0
+    prev_frame = torch.zeros_like(target)
+    prev_frame[:, :, 3:5, 1:3] = 1.0
+    next_frame = torch.zeros_like(target)
+    next_frame[:, :, 3:5, 5:7] = 1.0
+    predicted = torch.zeros_like(target)
+
+    terms = reconstruction_loss_terms(
+        predicted,
+        target,
+        mse_weight=0.0,
+        l1_weight=0.0,
+        edge_weight=0.0,
+        motion_edge_weight=1.0,
+        motion_threshold=0.05,
+        motion_dilation_kernel_size=3,
+        prev_frame=prev_frame,
+        next_frame=next_frame,
+    )
+
+    assert float(terms["motion_edge_l1"].item()) > 0.0
+    assert float(terms["motion_mask_fraction"].item()) > 0.0
+    assert float(terms["recon_loss"].item()) == pytest.approx(float(terms["motion_edge_l1"].item()))
+
+
 def test_reconstruction_loss_terms_require_motion_context_when_enabled() -> None:
     """Motion-weighted loss should fail fast if neighboring GT frames are unavailable."""
 
@@ -2170,6 +2534,15 @@ def test_reconstruction_loss_terms_require_motion_context_when_enabled() -> None
             l1_weight=0.0,
             edge_weight=0.0,
             motion_weight=1.0,
+        )
+    with pytest.raises(ValueError, match="prev_frame and next_frame"):
+        reconstruction_loss_terms(
+            target,
+            target,
+            mse_weight=0.0,
+            l1_weight=0.0,
+            edge_weight=0.0,
+            motion_edge_weight=1.0,
         )
 
 
@@ -2283,6 +2656,31 @@ def test_experiment_can_resume_deeper_dynamics_with_tail_blocks(
     assert torch.allclose(loaded_block_weight, torch.full_like(loaded_block_weight, 0.75))
     assert torch.allclose(source_tail_weight, torch.full_like(source_tail_weight, 0.75))
     assert torch.allclose(tail_block_weight, source_tail_weight)
+
+
+def test_experiment_resume_disables_learning_rate_warmup(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Resumed runs should use the configured full LR instead of continuing warmup."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="resume_full_lr",
+            **DEBUG_FRAME_KWARGS,
+            resume=str(saved_world_model_ae_checkpoint),
+            lr=1e-5,
+            device="cpu",
+        )
+    )
+
+    assert experiment.current_step == 5
+    assert experiment._active_learning_rate() == pytest.approx(1e-5)
+    assert all(group["lr"] == pytest.approx(1e-5) for group in experiment.optimizer.param_groups)
 
 
 def test_experiment_rejects_missing_action_conditioning_metadata(
@@ -2617,6 +3015,7 @@ def test_experiment_validation_start_step_delays_scheduled_validation(
 def test_experiment_restores_plateau_state_from_resume_metrics(
     fake_long_dataset_root: Path,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A resumed run should reuse prior validation history when evaluating plateau stops."""
 
@@ -2665,12 +3064,87 @@ def test_experiment_restores_plateau_state_from_resume_metrics(
         device="cpu",
     )
     resumed_experiment = Experiment(resumed_config)
+    saved_checkpoints: list[tuple[Path, int]] = []
+
+    def _record_checkpoint(path: str | Path, step: int) -> None:
+        """Record checkpoint-save requests without writing a large archive during the test."""
+
+        saved_checkpoints.append((Path(path), int(step)))
+
+    monkeypatch.setattr(resumed_experiment, "_save_checkpoint", _record_checkpoint)
     resumed_experiment._restore_early_stop_state(resumed_experiment.current_step)
     assert resumed_experiment.current_step == 1
     assert resumed_experiment.best_window_loss == pytest.approx(1.0)
     assert resumed_experiment._handle_validation_early_stop(2, {"ae_loss": 1.0})
+    assert saved_checkpoints == [(tmp_path / "outputs" / "resume_target" / "checkpoints" / "last.pt", 2)]
     metrics_path = tmp_path / "outputs" / "resume_target" / "metrics.jsonl"
     records = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
     stopped_records = [record for record in records if "stopped" in record]
     assert stopped_records
     assert stopped_records[-1]["step"] == 2
+
+
+def test_resume_handles_validation_max_frames_when_checkpoint_frame_end_is_none(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Resume should compare validation signatures safely when frame_end is unset in the checkpoint."""
+
+    initial_config = ExperimentConfig(
+        mode="ae_only",
+        data_root=str(fake_long_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="resume_validation_cap_source",
+        max_steps=0,
+        validation_interval=1,
+        checkpoint_interval=1,
+        device="cpu",
+    )
+    initial_experiment = Experiment(initial_config)
+    source_run_dir = tmp_path / "outputs" / "resume_validation_cap_source"
+    initial_experiment._save_checkpoint(source_run_dir / "checkpoints" / "last.pt", step=1)
+
+    resumed_experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="resume_validation_cap_target",
+            resume=str(source_run_dir / "checkpoints" / "last.pt"),
+            validation_max_frames=13,
+            max_steps=1,
+            validation_interval=1,
+            checkpoint_interval=1,
+            device="cpu",
+        )
+    )
+
+    assert resumed_experiment.current_step == 1
+    assert resumed_experiment.best_metric is None
+
+
+@pytest.mark.slow
+def test_experiment_validation_refreshes_best_checkpoint_stats_for_tail_remainder_clip(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Best-checkpoint latent stat refresh should handle validation clips with short tail chunks."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="tail_remainder_validation",
+            frame_start=0,
+            frame_end=13,
+            checkpoint_interval=0,
+            validation_interval=1,
+            device="cpu",
+        )
+    )
+
+    stats = experiment._validate(1)
+
+    assert "ae_loss" in stats
+    assert (tmp_path / "outputs" / "tail_remainder_validation" / "checkpoints" / "best.pt").exists()

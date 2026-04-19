@@ -10,11 +10,11 @@ from typing import Any
 
 import h5py
 import numpy as np
-from PIL import Image
 import torch
 from torch.utils.data import Dataset, Sampler
 
 from world_model_v2.dynamics_transformer import DYNAMICS_FRAME_LAYOUT, DynamicsFrameLayout
+from world_model_v2.image_resize import DEFAULT_RESIZE_FILTER, rgb_array_to_tensor as resize_rgb_array_to_tensor
 from world_model_v2.metaworld_dataset import MetaWorldGroupedFrameSampler
 
 
@@ -49,13 +49,21 @@ def resolve_resize_shape(
     return resolved_height, resolved_width
 
 
-def rgb_array_to_tensor(rgb: np.ndarray, height: int, width: int) -> torch.Tensor:
+def rgb_array_to_tensor(
+    rgb: np.ndarray,
+    height: int,
+    width: int,
+    *,
+    resize_filter: str | None = DEFAULT_RESIZE_FILTER,
+) -> torch.Tensor:
     """Resize one RGB array and return it as a normalized CHW tensor."""
 
-    image = Image.fromarray(rgb)
-    resized = image.resize((width, height), resample=Image.Resampling.BILINEAR)
-    pixels = np.asarray(resized, dtype=np.float32) / 255.0
-    return torch.from_numpy(pixels).permute(2, 0, 1).contiguous()
+    return resize_rgb_array_to_tensor(
+        rgb,
+        height=height,
+        width=width,
+        resize_filter=resize_filter,
+    )
 
 
 def read_nested_h5(group: h5py.Group, path: tuple[str, ...]) -> h5py.Dataset:

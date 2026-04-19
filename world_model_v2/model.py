@@ -195,14 +195,9 @@ class WorldModel(nn.Module):
             )
         latent_height = self.image_height // self.spatial_downsample_factor
         latent_width = self.image_width // self.spatial_downsample_factor
-        dynamics_patch_spatial = (
-            2
-            if latent_height >= 2
-            and latent_width >= 2
-            and latent_height % 2 == 0
-            and latent_width % 2 == 0
-            else 1
-        )
+        # Keep the first DiT at full latent resolution because the Wan tokenizer
+        # already performs the spatial compression.
+        dynamics_patch_spatial = 1
         self.dynamics_backend = "rf_dit"
         self.dynamics = RectifiedFlowDynamics(
             DynamicsTransformerConfig(

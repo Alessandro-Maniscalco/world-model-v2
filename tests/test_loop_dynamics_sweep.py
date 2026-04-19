@@ -193,6 +193,14 @@ def test_parse_args_falls_back_to_legacy_default_vae_checkpoint() -> None:
     assert args.vae_checkpoint == str(loop_dynamics_sweep.LEGACY_DEFAULT_VAE_CHECKPOINT)
 
 
+def test_parse_args_uses_learning_rate_warmup_default() -> None:
+    """The sweep helper should default to the shared LR warmup duration."""
+
+    with patch.object(sys, "argv", ["loop_dynamics_sweep.py"]):
+        args = loop_dynamics_sweep.parse_args()
+    assert args.lr_warmup_steps == 300
+
+
 def test_build_command_preserves_open_rollout_validation_metric() -> None:
     """The sweep helper should forward the requested validation metric to training runs."""
 
@@ -403,6 +411,30 @@ def test_build_command_preserves_self_forcing_warmup_steps() -> None:
     assert "--dynamics-self-forcing-warmup-steps" in command
     warmup_index = command.index("--dynamics-self-forcing-warmup-steps")
     assert command[warmup_index + 1] == "125"
+
+
+def test_build_command_preserves_learning_rate_warmup_steps() -> None:
+    """The sweep helper should forward LR warmup steps explicitly."""
+
+    with patch.object(sys, "argv", ["loop_dynamics_sweep.py"]):
+        args = loop_dynamics_sweep.parse_args()
+    args.lr_warmup_steps = 175
+    command = loop_dynamics_sweep.build_command(
+        args=args,
+        spec=loop_dynamics_sweep.SweepSpec(
+            frame_start=48,
+            frame_end=67,
+            infer_steps=32,
+            batch_size=1,
+            max_steps=10,
+            lr=1e-4,
+        ),
+        run_name="smoke",
+        load_dynamics=None,
+    )
+    assert "--lr-warmup-steps" in command
+    warmup_index = command.index("--lr-warmup-steps")
+    assert command[warmup_index + 1] == "175"
 
 
 def test_build_command_preserves_self_forcing_ramp_steps() -> None:

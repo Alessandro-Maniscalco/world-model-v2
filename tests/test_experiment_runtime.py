@@ -20,6 +20,9 @@ from world_model_v2.experiment import (
 )
 
 
+pytestmark = pytest.mark.slow
+
+
 DEBUG_FRAME_KWARGS = {"frame_start": 111, "frame_end": 123}
 DYNAMICS_FIVE_FRAME_KWARGS = {"frame_start": 111, "frame_end": 123}
 DYNAMICS_TWO_FRAME_KWARGS = {"frame_start": 111, "frame_end": 115}
@@ -50,6 +53,7 @@ def test_wan_ae_only_training_step_reports_kl_terms(
         "recon_l1",
         "edge_l1",
         "motion_l1",
+        "motion_edge_l1",
         "motion_mask_fraction",
         "kl_loss",
         "ae_loss",
@@ -151,7 +155,9 @@ def test_wan_experiment_run_writes_artifacts_for_each_mode(
         json.loads(line)
         for line in (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
     ]
+    training_record = next(record for record in metrics_records if record.get("step") == 1 and "loss" in record)
     validation_record = next(record for record in metrics_records if "validation" in record)
+    assert training_record["learning_rate"] == pytest.approx(config.lr / config.lr_warmup_steps)
     assert validation_record["validation"]["elapsed_run_seconds"] >= 0.0
     assert saved_stats["checkpoint"] == str(run_dir / "checkpoints" / "last.pt")
     assert saved_stats["best_checkpoint"] == str(run_dir / "checkpoints" / "best.pt")
@@ -160,6 +166,7 @@ def test_wan_experiment_run_writes_artifacts_for_each_mode(
         run_dir / "checkpoints" / "best.pt"
     )
     assert '"elapsed_run_seconds"' in captured.out
+    assert '"learning_rate"' in captured.out
     if mode == "ae_only":
         assert '"kl_loss"' in payload
     else:
@@ -595,6 +602,56 @@ def test_resume_applies_requested_learning_rate_override(
         )
     )
 
+    assert all(group["lr"] == pytest.approx(1e-5) for group in resumed_experiment.optimizer.param_groups)
+
+
+def test_resume_run_skips_learning_rate_warmup(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Resumed runs should train at the configured full LR instead of restarting warmup."""
+
+    initial_config = ExperimentConfig(
+        mode="dynamics_only",
+        data_root=str(fake_long_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="resume_lr_metric_source",
+        **DYNAMICS_FIVE_FRAME_KWARGS,
+        max_steps=1,
+        validation_interval=1,
+        checkpoint_interval=1,
+        device="cpu",
+        lr=2e-5,
+        load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+    )
+    initial_experiment = Experiment(initial_config)
+    initial_experiment.run()
+    source_run_dir = tmp_path / "outputs" / "resume_lr_metric_source"
+
+    resumed_experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="resume_lr_metric_target",
+            **DYNAMICS_FIVE_FRAME_KWARGS,
+            max_steps=2,
+            validation_interval=0,
+            checkpoint_interval=0,
+            early_stop_window_size=0,
+            device="cpu",
+            lr=1e-5,
+            resume=str(source_run_dir / "checkpoints" / "best.pt"),
+        )
+    )
+    resumed_experiment.run()
+
+    metrics_path = tmp_path / "outputs" / "resume_lr_metric_target" / "metrics.jsonl"
+    metrics_records = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
+    training_record = next(record for record in metrics_records if record.get("step") == 2 and "loss" in record)
+
+    assert training_record["learning_rate"] == pytest.approx(1e-5)
     assert all(group["lr"] == pytest.approx(1e-5) for group in resumed_experiment.optimizer.param_groups)
 
 

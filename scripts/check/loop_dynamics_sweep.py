@@ -112,6 +112,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--infer-steps", action="append", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr-warmup-steps", type=int, default=300)
     parser.add_argument("--max-steps", type=int, default=10000)
     parser.add_argument("--validation-interval", type=int, default=500)
     parser.add_argument("--checkpoint-interval", type=int, default=500)
@@ -379,6 +380,8 @@ def build_command(
         str(spec.batch_size),
         "--lr",
         str(spec.lr),
+        "--lr-warmup-steps",
+        str(args.lr_warmup_steps),
         "--max-steps",
         str(spec.max_steps),
         "--validation-interval",

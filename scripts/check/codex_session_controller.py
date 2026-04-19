@@ -450,12 +450,12 @@ def capture_repo_code_snapshot() -> dict[str, str]:
                 file_path = current_dir / filename
                 if file_path.suffix in IGNORED_SNAPSHOT_SUFFIXES:
                     continue
-                relative_path = str(file_path.relative_to(REPO_ROOT))
+                relative_path = file_path.relative_to(REPO_ROOT).as_posix()
                 snapshot[relative_path] = hash_file(file_path)
     for file_name in CODE_SNAPSHOT_TOP_LEVEL_FILES:
         file_path = REPO_ROOT / file_name
         if file_path.exists() and file_path.is_file():
-            snapshot[str(file_path.relative_to(REPO_ROOT))] = hash_file(file_path)
+            snapshot[file_path.relative_to(REPO_ROOT).as_posix()] = hash_file(file_path)
     return snapshot
 
 
