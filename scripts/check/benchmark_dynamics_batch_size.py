@@ -1,8 +1,8 @@
-"""Benchmark short RF-DiT training steps across candidate batch sizes.
+"""Benchmark one short RF-DiT throughput step across candidate batch sizes.
 
-This smoke-check helper loads a real `dynamics_only` experiment, runs one warmup
-step plus a few measured training steps for each requested batch size, and
-reports the fastest stable throughput without relying on `--auto-batch-size`.
+This smoke-check helper loads a real `dynamics_only` experiment, runs a single
+measured training step for each requested batch size, and reports the fastest
+throughput snapshot without relying on `--auto-batch-size`.
 """
 
 from __future__ import annotations
@@ -33,6 +33,8 @@ DEFAULT_CHECKPOINT = REPO_ROOT / "outputs" / "world_model_ae_only_20260418_18311
 DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "so101_base_sim_pickplace_cache"
 DEFAULT_BATCH_SIZES = "1,2,4,8,12,16,20,24,28,32,40,48,64"
 DEFAULT_GRAD_ACCUM_STEPS = "1"
+DEFAULT_WARMUP_STEPS = 0
+DEFAULT_MEASURED_STEPS = 1
 
 
 def parse_positive_int_list(value: str, *, name: str) -> tuple[int, ...]:
@@ -46,7 +48,7 @@ def parse_positive_int_list(value: str, *, name: str) -> tuple[int, ...]:
     return values
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments for the dynamics batch-size benchmark."""
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -57,8 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--grad-accum-steps-list", default=DEFAULT_GRAD_ACCUM_STEPS)
     parser.add_argument("--dataloader-num-workers", type=int, default=1)
-    parser.add_argument("--warmup-steps", type=int, default=1)
-    parser.add_argument("--measured-steps", type=int, default=2)
+    parser.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS)
+    parser.add_argument("--measured-steps", type=int, default=DEFAULT_MEASURED_STEPS)
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -78,7 +80,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wan-dim", type=int, default=64)
     parser.add_argument("--latent-channels", type=int, default=16)
     parser.add_argument("--wan-num-res-blocks", type=int, default=1)
+    parser.add_argument("--hidden-channels", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr-warmup-steps", type=int, default=200)
     parser.add_argument("--max-steps", type=int, default=80000)
     parser.add_argument("--validation-interval", type=int, default=250)
     parser.add_argument("--checkpoint-interval", type=int, default=50)
@@ -86,8 +90,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stop-patience-windows", type=int, default=20)
     parser.add_argument("--dynamics-context-frames", type=int, default=1)
     parser.add_argument("--dynamics-target-frames", type=int, default=3)
+    parser.add_argument("--dynamics-patch-spatial", type=int, default=1)
+    parser.add_argument("--dynamics-model-channels", type=int, default=256)
+    parser.add_argument("--dynamics-num-blocks", type=int, default=4)
+    parser.add_argument("--dynamics-num-heads", type=int, default=4)
+    parser.add_argument("--dynamics-action-conditioning-mode", default="chunk_per_frame")
+    parser.add_argument("--dynamics-action-representation", default="dataset_default")
+    parser.add_argument("--dynamics-action-scale", type=float, default=20.0)
+    parser.add_argument("--dynamics-adaln-lora-dim", type=int, default=64)
+    parser.add_argument("--dynamics-infer-steps", type=int, default=16)
+    parser.add_argument("--dynamics-train-timesteps", type=int, default=1000)
+    parser.add_argument("--dynamics-rf-shift", type=float, default=5.0)
+    parser.add_argument("--dynamics-validation-metric", default="next_frame_mse")
+    parser.add_argument(
+        "--dynamics-run-open-rollout-validation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--seed", type=int, default=7)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def build_config(args: argparse.Namespace, *, batch_size: int, run_name: str) -> ExperimentConfig:
@@ -109,10 +130,12 @@ def build_config(args: argparse.Namespace, *, batch_size: int, run_name: str) ->
         wan_dim=int(args.wan_dim),
         latent_channels=int(args.latent_channels),
         wan_num_res_blocks=int(args.wan_num_res_blocks),
+        hidden_channels=int(args.hidden_channels),
         batch_size=max(int(batch_size), 1),
         gradient_accumulation_steps=max(int(args.grad_accum_steps), 1),
         dataloader_num_workers=max(int(args.dataloader_num_workers), 0),
         lr=float(args.lr),
+        lr_warmup_steps=max(int(args.lr_warmup_steps), 0),
         max_steps=int(args.max_steps),
         validation_interval=int(args.validation_interval),
         checkpoint_interval=int(args.checkpoint_interval),
@@ -120,6 +143,19 @@ def build_config(args: argparse.Namespace, *, batch_size: int, run_name: str) ->
         early_stop_patience_windows=int(args.early_stop_patience_windows),
         dynamics_context_frames=int(args.dynamics_context_frames),
         dynamics_target_frames=int(args.dynamics_target_frames),
+        dynamics_patch_spatial=int(args.dynamics_patch_spatial),
+        dynamics_model_channels=int(args.dynamics_model_channels),
+        dynamics_num_blocks=int(args.dynamics_num_blocks),
+        dynamics_num_heads=int(args.dynamics_num_heads),
+        dynamics_action_conditioning_mode=str(args.dynamics_action_conditioning_mode),
+        dynamics_action_representation=str(args.dynamics_action_representation),
+        dynamics_action_scale=float(args.dynamics_action_scale),
+        dynamics_adaln_lora_dim=int(args.dynamics_adaln_lora_dim),
+        dynamics_infer_steps=int(args.dynamics_infer_steps),
+        dynamics_train_timesteps=int(args.dynamics_train_timesteps),
+        dynamics_rf_shift=float(args.dynamics_rf_shift),
+        dynamics_validation_metric=str(args.dynamics_validation_metric),
+        dynamics_run_open_rollout_validation=bool(args.dynamics_run_open_rollout_validation),
         load_encoder_decoder=str(Path(args.load_encoder_decoder)),
         run_name=run_name,
         output_dir=str(Path(args.output_dir)),

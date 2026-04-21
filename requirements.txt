@@ -12,3 +12,4 @@ imageio
 imageio-ffmpeg
 gymnasium
 pytest
+wandb

@@ -55,6 +55,7 @@ def test_run_parse_args_uses_expected_defaults() -> None:
     assert config.dynamics_validation_conditioning_frame_choices is None
     assert config.dynamics_open_rollout_context_frames is None
     assert config.dynamics_open_rollout_stride_frames is None
+    assert config.dynamics_patch_spatial == 1
     assert config.dynamics_model_channels == 256
     assert config.dynamics_num_blocks == 4
     assert config.dynamics_num_heads == 4
@@ -81,7 +82,7 @@ def test_run_parse_args_uses_expected_defaults() -> None:
     assert config.dataloader_pin_memory is None
     assert config.auto_batch_size is False
     assert config.lr == 1e-4
-    assert config.lr_warmup_steps == 300
+    assert config.lr_warmup_steps == 200
     assert config.optimizer_beta1 == 0.95
     assert config.validation_interval == 250
     assert config.validation_start_step == 0
@@ -90,6 +91,14 @@ def test_run_parse_args_uses_expected_defaults() -> None:
     assert config.early_stop_patience_windows == 5
     assert config.early_stop_min_delta == 1e-10
     assert config.early_stop_warmup_steps == 300
+    assert config.wandb_enabled is False
+    assert config.wandb_project == "world-model-v2"
+    assert config.wandb_entity == ""
+    assert config.wandb_group == ""
+    assert config.wandb_name == ""
+    assert config.wandb_tags is None
+    assert config.wandb_mode == "online"
+    assert config.wandb_run_id == ""
 
 
 def test_run_build_config_preserves_load_flags() -> None:
@@ -109,6 +118,39 @@ def test_run_build_config_preserves_load_flags() -> None:
     assert config.mode == "dynamics_only"
     assert config.load_encoder_decoder == "encoder_decoder.pt"
     assert config.load_dynamics == "dynamics.pt"
+
+
+def test_run_build_config_preserves_wandb_flags() -> None:
+    """The config builder should keep the requested W&B logging controls."""
+
+    args = parse_args(
+        [
+            "--wandb",
+            "--wandb-project",
+            "wm-v2",
+            "--wandb-entity",
+            "openai",
+            "--wandb-group",
+            "so101",
+            "--wandb-name",
+            "trial-17",
+            "--wandb-tags",
+            "ae,debug",
+            "--wandb-mode",
+            "offline",
+            "--wandb-run-id",
+            "existing-run-id",
+        ]
+    )
+    config = build_config(args)
+    assert config.wandb_enabled is True
+    assert config.wandb_project == "wm-v2"
+    assert config.wandb_entity == "openai"
+    assert config.wandb_group == "so101"
+    assert config.wandb_name == "trial-17"
+    assert config.wandb_tags == ("ae", "debug")
+    assert config.wandb_mode == "offline"
+    assert config.wandb_run_id == "existing-run-id"
 
 
 def test_run_build_config_preserves_validation_start_step() -> None:
@@ -294,6 +336,8 @@ def test_run_build_config_preserves_custom_dynamics_layout_flags() -> None:
             "1",
             "--dynamics-open-rollout-stride-frames",
             "1",
+            "--dynamics-patch-spatial",
+            "2",
         ]
     )
     config = build_config(args)
@@ -304,6 +348,7 @@ def test_run_build_config_preserves_custom_dynamics_layout_flags() -> None:
     assert config.dynamics_validation_conditioning_frame_choices == (1,)
     assert config.dynamics_open_rollout_context_frames == 1
     assert config.dynamics_open_rollout_stride_frames == 1
+    assert config.dynamics_patch_spatial == 2
 
 
 def test_run_build_config_preserves_rollout_consistency_validation_metric() -> None:
@@ -501,6 +546,8 @@ def test_run_build_config_preserves_lerobot_so101_base_sim_pickplace_format() ->
 
     args = parse_args(
         [
+            "--mode",
+            "dynamics_only",
             "--dataset-format",
             "lerobot_so101_base_sim_pickplace",
             "--data-root",
@@ -510,6 +557,30 @@ def test_run_build_config_preserves_lerobot_so101_base_sim_pickplace_format() ->
     config = build_config(args)
     assert config.dataset_format == "lerobot_so101_base_sim_pickplace"
     assert config.data_root == "data/so101_base_sim_pickplace_cache"
+    assert config.resolved_dynamics_action_representation() == "relative_delta"
+    assert config.resolved_dynamics_action_scale() == 20.0
+
+
+def test_run_build_config_allows_explicit_absolute_so101_actions() -> None:
+    """The config builder should preserve explicit action-representation overrides."""
+
+    args = parse_args(
+        [
+            "--dataset-format",
+            "lerobot_so101_base_sim_pickplace",
+            "--dynamics-action-representation",
+            "absolute",
+            "--dynamics-action-scale",
+            "7.5",
+        ]
+    )
+
+    config = build_config(args)
+
+    assert config.dynamics_action_representation == "absolute"
+    assert config.dynamics_action_scale == 7.5
+    assert config.resolved_dynamics_action_representation() == "absolute"
+    assert config.resolved_dynamics_action_scale() == 1.0
 
 
 def test_run_rejects_removed_joint_mode() -> None:

@@ -25,6 +25,7 @@ from world_model_v2.experiment import checkpoint_ae_backend, load_training_check
 from world_model_v2.model import WorldModel
 from world_model_v2.utils.checkpointing import save_json
 from world_model_v2.utils.visualization import build_side_by_side_grid, write_side_by_side_mp4
+from world_model_v2.wan_vae import WanVAEConfig
 
 
 def resolve_image_size(config: dict[str, Any]) -> tuple[int, int]:
@@ -58,6 +59,36 @@ def validate_device(device: torch.device) -> None:
         )
 
 
+def build_checkpoint_wan_config(checkpoint: dict[str, Any]) -> WanVAEConfig:
+    """Rebuild one serialized Wan config, including legacy pre-patchify defaults."""
+
+    autoencoder = checkpoint.get("autoencoder")
+    if not isinstance(autoencoder, dict):
+        raise ValueError("Checkpoint is missing autoencoder metadata.")
+    raw_config = autoencoder.get("config")
+    if not isinstance(raw_config, dict):
+        raise ValueError("Checkpoint is missing the serialized autoencoder config.")
+    payload = dict(raw_config)
+    if "patch_size" not in payload:
+        payload["patch_size"] = 1
+    if "dec_dim" not in payload:
+        payload["dec_dim"] = int(payload.get("dim", 64))
+    if "temporal_window" not in payload:
+        temporal_factor = 2 ** sum(bool(flag) for flag in payload.get("temperal_downsample", []))
+        payload["temporal_window"] = max(1, int(temporal_factor))
+    return WanVAEConfig.from_dict(payload)
+
+
+def checkpoint_latent_normalization_stats(checkpoint: dict[str, Any]) -> dict[str, Any] | None:
+    """Return serialized latent normalization stats when the checkpoint stored them."""
+
+    autoencoder = checkpoint.get("autoencoder")
+    if not isinstance(autoencoder, dict):
+        return None
+    raw_stats = autoencoder.get("normalization_stats")
+    return raw_stats if isinstance(raw_stats, dict) else None
+
+
 def build_model_from_checkpoint(
     checkpoint: dict[str, Any],
     device: torch.device,
@@ -66,6 +97,7 @@ def build_model_from_checkpoint(
 
     config = checkpoint["config"]
     height, width = resolve_image_size(config)
+    wan_config = build_checkpoint_wan_config(checkpoint)
     model = WorldModel(
         latent_channels=int(config["latent_channels"]),
         hidden_channels=int(config["hidden_channels"]),
@@ -73,8 +105,24 @@ def build_model_from_checkpoint(
         resolution=int(config["resolution"]),
         height=height,
         width=width,
+        wan_config=wan_config,
+        latent_normalization_stats=checkpoint_latent_normalization_stats(checkpoint),
     ).to(device)
-    model.load_state_dict(checkpoint["model_state"], strict=True)
+    model_state = checkpoint["model_state"]
+    encoder_state = {
+        key.removeprefix("encoder."): value
+        for key, value in model_state.items()
+        if key.startswith("encoder.")
+    }
+    decoder_state = {
+        key.removeprefix("decoder."): value
+        for key, value in model_state.items()
+        if key.startswith("decoder.")
+    }
+    if not encoder_state or not decoder_state:
+        raise KeyError("Checkpoint is missing encoder or decoder weights.")
+    model.encoder.load_state_dict(encoder_state, strict=True)
+    model.decoder.load_state_dict(decoder_state, strict=True)
     model.eval()
     return model
 

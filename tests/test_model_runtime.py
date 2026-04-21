@@ -12,7 +12,7 @@ from world_model_v2.wan_vae import WanVAEConfig
 
 pytestmark = pytest.mark.slow
 
-TEST_RUNTIME_WAN_CONFIG = WanVAEConfig(dim=16, z_dim=8, num_res_blocks=1)
+TEST_RUNTIME_WAN_CONFIG = WanVAEConfig(dim=16, dec_dim=16, z_dim=48, num_res_blocks=1)
 
 
 def _build_runtime_world_model(
@@ -75,7 +75,7 @@ def test_wan_world_model_preserves_expected_shapes() -> None:
 
 
 def test_wan_world_model_accepts_explicit_action_chunks() -> None:
-    """The Wan model should accept DreamDojo-style four-step action chunks."""
+    """The Wan model should accept DreamDojo-style twelve-step action chunks."""
 
     model = _build_runtime_world_model()
     latent_height = model.image_height // model.spatial_downsample_factor
@@ -146,7 +146,7 @@ def test_wan_world_model_derives_latent_size_from_resolution() -> None:
 def test_wan_world_model_supports_rectangular_inputs() -> None:
     """The Wan model should derive latent height and width for rectangular inputs."""
 
-    model = _build_runtime_world_model(resolution=24, height=24, width=40)
+    model = _build_runtime_world_model(resolution=32, height=32, width=48)
     images = torch.rand(2, 3, model.image_height, model.image_width)
     latents = model.encode(images, deterministic=True)
     reconstructed = model.decode(latents)

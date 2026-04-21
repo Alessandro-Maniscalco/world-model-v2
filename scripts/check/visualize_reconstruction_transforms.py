@@ -62,6 +62,7 @@ from world_model_v2.reconstruction_diagnostics import (
 )
 from world_model_v2.utils.checkpointing import save_json
 from world_model_v2.utils.visualization import build_side_by_side_grid, write_side_by_side_mp4
+from world_model_v2.wan_vae import WanVAEConfig
 
 
 def parse_optional_int_tuple(value: Any) -> tuple[int, ...] | None:
@@ -203,6 +204,36 @@ def build_checkpoint_config(checkpoint: dict[str, Any]) -> ExperimentConfig:
     )
 
 
+def build_checkpoint_wan_config(checkpoint: dict[str, Any]) -> WanVAEConfig:
+    """Rebuild one serialized Wan config, including legacy pre-patchify defaults."""
+
+    autoencoder = checkpoint.get("autoencoder")
+    if not isinstance(autoencoder, dict):
+        raise ValueError("Checkpoint is missing autoencoder metadata.")
+    raw_config = autoencoder.get("config")
+    if not isinstance(raw_config, dict):
+        raise ValueError("Checkpoint is missing the serialized autoencoder config.")
+    payload = dict(raw_config)
+    if "patch_size" not in payload:
+        payload["patch_size"] = 1
+    if "dec_dim" not in payload:
+        payload["dec_dim"] = int(payload.get("dim", 64))
+    if "temporal_window" not in payload:
+        temporal_factor = 2 ** sum(bool(flag) for flag in payload.get("temperal_downsample", []))
+        payload["temporal_window"] = max(1, int(temporal_factor))
+    return WanVAEConfig.from_dict(payload)
+
+
+def checkpoint_latent_normalization_stats(checkpoint: dict[str, Any]) -> dict[str, Any] | None:
+    """Return serialized latent normalization stats when the checkpoint stored them."""
+
+    autoencoder = checkpoint.get("autoencoder")
+    if not isinstance(autoencoder, dict):
+        return None
+    raw_stats = autoencoder.get("normalization_stats")
+    return raw_stats if isinstance(raw_stats, dict) else None
+
+
 def build_model_from_checkpoint(
     checkpoint: dict[str, Any],
     cfg: ExperimentConfig,
@@ -210,6 +241,7 @@ def build_model_from_checkpoint(
 ) -> WorldModel:
     """Instantiate the stored model topology and load the saved state dict."""
 
+    wan_config = build_checkpoint_wan_config(checkpoint)
     model = WorldModel(
         latent_channels=cfg.latent_channels,
         hidden_channels=cfg.hidden_channels,
@@ -241,6 +273,8 @@ def build_model_from_checkpoint(
         dynamics_adaln_lora_dim=cfg.dynamics_adaln_lora_dim,
         dynamics_rope_t_extrapolation_ratio=cfg.dynamics_rope_t_extrapolation_ratio,
         dynamics_use_learned_temporal_embedding=cfg.dynamics_use_learned_temporal_embedding,
+        wan_config=wan_config,
+        latent_normalization_stats=checkpoint_latent_normalization_stats(checkpoint),
     ).to(device)
     model_state = checkpoint["model_state"]
     encoder_state = {

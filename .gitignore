@@ -33,3 +33,7 @@ assets/**
 !/saved_checkpoints/github/
 /saved_checkpoints/github/*
 !/saved_checkpoints/github/vae_pickplace_z32_8x.pt
+!/saved_checkpoints/old/
+/saved_checkpoints/old/**
+!/saved_checkpoints/old/**/
+!/saved_checkpoints/old/**/*.md

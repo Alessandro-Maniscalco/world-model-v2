@@ -15,7 +15,7 @@ import random
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import torch
@@ -36,12 +36,14 @@ from world_model_v2.dynamics_transformer import (
 )
 from world_model_v2.dynamics_transformer import DynamicsTrainingInputs
 from world_model_v2.lerobot_video_dataset import (
+    LEROBOT_ACTION_REPRESENTATIONS,
     LeRobotVideoAutoencoderClipDataset,
     LeRobotVideoTransitionDataset,
     LeRobotVideoValidationClipDataset,
     SO101_BASE_SIM_PICKPLACE_ACTION_DIM,
     SO101_BASE_SIM_PICKPLACE_DATASET_ID,
     SO101_BASE_SIM_PICKPLACE_IMAGE_COLUMN,
+    SO101_RELATIVE_ACTION_SCALE,
 )
 from world_model_v2.maniskill_dataset import (
     MANISKILL_DEFAULT_ACTION_DIM,
@@ -68,11 +70,14 @@ from world_model_v2.metaworld_dataset import (
 from world_model_v2.model import LatentNormalizationStats, WorldModel
 from world_model_v2.utils.checkpointing import append_jsonl, save_json
 from world_model_v2.utils.visualization import build_side_by_side_grid, write_side_by_side_mp4
+from world_model_v2.wandb_logger import WandbRunLogger
 from world_model_v2.wan_vae import (
     DEFAULT_WAN_DIM,
     DEFAULT_WAN_NUM_RES_BLOCKS,
     DEFAULT_WAN_Z_DIM,
     WanVAEConfig,
+    dreamdojo_wan_state_dict,
+    remap_dreamdojo_wan_state_dict,
 )
 
 
@@ -99,12 +104,95 @@ _TORCH_SAVE_ZIP_WRITE_FAILURE_MARKERS = (
     "PytorchStreamWriter failed writing file",
     "unexpected pos",
 )
+_REGENERABLE_CHECKPOINT_STATE_KEYS = frozenset({"net.pos_embedder.seq"})
+DYNAMICS_ACTION_REPRESENTATION_CHOICES = ("dataset_default", *LEROBOT_ACTION_REPRESENTATIONS)
 
 
 def validation_metric_requires_open_rollout(metric_name: str) -> bool:
     """Return whether one validation metric depends on open-rollout stats."""
 
     return metric_name in _OPEN_ROLLOUT_VALIDATION_METRICS
+
+
+def resolve_dynamics_action_representation(
+    *,
+    mode: str,
+    dataset_format: str,
+    action_representation: str,
+) -> str:
+    """Resolve one configured action representation into the effective runtime mode."""
+
+    if action_representation not in DYNAMICS_ACTION_REPRESENTATION_CHOICES:
+        raise ValueError(
+            f"Unsupported dynamics_action_representation={action_representation!r}. "
+            f"Expected one of {DYNAMICS_ACTION_REPRESENTATION_CHOICES}."
+        )
+    if action_representation != "dataset_default":
+        return action_representation
+    if mode == "dynamics_only" and dataset_format == "lerobot_so101_base_sim_pickplace":
+        return "relative_delta"
+    return "absolute"
+
+
+def resolve_dynamics_action_scale(
+    *,
+    mode: str,
+    dataset_format: str,
+    action_representation: str,
+    action_scale: float,
+) -> float:
+    """Resolve the effective action scaling after representation selection."""
+
+    resolved_representation = resolve_dynamics_action_representation(
+        mode=mode,
+        dataset_format=dataset_format,
+        action_representation=action_representation,
+    )
+    if resolved_representation == "absolute":
+        return 1.0
+    resolved_scale = float(action_scale)
+    if resolved_scale <= 0.0:
+        raise ValueError("dynamics_action_scale must be positive when using relative actions.")
+    return resolved_scale
+
+
+def resolved_dynamics_action_representation_from_config(
+    config: Mapping[str, Any],
+    *,
+    mode_override: str | None = None,
+) -> str:
+    """Resolve the effective action representation from serialized config data."""
+
+    resolved_mode = (
+        str(mode_override)
+        if mode_override is not None
+        else str(config.get("mode", "ae_only"))
+    )
+    return resolve_dynamics_action_representation(
+        mode=resolved_mode,
+        dataset_format=str(config.get("dataset_format", "interactive_world_sim")),
+        action_representation=str(config.get("dynamics_action_representation", "absolute")),
+    )
+
+
+def resolved_dynamics_action_scale_from_config(
+    config: Mapping[str, Any],
+    *,
+    mode_override: str | None = None,
+) -> float:
+    """Resolve the effective action scale from serialized config data."""
+
+    resolved_mode = (
+        str(mode_override)
+        if mode_override is not None
+        else str(config.get("mode", "ae_only"))
+    )
+    return resolve_dynamics_action_scale(
+        mode=resolved_mode,
+        dataset_format=str(config.get("dataset_format", "interactive_world_sim")),
+        action_representation=str(config.get("dynamics_action_representation", "absolute")),
+        action_scale=float(config.get("dynamics_action_scale", SO101_RELATIVE_ACTION_SCALE)),
+    )
 
 
 def is_retryable_torch_save_zip_error(error: RuntimeError) -> bool:
@@ -127,6 +215,33 @@ def remove_file_with_retries(path: Path, *, retries: int = 5, delay_seconds: flo
                 raise
             gc.collect()
             time.sleep(delay_seconds)
+
+
+def replace_file_with_retries(
+    source: Path,
+    destination: Path,
+    *,
+    retries: int = 5,
+    delay_seconds: float = 0.1,
+) -> None:
+    """Atomically replace one file while tolerating short-lived Windows file-handle lag."""
+
+    resolved_retries = max(int(retries), 1)
+    for attempt in range(resolved_retries):
+        try:
+            source.replace(destination)
+            return
+        except PermissionError:
+            if attempt + 1 >= resolved_retries:
+                raise
+            gc.collect()
+            time.sleep(delay_seconds)
+
+
+def temporary_checkpoint_path(path: Path) -> Path:
+    """Return one same-directory temporary checkpoint path for atomic save-and-replace."""
+
+    return path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
 
 
 def resolved_training_autocast_dtype(device: torch.device) -> torch.dtype | None:
@@ -193,10 +308,13 @@ class ExperimentConfig:
     dynamics_validation_conditioning_frame_choices: tuple[int, ...] | None = None
     dynamics_open_rollout_context_frames: int | None = None
     dynamics_open_rollout_stride_frames: int | None = None
+    dynamics_patch_spatial: int = 1
     dynamics_model_channels: int = 256
     dynamics_num_blocks: int = 4
     dynamics_num_heads: int = 4
     dynamics_action_conditioning_mode: str = "chunk_per_frame"
+    dynamics_action_representation: str = "dataset_default"
+    dynamics_action_scale: float = SO101_RELATIVE_ACTION_SCALE
     dynamics_zero_init_action_embedder: bool = False
     dynamics_use_adaln_lora: bool = True
     dynamics_adaln_lora_dim: int = 64
@@ -236,6 +354,14 @@ class ExperimentConfig:
     resume: str = ""
     load_encoder_decoder: str = ""
     load_dynamics: str = ""
+    wandb_enabled: bool = False
+    wandb_project: str = "world-model-v2"
+    wandb_entity: str = ""
+    wandb_group: str = ""
+    wandb_name: str = ""
+    wandb_tags: tuple[str, ...] | None = None
+    wandb_mode: str = "online"
+    wandb_run_id: str = ""
     seed: int = 7
 
     def to_dict(self) -> dict[str, Any]:
@@ -262,6 +388,16 @@ class ExperimentConfig:
             "resolution": self.resolution,
             "height": self.resolved_height(),
             "width": self.resolved_width(),
+            "dynamics_action_representation": (
+                self.resolved_dynamics_action_representation()
+                if self.mode == "dynamics_only"
+                else None
+            ),
+            "dynamics_action_scale": (
+                self.resolved_dynamics_action_scale()
+                if self.mode == "dynamics_only"
+                else None
+            ),
         }
 
     def resolved_split(self) -> str:
@@ -342,6 +478,25 @@ class ExperimentConfig:
         return DynamicsFrameLayout(
             context_frames=self.dynamics_context_frames,
             target_frames=self.dynamics_target_frames,
+        )
+
+    def resolved_dynamics_action_representation(self) -> str:
+        """Return the effective action representation used by dynamics datasets."""
+
+        return resolve_dynamics_action_representation(
+            mode=self.mode,
+            dataset_format=self.dataset_format,
+            action_representation=self.dynamics_action_representation,
+        )
+
+    def resolved_dynamics_action_scale(self) -> float:
+        """Return the effective action scale used by dynamics datasets."""
+
+        return resolve_dynamics_action_scale(
+            mode=self.mode,
+            dataset_format=self.dataset_format,
+            action_representation=self.dynamics_action_representation,
+            action_scale=self.dynamics_action_scale,
         )
 
 
@@ -544,6 +699,7 @@ def save_training_checkpoint(
 
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = temporary_checkpoint_path(output_path)
     payload = {
         "kind": WORLD_MODEL_CHECKPOINT_KIND,
         "model_state": model.state_dict(),
@@ -560,14 +716,32 @@ def save_training_checkpoint(
         "dynamics_backend": model.dynamics_backend,
         "dynamics": model.dynamics_config(),
     }
+    temp_save_succeeded = False
     try:
-        torch.save(payload, output_path)
+        try:
+            torch.save(payload, temp_path)
+        except RuntimeError as error:
+            if not is_retryable_torch_save_zip_error(error):
+                raise
+            gc.collect()
+            remove_file_with_retries(temp_path)
+            torch.save(payload, temp_path, _use_new_zipfile_serialization=False)
+        temp_save_succeeded = True
+        replace_file_with_retries(temp_path, output_path)
     except RuntimeError as error:
-        if not is_retryable_torch_save_zip_error(error):
-            raise
-        gc.collect()
-        remove_file_with_retries(output_path)
-        torch.save(payload, output_path, _use_new_zipfile_serialization=False)
+        if not temp_save_succeeded:
+            try:
+                remove_file_with_retries(temp_path)
+            except PermissionError:
+                pass
+        raise
+    except Exception:
+        if not temp_save_succeeded:
+            try:
+                remove_file_with_retries(temp_path)
+            except PermissionError:
+                pass
+        raise
 
 
 def load_training_checkpoint(path: str | Path, device: torch.device | str) -> dict[str, Any]:
@@ -656,6 +830,7 @@ class Experiment:
         """Build datasets, model, optimizer, and run directories."""
 
         self.cfg = cfg
+        self._cached_encoder_decoder_source: tuple[str, Any] | None = None
         self._validate_config()
         self._set_seed(cfg.seed)
         self.device = torch.device(cfg.device)
@@ -686,6 +861,7 @@ class Experiment:
             dynamics_validation_conditioning_frame_choices=cfg.dynamics_validation_conditioning_frame_choices,
             dynamics_open_rollout_context_frames=cfg.dynamics_open_rollout_context_frames,
             dynamics_open_rollout_stride_frames=cfg.dynamics_open_rollout_stride_frames,
+            dynamics_patch_spatial=cfg.dynamics_patch_spatial,
             dynamics_model_channels=cfg.dynamics_model_channels,
             dynamics_num_blocks=cfg.dynamics_num_blocks,
             dynamics_num_heads=cfg.dynamics_num_heads,
@@ -737,6 +913,7 @@ class Experiment:
         self.early_stop_observations = 0
         self._resume_validation_setup_matches = True
         self.run_started_at_monotonic: float | None = None
+        self.wandb_logger: WandbRunLogger | None = None
         if cfg.resume:
             self.current_step = self._load_resume()
 
@@ -766,7 +943,7 @@ class Experiment:
             raise RuntimeError("CUDA was requested but is not available to PyTorch.")
 
     def _requested_wan_config(self) -> WanVAEConfig:
-        """Return the fixed local Wan2.1-style tokenizer config requested by the run."""
+        """Return the Wan 2.2 tokenizer config requested by the run."""
 
         return WanVAEConfig(
             dim=self.cfg.wan_dim,
@@ -774,34 +951,51 @@ class Experiment:
             num_res_blocks=self.cfg.wan_num_res_blocks,
         )
 
+    def _load_encoder_decoder_source(self) -> tuple[str, Any]:
+        """Load and cache the requested encoder-decoder source checkpoint."""
+
+        if not self.cfg.load_encoder_decoder:
+            raise ValueError("load_encoder_decoder is empty.")
+        if self._cached_encoder_decoder_source is not None:
+            return self._cached_encoder_decoder_source
+        path = self.cfg.load_encoder_decoder
+        try:
+            source: tuple[str, Any] = ("world_model", load_training_checkpoint(path, self.device))
+        except ValueError:
+            payload = torch.load(Path(path), map_location=self.device, weights_only=False)
+            state_dict = dreamdojo_wan_state_dict(payload)
+            if state_dict is None:
+                raise ValueError(
+                    f"{path} is neither a supported world-model checkpoint nor a raw DreamDojo Wan 2.2 state dict."
+                ) from None
+            source = ("dreamdojo_raw", state_dict)
+        self._cached_encoder_decoder_source = source
+        return source
+
+    def _assert_requested_wan_matches_dreamdojo_raw_checkpoint(self, path: str | Path) -> WanVAEConfig:
+        """Require the active tokenizer config to match the raw DreamDojo Wan 2.2 checkpoint."""
+
+        requested_config = self._requested_wan_config()
+        if not requested_config.is_dreamdojo_exact():
+            raise ValueError(
+                f"Raw DreamDojo Wan 2.2 weights from {path} require the exact tokenizer config "
+                f"{WanVAEConfig().to_dict()}, received {requested_config.to_dict()}."
+            )
+        return requested_config
+
     def _assert_checkpoint_wan_shape_matches_requested(
         self,
         checkpoint_config: WanVAEConfig,
         path: str | Path,
     ) -> None:
-        """Reject checkpoints whose CLI-exposed Wan shape differs from the request."""
+        """Reject checkpoints whose Wan tokenizer config differs from the request."""
 
         requested_config = self._requested_wan_config()
-        mismatches: list[str] = []
-        if checkpoint_config.dim != requested_config.dim:
-            mismatches.append(
-                f"dim checkpoint={checkpoint_config.dim} requested={requested_config.dim}"
-            )
-        if checkpoint_config.z_dim != requested_config.z_dim:
-            mismatches.append(
-                f"z_dim checkpoint={checkpoint_config.z_dim} requested={requested_config.z_dim}"
-            )
-        if checkpoint_config.num_res_blocks != requested_config.num_res_blocks:
-            mismatches.append(
-                "num_res_blocks "
-                f"checkpoint={checkpoint_config.num_res_blocks} "
-                f"requested={requested_config.num_res_blocks}"
-            )
-        if mismatches:
-            mismatch_text = ", ".join(mismatches)
+        if checkpoint_config.to_dict() != requested_config.to_dict():
             raise ValueError(
-                f"Checkpoint autoencoder config from {path} does not match the requested "
-                f"Wan temporal tokenizer shape: {mismatch_text}."
+                f"Checkpoint autoencoder config from {path} does not match the requested Wan 2.2 "
+                "tokenizer config. Older approximate 2x-temporal tokenizer checkpoints are not "
+                "load-compatible with the DreamDojo-exact Wan 2.2 port."
             )
 
     def _extract_checkpoint_autoencoder_metadata(
@@ -856,18 +1050,23 @@ class Experiment:
             )
             return checkpoint_config, checkpoint_stats
         if self.cfg.load_encoder_decoder:
-            checkpoint = load_training_checkpoint(self.cfg.load_encoder_decoder, self.device)
-            checkpoint_config, checkpoint_stats = self._extract_checkpoint_autoencoder_metadata(
-                checkpoint,
-                self.cfg.load_encoder_decoder,
-                require_stats=True,
+            source_kind, source_payload = self._load_encoder_decoder_source()
+            if source_kind == "world_model":
+                checkpoint_config, checkpoint_stats = self._extract_checkpoint_autoencoder_metadata(
+                    source_payload,
+                    self.cfg.load_encoder_decoder,
+                    require_stats=True,
+                )
+                self._assert_checkpoint_wan_shape_matches_requested(
+                    checkpoint_config,
+                    self.cfg.load_encoder_decoder,
+                )
+                return checkpoint_config, checkpoint_stats
+            requested_config = self._assert_requested_wan_matches_dreamdojo_raw_checkpoint(
+                self.cfg.load_encoder_decoder
             )
-            self._assert_checkpoint_wan_shape_matches_requested(
-                checkpoint_config,
-                self.cfg.load_encoder_decoder,
-            )
-            return checkpoint_config, checkpoint_stats
-        return requested_config, LatentNormalizationStats.identity(requested_config.z_dim)
+            return requested_config, LatentNormalizationStats.default_for_channels(requested_config.z_dim)
+        return requested_config, LatentNormalizationStats.default_for_channels(requested_config.z_dim)
 
     def _validate_config(self) -> None:
         """Validate mode-specific flag combinations before work begins."""
@@ -950,6 +1149,8 @@ class Experiment:
             raise ValueError("dynamics_context_frames must be positive.")
         if self.cfg.dynamics_target_frames < 1:
             raise ValueError("dynamics_target_frames must be positive.")
+        if self.cfg.dynamics_patch_spatial < 1:
+            raise ValueError("dynamics_patch_spatial must be positive.")
         if self.cfg.dynamics_model_channels < 1:
             raise ValueError("dynamics_model_channels must be positive.")
         if self.cfg.dynamics_num_blocks < 1:
@@ -961,6 +1162,27 @@ class Experiment:
                 "dynamics_action_conditioning_mode must be 'chunk_per_frame' for the "
                 "DreamDojo-mechanics RF DiT."
             )
+        if self.cfg.dynamics_action_representation not in DYNAMICS_ACTION_REPRESENTATION_CHOICES:
+            raise ValueError(
+                "dynamics_action_representation must be one of "
+                f"{DYNAMICS_ACTION_REPRESENTATION_CHOICES}."
+            )
+        resolved_action_representation = self.cfg.resolved_dynamics_action_representation()
+        resolved_action_scale = self.cfg.resolved_dynamics_action_scale()
+        if self.cfg.mode != "dynamics_only" and resolved_action_representation != "absolute":
+            raise ValueError(
+                "Relative dynamics actions are only meaningful in mode dynamics_only."
+            )
+        if (
+            resolved_action_representation != "absolute"
+            and self.cfg.dataset_format != "lerobot_so101_base_sim_pickplace"
+        ):
+            raise ValueError(
+                "Relative dynamics actions are currently only implemented for "
+                "dataset_format='lerobot_so101_base_sim_pickplace'."
+            )
+        if resolved_action_representation == "relative_delta" and resolved_action_scale <= 0.0:
+            raise ValueError("dynamics_action_scale must be positive for relative dynamics actions.")
         if not self.cfg.dynamics_use_adaln_lora:
             raise ValueError("dynamics_use_adaln_lora must be enabled for the DreamDojo-mechanics RF DiT.")
         if self.cfg.dynamics_adaln_lora_dim < 1:
@@ -1042,6 +1264,12 @@ class Experiment:
             )
         if self.cfg.dataloader_prefetch_factor < 1:
             raise ValueError("dataloader_prefetch_factor must be greater than or equal to one.")
+        if self.cfg.wandb_enabled and not self.cfg.wandb_project.strip():
+            raise ValueError("wandb_project must be non-empty when wandb logging is enabled.")
+        if self.cfg.wandb_mode not in {"online", "offline"}:
+            raise ValueError("wandb_mode must be 'online' or 'offline'.")
+        if self.cfg.wandb_run_id and not self.cfg.wandb_run_id.strip():
+            raise ValueError("wandb_run_id must be non-empty when provided.")
         if self.cfg.dataset_format == "lerobot_metaworld":
             if self.cfg.split not in {"train", "val"}:
                 raise ValueError("MetaWorld MT50 only supports train/val aliases for split.")
@@ -1200,6 +1428,8 @@ class Experiment:
             dataset_kwargs["rollout_chunks"] = self.cfg.dynamics_self_forcing_rollout_chunks
             dataset_kwargs["all_episodes"] = self.cfg.train_all_episodes
             dataset_kwargs["exclude_episodes"] = exclude_episodes
+            dataset_kwargs["action_representation"] = self.cfg.resolved_dynamics_action_representation()
+            dataset_kwargs["action_scale"] = self.cfg.resolved_dynamics_action_scale()
             return LeRobotVideoTransitionDataset(**dataset_kwargs)
         if self.cfg.dataset_format == "maniskill_replay":
             dataset_kwargs = {
@@ -1335,6 +1565,8 @@ class Experiment:
                 width=self.cfg.width,
                 repo_id=SO101_BASE_SIM_PICKPLACE_DATASET_ID,
                 image_column=SO101_BASE_SIM_PICKPLACE_IMAGE_COLUMN,
+                action_representation=self.cfg.resolved_dynamics_action_representation(),
+                action_scale=self.cfg.resolved_dynamics_action_scale(),
             )
         if self.cfg.dataset_format == "maniskill_replay":
             return ManiSkillValidationClipDataset(
@@ -2008,6 +2240,32 @@ class Experiment:
         checkpoint_config = checkpoint_dynamics.get("config")
         if not isinstance(checkpoint_config, dict):
             return
+        root_checkpoint_config = checkpoint.get("config")
+        if not isinstance(root_checkpoint_config, dict):
+            root_checkpoint_config = {}
+        checkpoint_mode = str(checkpoint.get("mode", root_checkpoint_config.get("mode", self.cfg.mode)))
+        checkpoint_action_representation = resolved_dynamics_action_representation_from_config(
+            root_checkpoint_config,
+            mode_override=checkpoint_mode,
+        )
+        active_action_representation = self.cfg.resolved_dynamics_action_representation()
+        if checkpoint_action_representation != active_action_representation:
+            raise ValueError(
+                "Checkpoint dynamics action representation from "
+                f"{path} resolves to {checkpoint_action_representation!r}, but the active run "
+                f"uses {active_action_representation!r}. Old absolute-action checkpoints are not "
+                "compatible with the new relative-action SO101 dynamics path."
+            )
+        checkpoint_action_scale = resolved_dynamics_action_scale_from_config(
+            root_checkpoint_config,
+            mode_override=checkpoint_mode,
+        )
+        active_action_scale = self.cfg.resolved_dynamics_action_scale()
+        if not math.isclose(checkpoint_action_scale, active_action_scale, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(
+                f"Checkpoint dynamics action scale={checkpoint_action_scale} from {path} does not "
+                f"match the requested action scale={active_action_scale}."
+            )
         checkpoint_architecture_version = checkpoint_config.get("architecture_version")
         if checkpoint_architecture_version != DREAMDOJO_DYNAMICS_ARCHITECTURE_VERSION:
             raise ValueError(
@@ -2064,13 +2322,20 @@ class Experiment:
         """Load any optional encoder/decoder or dynamics checkpoint weights."""
 
         if self.cfg.load_encoder_decoder:
-            checkpoint = load_training_checkpoint(self.cfg.load_encoder_decoder, self.device)
-            self._assert_checkpoint_autoencoder_compatible(
-                checkpoint,
-                self.cfg.load_encoder_decoder,
-            )
-            self._load_submodule_state("encoder", self.model.encoder, checkpoint["model_state"])
-            self._load_submodule_state("decoder", self.model.decoder, checkpoint["model_state"])
+            source_kind, source_payload = self._load_encoder_decoder_source()
+            if source_kind == "world_model":
+                checkpoint = source_payload
+                self._assert_checkpoint_autoencoder_compatible(
+                    checkpoint,
+                    self.cfg.load_encoder_decoder,
+                )
+                self._load_submodule_state("encoder", self.model.encoder, checkpoint["model_state"])
+                self._load_submodule_state("decoder", self.model.decoder, checkpoint["model_state"])
+            else:
+                self._assert_requested_wan_matches_dreamdojo_raw_checkpoint(self.cfg.load_encoder_decoder)
+                remapped_state = remap_dreamdojo_wan_state_dict(source_payload)
+                self._load_submodule_state("encoder", self.model.encoder, remapped_state)
+                self._load_submodule_state("decoder", self.model.decoder, remapped_state)
         if self.cfg.load_dynamics:
             checkpoint = load_training_checkpoint(self.cfg.load_dynamics, self.device)
             self._assert_checkpoint_autoencoder_compatible(checkpoint, self.cfg.load_dynamics)
@@ -2101,6 +2366,13 @@ class Experiment:
         }
         if not submodule_state:
             raise KeyError(f"Checkpoint is missing weights for {prefix}.")
+        expected_state = module.state_dict()
+        for key in tuple(submodule_state.keys()):
+            if key not in _REGENERABLE_CHECKPOINT_STATE_KEYS:
+                continue
+            expected_tensor = expected_state.get(key)
+            if expected_tensor is None or tuple(expected_tensor.shape) != tuple(submodule_state[key].shape):
+                submodule_state.pop(key)
         allowed_missing_keys = set() if allowed_missing_keys is None else set(allowed_missing_keys)
         incompatible = module.load_state_dict(submodule_state, strict=False)
         missing_keys = set(incompatible.missing_keys)
@@ -2220,6 +2492,16 @@ class Experiment:
                 if self.cfg.mode != "dynamics_only"
                 or self.model.dynamics.cfg.open_rollout_stride_frames is None
                 else int(self.model.dynamics.cfg.open_rollout_stride_frames)
+            ),
+            "dynamics_action_representation": (
+                self.cfg.resolved_dynamics_action_representation()
+                if self.cfg.mode == "dynamics_only"
+                else None
+            ),
+            "dynamics_action_scale": (
+                self.cfg.resolved_dynamics_action_scale()
+                if self.cfg.mode == "dynamics_only"
+                else None
             ),
         }
 
@@ -2380,6 +2662,26 @@ class Experiment:
                 else checkpoint_dynamics_config.get(
                     "open_rollout_stride_frames",
                     checkpoint_config.get("dynamics_open_rollout_stride_frames"),
+                )
+            ),
+            "dynamics_action_representation": (
+                None
+                if self.cfg.mode != "dynamics_only"
+                else resolved_dynamics_action_representation_from_config(
+                    checkpoint_config,
+                    mode_override=str(
+                        checkpoint.get("mode", checkpoint_config.get("mode", self.cfg.mode))
+                    ),
+                )
+            ),
+            "dynamics_action_scale": (
+                None
+                if self.cfg.mode != "dynamics_only"
+                else resolved_dynamics_action_scale_from_config(
+                    checkpoint_config,
+                    mode_override=str(
+                        checkpoint.get("mode", checkpoint_config.get("mode", self.cfg.mode))
+                    ),
                 )
             ),
         }
@@ -2745,8 +3047,6 @@ class Experiment:
             "loss": total_loss,
             "latent_rf_mse": latent_rf_mse.detach(),
             "target_sigma": dynamics_inputs.target_sigmas.mean().detach(),
-            "conditioning_frames_mean": dynamics_inputs.num_conditional_frames.float().mean().detach(),
-            "use_video_condition_mean": dynamics_inputs.use_video_condition.float().mean().detach(),
             "active_self_forcing_loss_weight": torch.tensor(
                 active_self_forcing_loss_weight,
                 device=latent_rf_mse.device,
@@ -3473,98 +3773,6 @@ class Experiment:
         return aggregated
 
     @torch.no_grad()
-    def _compute_latent_normalization_stats_from_clips(
-        self,
-        clips: list[torch.Tensor],
-    ) -> LatentNormalizationStats:
-        """Compute DreamDojo-style latent normalization stats from full validation clips."""
-
-        if not clips:
-            raise ValueError("Cannot compute latent normalization stats from an empty clip collection.")
-        img_sum = torch.zeros(self.model.latent_channels, device=self.device)
-        img_sum_sq = torch.zeros_like(img_sum)
-        video_sum = torch.zeros_like(img_sum)
-        video_sum_sq = torch.zeros_like(img_sum)
-        img_count = 0
-        video_count = 0
-        window_frames = self.model.latent_frames_to_pixel_frames(self.model.dynamics.cfg.max_frames)
-        stride_frames = self.model.dynamics.cfg.num_action_per_chunk
-        for clip_frames in clips:
-            if clip_frames.ndim != 4:
-                raise ValueError(
-                    "Expected each latent-normalization clip to have shape [frames, channels, height, width]."
-                )
-            frames = clip_frames.unsqueeze(0).to(self.device)
-            image_mu, _ = self.model.encode_posterior(frames[:, 0])
-            img_sum += image_mu.sum(dim=(0, 2, 3))
-            img_sum_sq += image_mu.square().sum(dim=(0, 2, 3))
-            img_count += int(image_mu.shape[0] * image_mu.shape[2] * image_mu.shape[3])
-            total_frames = int(frames.shape[1])
-            for start in range(0, total_frames, stride_frames):
-                actual_stop = min(start + window_frames, total_frames)
-                frame_chunk = frames[:, start:actual_stop]
-                actual_chunk_frames = int(frame_chunk.shape[1])
-                if actual_chunk_frames < window_frames:
-                    pad_frame = frame_chunk[:, -1:].expand(-1, window_frames - actual_chunk_frames, -1, -1, -1)
-                    frame_chunk = torch.cat([frame_chunk, pad_frame], dim=1)
-                video = rearrange(frame_chunk, "b t c h w -> b c t h w")
-                raw_video_mu, _ = self.model.encoder(video)
-                actual_latent_frames = self.model.pixel_frames_to_latent_frames(actual_chunk_frames)
-                unique_latent_start = 0 if start == 0 else 1
-                if actual_latent_frames <= unique_latent_start:
-                    if actual_stop == total_frames:
-                        break
-                    continue
-                unique_video_mu = raw_video_mu[:, :, unique_latent_start:actual_latent_frames]
-                video_sum += unique_video_mu.sum(dim=(0, 2, 3, 4))
-                video_sum_sq += unique_video_mu.square().sum(dim=(0, 2, 3, 4))
-                video_count += int(
-                    unique_video_mu.shape[0]
-                    * unique_video_mu.shape[2]
-                    * unique_video_mu.shape[3]
-                    * unique_video_mu.shape[4]
-                )
-                if actual_stop == total_frames:
-                    break
-
-        def _finalize(sum_tensor: torch.Tensor, sum_sq_tensor: torch.Tensor, count: int) -> tuple[list[float], list[float]]:
-            """Convert accumulated moments into per-channel mean/std lists."""
-
-            mean = sum_tensor / max(count, 1)
-            variance = (sum_sq_tensor / max(count, 1) - mean.square()).clamp_min(1e-6)
-            std = torch.sqrt(variance)
-            return mean.detach().cpu().tolist(), std.detach().cpu().tolist()
-
-        img_mean, img_std = _finalize(img_sum, img_sum_sq, img_count)
-        video_mean, video_std = _finalize(video_sum, video_sum_sq, video_count)
-        return LatentNormalizationStats(
-            img_mean=tuple(img_mean),
-            img_std=tuple(img_std),
-            video_mean=tuple(video_mean),
-            video_std=tuple(video_std),
-        )
-
-    @torch.no_grad()
-    def _refresh_best_autoencoder_checkpoint_stats(
-        self,
-        step: int,
-        validation_results: list[dict[str, Any]],
-    ) -> None:
-        """Recompute latent normalization stats and rewrite the best AE checkpoint."""
-
-        if self.cfg.mode != "ae_only":
-            return
-        validation_clips = [
-            result["frames"]
-            for result in validation_results
-            if isinstance(result.get("frames"), torch.Tensor)
-        ]
-        self.model.set_latent_normalization_stats(
-            self._compute_latent_normalization_stats_from_clips(validation_clips)
-        )
-        self._save_checkpoint(self.checkpoints_dir / "best.pt", step)
-
-    @torch.no_grad()
     def _validate(self, step: int) -> dict[str, Any]:
         """Run validation, export artifacts, and update the best checkpoint."""
 
@@ -3588,7 +3796,6 @@ class Experiment:
         if is_best_checkpoint:
             self.best_metric = metric_value
             self._save_checkpoint(self.checkpoints_dir / "best.pt", step)
-            self._refresh_best_autoencoder_checkpoint_stats(step, validation_results)
         output_dir = self.run_dir / "samples" / f"step_{step:06d}"
         output_dir.mkdir(parents=True, exist_ok=True)
         exported_frame_counts: list[int] = []
@@ -3637,6 +3844,8 @@ class Experiment:
             summary_path = output_dir / "validation_summary.json"
             save_json(summary_path, stats)
         append_jsonl(self.metrics_path, {"step": step, "validation": stats})
+        if self.wandb_logger is not None:
+            self.wandb_logger.log_validation_metrics(step, stats)
         return stats
 
     def _save_checkpoint(self, path: str | Path, step: int) -> None:
@@ -3672,6 +3881,8 @@ class Experiment:
             self.metrics_path,
             {"step": step, "early_stop": early_stop_record},
         )
+        if self.wandb_logger is not None:
+            self.wandb_logger.log_early_stop_metrics(step, early_stop_record)
         if early_stop_record["improved"] or early_stop_record["should_stop"]:
             print(
                 json.dumps(
@@ -3705,6 +3916,34 @@ class Experiment:
             and step % self.cfg.validation_interval == 0
         )
 
+    def _start_wandb_run(self) -> WandbRunLogger | None:
+        """Create one optional W&B logger for the current training run."""
+
+        return WandbRunLogger.create(
+            enabled=self.cfg.wandb_enabled,
+            project=self.cfg.wandb_project,
+            entity=self.cfg.wandb_entity,
+            group=self.cfg.wandb_group,
+            name=self.cfg.wandb_name or self.run_name,
+            tags=self.cfg.wandb_tags,
+            mode=self.cfg.wandb_mode,
+            config=self.cfg.to_dict(),
+            run_dir=self.run_dir,
+            resume_checkpoint=self.cfg.resume,
+            run_id=self.cfg.wandb_run_id,
+        )
+
+    def _wandb_run_summary(self) -> dict[str, Any]:
+        """Return flat run metadata worth mirroring into W&B summary fields."""
+
+        return {
+            "clip_dataset_format": self.cfg.dataset_format,
+            "effective_train_batch_size": int(self._effective_train_batch_size()),
+            "mode": self.cfg.mode,
+            "resolved_train_loader_num_workers": int(self._resolved_train_loader_num_workers),
+            "train_loader_num_workers_source": self._train_loader_worker_resolution_source,
+        }
+
     def run(self) -> None:
         """Execute the configured training loop end to end."""
 
@@ -3712,6 +3951,7 @@ class Experiment:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         save_json(self.run_dir / "config.json", self.cfg.to_dict())
         self._restore_early_stop_state(self.current_step)
+        self.wandb_logger = self._start_wandb_run()
         append_jsonl(
             self.metrics_path,
             {
@@ -3727,56 +3967,79 @@ class Experiment:
                 }
             },
         )
+        if self.wandb_logger is not None:
+            self.wandb_logger.update_summary("run", self._wandb_run_summary())
 
-        train_iterator = iter(self.train_loader)
-        last_validation_step = -1
-        while self.current_step < self.cfg.max_steps:
-            self.model.train()
-            loss_dict: dict[str, torch.Tensor] | None = None
-            try:
-                loss_dict, train_iterator = self._execute_accumulated_training_step(train_iterator)
-            except RuntimeError as error:
-                if not self._is_cuda_oom(error):
-                    raise
-                recovered = self._reduce_batch_size_after_oom()
-                loss_dict = None
-                error = None
-                self._cleanup_after_cuda_oom()
-                if not recovered:
-                    raise
-                train_iterator = iter(self.train_loader)
-                continue
-            self.current_step += 1
-
-            metric_record = {"step": self.current_step, "loss": float(loss_dict["loss"].detach().cpu())}
-            for key, value in loss_dict.items():
-                if key == "loss":
+        try:
+            train_iterator = iter(self.train_loader)
+            last_validation_step = -1
+            while self.current_step < self.cfg.max_steps:
+                self.model.train()
+                loss_dict: dict[str, torch.Tensor] | None = None
+                try:
+                    loss_dict, train_iterator = self._execute_accumulated_training_step(train_iterator)
+                except RuntimeError as error:
+                    if not self._is_cuda_oom(error):
+                        raise
+                    recovered = self._reduce_batch_size_after_oom()
+                    loss_dict = None
+                    error = None
+                    self._cleanup_after_cuda_oom()
+                    if not recovered:
+                        raise
+                    train_iterator = iter(self.train_loader)
                     continue
-                metric_record[key] = float(value.detach().cpu())
-            append_jsonl(self.metrics_path, metric_record)
-            if self.current_step == 1 or (
-                self.cfg.log_interval > 0 and self.current_step % self.cfg.log_interval == 0
-            ):
-                print(json.dumps(metric_record, sort_keys=True))
+                self.current_step += 1
 
-            if self._should_run_validation(self.current_step):
-                validation_stats = self._validate(self.current_step)
-                last_validation_step = self.current_step
-                print(json.dumps({"step": self.current_step, "validation": validation_stats}, sort_keys=True))
-                if self._handle_validation_early_stop(self.current_step, validation_stats):
-                    return
+                metric_record = {
+                    "step": self.current_step,
+                    "loss": float(loss_dict["loss"].detach().cpu()),
+                    "elapsed_run_seconds": self._elapsed_run_seconds(),
+                }
+                for key, value in loss_dict.items():
+                    if key == "loss":
+                        continue
+                    metric_record[key] = float(value.detach().cpu())
+                append_jsonl(self.metrics_path, metric_record)
+                if self.wandb_logger is not None:
+                    self.wandb_logger.log_training_metrics(self.current_step, metric_record)
+                if self.current_step == 1 or (
+                    self.cfg.log_interval > 0 and self.current_step % self.cfg.log_interval == 0
+                ):
+                    print(json.dumps(metric_record, sort_keys=True))
+
+                if self._should_run_validation(self.current_step):
+                    validation_stats = self._validate(self.current_step)
+                    last_validation_step = self.current_step
+                    print(
+                        json.dumps(
+                            {"step": self.current_step, "validation": validation_stats},
+                            sort_keys=True,
+                        )
+                    )
+                    if self._handle_validation_early_stop(self.current_step, validation_stats):
+                        return
+
+                if (
+                    self.cfg.checkpoint_interval > 0
+                    and self.current_step % self.cfg.checkpoint_interval == 0
+                ):
+                    self._save_checkpoint(self.checkpoints_dir / "last.pt", self.current_step)
 
             if (
-                self.cfg.checkpoint_interval > 0
-                and self.current_step % self.cfg.checkpoint_interval == 0
+                last_validation_step != self.current_step
+                and self.current_step >= self.cfg.validation_start_step
             ):
-                self._save_checkpoint(self.checkpoints_dir / "last.pt", self.current_step)
-
-        if (
-            last_validation_step != self.current_step
-            and self.current_step >= self.cfg.validation_start_step
-        ):
-            validation_stats = self._validate(self.current_step)
-            print(json.dumps({"step": self.current_step, "validation": validation_stats}, sort_keys=True))
-            self._handle_validation_early_stop(self.current_step, validation_stats)
-        self._save_checkpoint(self.checkpoints_dir / "last.pt", self.current_step)
+                validation_stats = self._validate(self.current_step)
+                print(
+                    json.dumps(
+                        {"step": self.current_step, "validation": validation_stats},
+                        sort_keys=True,
+                    )
+                )
+                self._handle_validation_early_stop(self.current_step, validation_stats)
+            self._save_checkpoint(self.checkpoints_dir / "last.pt", self.current_step)
+        finally:
+            if self.wandb_logger is not None:
+                self.wandb_logger.finish()
+                self.wandb_logger = None

@@ -23,6 +23,34 @@ The small DreamDojo-style backbone used for current dynamics work is:
 
 Important: the repo-level default frame layout helper still has `4 -> 1`, but the aligned controller recipe is `1 context latent -> 3 future latents`. The parameter counts below are for the DreamDojo-style small backbone and do not change between `4 -> 1` and `1 -> 3`, because the model does not keep trainable per-frame parameters.
 
+## SO101 Action Semantics
+
+- The Wan 2.2 VAE port does not consume actions. Actions enter only in the DreamDojo-style dynamics path after frames are encoded to latents.
+- On the real SO101 parquet, the stored action is an exact next-state target for the first 6 state channels:
+
+$$
+\mathrm{action}[t] = \mathrm{observation.state}[t + 1][:6]
+$$
+
+so the relative transition command used for dynamics is:
+
+$$
+\mathrm{relative\_action}[t]
+=
+(\mathrm{action}[t] - \mathrm{observation.state}[t][:6]) \cdot 20.0
+=
+(\mathrm{observation.state}[t + 1][:6] - \mathrm{observation.state}[t][:6]) \cdot 20.0
+$$
+
+- This switch from raw absolute targets to DreamDojo-style relative actions is deliberate. The local SO101 check showed max error `0.0` for both equalities above, and the unscaled per-step delta stds were only about `[0.0236, 0.0340, 0.0386, 0.0529, 0.0155, 0.0374]`, so multiplying by `20.0` moves the action signal into a more useful training range.
+- Those scaled relative actions are then packed into the DiT's per-transition action chunks and applied through the existing `chunk_per_frame` conditioning path.
+
+## Action Test Coverage
+
+- `tests/test_lerobot_video_dataset.py` checks that SO101 relative actions equal next-state deltas, that clip loading can emit `relative_delta`, and that transition datasets apply the configured scale.
+- `tests/test_experiment.py` checks that `dynamics_only` SO101 runs default to `relative_delta` with scale `20.0`.
+- `tests/test_dynamics_transformer.py`, `tests/test_model.py`, and `tests/test_model_runtime.py` cover the later DreamDojo action path itself: action-frame alignment, rollout action-window slicing and padding, and explicit action-chunk acceptance.
+
 ## Wan Cache Note
 
 The cache people usually ask about is not inside the DiT. It lives in the Wan VAE used before and after the DiT in `world_model_v2/wan_vae.py`.

@@ -22,11 +22,17 @@ import matplotlib.pyplot as plt
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
 DEFAULT_OUTPUT_NAME = "metrics_validation_plot.png"
-MAX_TRAIN_METRICS = 2
-MAX_VALIDATION_METRICS = 4
+MAX_TRAIN_METRICS = 1
+MAX_VALIDATION_METRICS = 1
 TRAIN_METRIC_PRIORITY = (
     "loss",
     "latent_rf_total_loss",
+    "latent_rf_mse",
+)
+VALIDATION_TOTAL_LOSS_PRIORITY = (
+    "loss",
+    "latent_rf_total_loss",
+    "ae_loss",
     "latent_rf_mse",
 )
 VALIDATION_METRIC_PRIORITY = (
@@ -204,7 +210,7 @@ def select_metric_names(
 def select_training_metric_names(
     series: dict[str, list[tuple[int, float]]],
 ) -> tuple[str, ...]:
-    """Return the compact subset of training metrics to plot."""
+    """Return the single training loss curve to plot."""
 
     return select_metric_names(
         series,
@@ -217,10 +223,11 @@ def select_validation_metric_names(
     records: list[dict[str, Any]],
     series: dict[str, list[tuple[int, float]]],
 ) -> tuple[str, ...]:
-    """Return the compact subset of validation metrics to plot."""
+    """Return one validation loss-like curve, preferring an aggregate loss when present."""
 
-    if "ae_loss" in series:
-        return ("ae_loss",)
+    for key in VALIDATION_TOTAL_LOSS_PRIORITY:
+        if key in series:
+            return (key,)
     config = extract_run_config(records)
     primary_metric = str(config.get("dynamics_validation_metric", "")).strip() or None
     return select_metric_names(

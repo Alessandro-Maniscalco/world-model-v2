@@ -1,4 +1,4 @@
-"""World model that pairs a Wan2.1-style temporal VAE with DreamDojo-style RF dynamics."""
+"""World model that pairs the Wan 2.2 tokenizer with DreamDojo-style RF dynamics."""
 
 from __future__ import annotations
 
@@ -15,6 +15,9 @@ from world_model_v2.dynamics_transformer import (
     RectifiedFlowDynamics,
 )
 from world_model_v2.wan_vae import (
+    DEFAULT_WAN_Z_DIM,
+    WAN_2PT2_MEAN,
+    WAN_2PT2_STD,
     WanPosteriorEncoder,
     WanVAEConfig,
     WanVideoDecoder,
@@ -57,15 +60,32 @@ class LatentNormalizationStats:
         )
 
     @classmethod
+    def dreamdojo_wan_2pt2(cls) -> "LatentNormalizationStats":
+        """Return the fixed DreamDojo Wan 2.2 latent normalization statistics."""
+
+        return cls(
+            img_mean=WAN_2PT2_MEAN,
+            img_std=WAN_2PT2_STD,
+            video_mean=WAN_2PT2_MEAN,
+            video_std=WAN_2PT2_STD,
+        )
+
+    @classmethod
+    def default_for_channels(cls, channels: int) -> "LatentNormalizationStats":
+        """Return the default normalization stats for one latent-channel count."""
+
+        return cls.dreamdojo_wan_2pt2() if channels == len(WAN_2PT2_MEAN) else cls.identity(channels)
+
+    @classmethod
     def from_dict(
         cls,
         payload: dict[str, Any] | None,
         channels: int,
     ) -> "LatentNormalizationStats":
-        """Build stats from checkpoint metadata or fall back to identity stats."""
+        """Build stats from checkpoint metadata or fall back to the default stats."""
 
         if payload is None:
-            return cls.identity(channels)
+            return cls.default_for_channels(channels)
 
         def _read_vector(key: str, default: float) -> tuple[float, ...]:
             """Read one per-channel vector from serialized metadata."""
@@ -105,7 +125,7 @@ class WorldModel(nn.Module):
 
     def __init__(
         self,
-        latent_channels: int = 32,
+        latent_channels: int = DEFAULT_WAN_Z_DIM,
         hidden_channels: int = 64,
         ae_backend: str = "wan",
         resolution: int = 128,
@@ -125,6 +145,7 @@ class WorldModel(nn.Module):
         dynamics_validation_conditioning_frame_choices: tuple[int, ...] | list[int] | None = None,
         dynamics_open_rollout_context_frames: int | None = None,
         dynamics_open_rollout_stride_frames: int | None = None,
+        dynamics_patch_spatial: int = 1,
         dynamics_model_channels: int = 256,
         dynamics_num_blocks: int = 4,
         dynamics_num_heads: int = 4,
@@ -195,9 +216,6 @@ class WorldModel(nn.Module):
             )
         latent_height = self.image_height // self.spatial_downsample_factor
         latent_width = self.image_width // self.spatial_downsample_factor
-        # Keep the first DiT at full latent resolution because the Wan tokenizer
-        # already performs the spatial compression.
-        dynamics_patch_spatial = 1
         self.dynamics_backend = "rf_dit"
         self.dynamics = RectifiedFlowDynamics(
             DynamicsTransformerConfig(

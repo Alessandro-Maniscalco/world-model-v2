@@ -1,0 +1,69 @@
+{
+  "action_representation": "relative_delta",
+  "action_scale": 20.0,
+  "checkpoint": "C:\\Users\\aless\\world-model-v2\\dreamdojo\\outputs\\smoke_real_1step_standalone\\checkpoints\\best.pt",
+  "device": "cuda",
+  "exported_video_frame_count": 31,
+  "loss_frames": 30,
+  "seed_frames": 1,
+  "variants": {
+    "double_delta": {
+      "action_abs_max": 2.3914177417755127,
+      "action_abs_mean": 0.5618513226509094,
+      "action_l1_vs_original": 0.2809256613254547,
+      "frame_l1": 0.5871284604072571,
+      "frame_mse": 0.4874836206436157,
+      "ground_truth_target_motion_l1": 0.01645101048052311,
+      "predicted_target_motion_l1": 0.18879397213459015,
+      "prediction_delta_l1_vs_original": 0.07238291203975677,
+      "prediction_delta_mse_vs_original": 0.009524217806756496,
+      "target_motion_ratio": 11.47613226300655
+    },
+    "half_delta": {
+      "action_abs_max": 0.5978544354438782,
+      "action_abs_mean": 0.14046283066272736,
+      "action_l1_vs_original": 0.14046283066272736,
+      "frame_l1": 0.6183081865310669,
+      "frame_mse": 0.5269679427146912,
+      "ground_truth_target_motion_l1": 0.01645101048052311,
+      "predicted_target_motion_l1": 0.18430015444755554,
+      "prediction_delta_l1_vs_original": 0.029747623950242996,
+      "prediction_delta_mse_vs_original": 0.0016759495483711362,
+      "target_motion_ratio": 11.20296863622782
+    },
+    "original": {
+      "action_abs_max": 1.1957088708877563,
+      "action_abs_mean": 0.2809256613254547,
+      "action_l1_vs_original": 0.0,
+      "frame_l1": 0.6107634902000427,
+      "frame_mse": 0.5164560675621033,
+      "ground_truth_target_motion_l1": 0.01645101048052311,
+      "predicted_target_motion_l1": 0.1851368099451065,
+      "target_motion_ratio": 11.253826028759512
+    },
+    "reverse_delta": {
+      "action_abs_max": 1.1957088708877563,
+      "action_abs_mean": 0.2809256613254547,
+      "action_l1_vs_original": 0.5618513226509094,
+      "frame_l1": 0.6289448142051697,
+      "frame_mse": 0.5447825193405151,
+      "ground_truth_target_motion_l1": 0.01645101048052311,
+      "predicted_target_motion_l1": 0.18711233139038086,
+      "prediction_delta_l1_vs_original": 0.09142627567052841,
+      "prediction_delta_mse_vs_original": 0.015387448482215405,
+      "target_motion_ratio": 11.373911141319208
+    },
+    "zero": {
+      "action_abs_max": 0.0,
+      "action_abs_mean": 0.0,
+      "action_l1_vs_original": 0.2809256613254547,
+      "frame_l1": 0.6228998899459839,
+      "frame_mse": 0.5341190695762634,
+      "ground_truth_target_motion_l1": 0.01645101048052311,
+      "predicted_target_motion_l1": 0.1843513399362564,
+      "prediction_delta_l1_vs_original": 0.053893446922302246,
+      "prediction_delta_mse_vs_original": 0.005471601150929928,
+      "target_motion_ratio": 11.206080024963573
+    }
+  }
+}

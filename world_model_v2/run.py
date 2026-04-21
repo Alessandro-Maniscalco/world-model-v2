@@ -10,11 +10,13 @@ import torch
 
 from world_model_v2.dynamics_transformer import DYNAMICS_FRAME_LAYOUT
 from world_model_v2.experiment import Experiment, ExperimentConfig
+from world_model_v2.experiment import DYNAMICS_ACTION_REPRESENTATION_CHOICES
 from world_model_v2.wan_vae import (
     DEFAULT_WAN_DIM,
     DEFAULT_WAN_NUM_RES_BLOCKS,
     DEFAULT_WAN_Z_DIM,
 )
+from world_model_v2.lerobot_video_dataset import SO101_RELATIVE_ACTION_SCALE
 
 
 def parse_int_csv(value: str | None) -> tuple[int, ...] | None:
@@ -37,6 +39,17 @@ def parse_float_csv(value: str | None) -> tuple[float, ...] | None:
     if any(part == "" for part in parts):
         raise ValueError(f"Expected a comma-separated float list, received {value!r}.")
     return tuple(float(part) for part in parts)
+
+
+def parse_str_csv(value: str | None) -> tuple[str, ...] | None:
+    """Parse one optional comma-separated string list from the CLI."""
+
+    if value is None:
+        return None
+    parts = [part.strip() for part in value.split(",")]
+    if any(part == "" for part in parts):
+        raise ValueError(f"Expected a comma-separated string list, received {value!r}.")
+    return tuple(parts)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -119,6 +132,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dynamics-validation-conditioning-frame-choices", default=None)
     parser.add_argument("--dynamics-open-rollout-context-frames", type=int, default=None)
     parser.add_argument("--dynamics-open-rollout-stride-frames", type=int, default=None)
+    parser.add_argument("--dynamics-patch-spatial", type=int, default=1)
     parser.add_argument("--dynamics-model-channels", type=int, default=256)
     parser.add_argument("--dynamics-num-blocks", type=int, default=4)
     parser.add_argument("--dynamics-num-heads", type=int, default=4)
@@ -126,6 +140,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dynamics-action-conditioning-mode",
         choices=["chunk_per_frame"],
         default="chunk_per_frame",
+    )
+    parser.add_argument(
+        "--dynamics-action-representation",
+        choices=DYNAMICS_ACTION_REPRESENTATION_CHOICES,
+        default="dataset_default",
+    )
+    parser.add_argument(
+        "--dynamics-action-scale",
+        type=float,
+        default=SO101_RELATIVE_ACTION_SCALE,
     )
     parser.add_argument("--dynamics-zero-init-action-embedder", action="store_true")
     parser.add_argument(
@@ -196,6 +220,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resume", default="")
     parser.add_argument("--load-encoder-decoder", default="")
     parser.add_argument("--load-dynamics", default="")
+    parser.add_argument(
+        "--wandb",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--wandb-project", default="world-model-v2")
+    parser.add_argument("--wandb-entity", default="")
+    parser.add_argument("--wandb-group", default="")
+    parser.add_argument("--wandb-name", default="")
+    parser.add_argument("--wandb-tags", default=None)
+    parser.add_argument("--wandb-run-id", default="")
+    parser.add_argument(
+        "--wandb-mode",
+        choices=["online", "offline"],
+        default="online",
+    )
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -262,10 +302,13 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         ),
         dynamics_open_rollout_context_frames=args.dynamics_open_rollout_context_frames,
         dynamics_open_rollout_stride_frames=args.dynamics_open_rollout_stride_frames,
+        dynamics_patch_spatial=args.dynamics_patch_spatial,
         dynamics_model_channels=args.dynamics_model_channels,
         dynamics_num_blocks=args.dynamics_num_blocks,
         dynamics_num_heads=args.dynamics_num_heads,
         dynamics_action_conditioning_mode=args.dynamics_action_conditioning_mode,
+        dynamics_action_representation=args.dynamics_action_representation,
+        dynamics_action_scale=args.dynamics_action_scale,
         dynamics_zero_init_action_embedder=args.dynamics_zero_init_action_embedder,
         dynamics_use_adaln_lora=args.dynamics_use_adaln_lora,
         dynamics_adaln_lora_dim=args.dynamics_adaln_lora_dim,
@@ -305,6 +348,14 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         resume=args.resume,
         load_encoder_decoder=args.load_encoder_decoder,
         load_dynamics=args.load_dynamics,
+        wandb_enabled=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_group=args.wandb_group,
+        wandb_name=args.wandb_name,
+        wandb_tags=parse_str_csv(args.wandb_tags),
+        wandb_mode=args.wandb_mode,
+        wandb_run_id=args.wandb_run_id,
         seed=args.seed,
     )
 

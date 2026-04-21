@@ -24,6 +24,13 @@ from world_model_v2.wan_vae import (
     WanVAEConfig,
 )
 
+TEST_WAN_CONFIG = WanVAEConfig(
+    dim=16,
+    dec_dim=16,
+    z_dim=DEFAULT_WAN_Z_DIM,
+    num_res_blocks=1,
+)
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     """Register the opt-in flag for runtime-heavy slow tests."""
@@ -48,6 +55,27 @@ def pytest_collection_modifyitems(
     for item in items:
         if "slow" in item.keywords:
             item.add_marker(skip_slow)
+
+
+@pytest.fixture(autouse=True)
+def patch_default_experiment_wan_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink the default test-time tokenizer config while preserving Wan 2.2 semantics."""
+
+    from world_model_v2.experiment import Experiment
+
+    original = Experiment._requested_wan_config
+
+    def _requested_wan_config(self: Experiment) -> WanVAEConfig:
+        """Return a compact Wan 2.2 config for default CPU tests."""
+
+        requested = original(self)
+        if self.cfg.load_encoder_decoder.endswith(".pth"):
+            return requested
+        if requested == WanVAEConfig():
+            return TEST_WAN_CONFIG
+        return requested
+
+    monkeypatch.setattr(Experiment, "_requested_wan_config", _requested_wan_config)
 
 
 def write_episode(path: Path, frames: int = 6, height: int = 32, width: int = 32) -> None:
@@ -346,13 +374,6 @@ def write_lerobot_video_episode(path: Path, frame_values: list[int], episode_ind
     """Create one small episode-sharded LeRobot parquet file with 6D actions."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    action_array = pa.array(
-        [
-            [float(frame_value + offset) for offset in range(6)]
-            for frame_value in frame_values
-        ],
-        type=pa.list_(pa.float32()),
-    )
     state_array = pa.array(
         [
             [float(frame_value + offset) for offset in range(12)]
@@ -360,6 +381,12 @@ def write_lerobot_video_episode(path: Path, frame_values: list[int], episode_ind
         ],
         type=pa.list_(pa.float32()),
     )
+    action_rows: list[list[float]] = []
+    for index, _frame_value in enumerate(frame_values):
+        next_index = min(index + 1, len(frame_values) - 1)
+        next_frame_value = frame_values[next_index]
+        action_rows.append([float(next_frame_value + offset) for offset in range(6)])
+    action_array = pa.array(action_rows, type=pa.list_(pa.float32()))
     pq.write_table(
         pa.table(
             {
@@ -547,12 +574,8 @@ def saved_world_model_ae_checkpoint(tmp_path_factory: pytest.TempPathFactory) ->
     checkpoint_path = root / "world_model_wan_ae.pt"
     model = WorldModel(
         ae_backend="wan",
-        latent_channels=DEFAULT_WAN_Z_DIM,
-        wan_config=WanVAEConfig(
-            dim=DEFAULT_WAN_DIM,
-            z_dim=DEFAULT_WAN_Z_DIM,
-            num_res_blocks=DEFAULT_WAN_NUM_RES_BLOCKS,
-        ),
+        latent_channels=TEST_WAN_CONFIG.z_dim,
+        wan_config=TEST_WAN_CONFIG,
     )
     for parameter in model.encoder.parameters():
         torch.nn.init.constant_(parameter, 0.25)
@@ -567,6 +590,9 @@ def saved_world_model_ae_checkpoint(tmp_path_factory: pytest.TempPathFactory) ->
         output_dir=str(root / "outputs"),
         run_name="fixture_wan_ae",
         ae_backend="wan",
+        wan_dim=TEST_WAN_CONFIG.dim,
+        latent_channels=TEST_WAN_CONFIG.z_dim,
+        wan_num_res_blocks=TEST_WAN_CONFIG.num_res_blocks,
         device="cpu",
     )
     save_training_checkpoint(

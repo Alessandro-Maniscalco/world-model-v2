@@ -14,6 +14,7 @@ from typing import Any
 import cv2
 from huggingface_hub import hf_hub_download
 import imageio_ffmpeg
+import numpy as np
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset, Sampler
@@ -29,12 +30,15 @@ from world_model_v2.metaworld_dataset import (
 SO101_BASE_SIM_PICKPLACE_DATASET_ID = "davidlinjiahao/lerobot_so101_base_sim_pickplace"
 SO101_BASE_SIM_PICKPLACE_IMAGE_COLUMN = "observation.images.front"
 SO101_BASE_SIM_PICKPLACE_ACTION_DIM = 6
+SO101_STATE_COLUMN = "observation.state"
+SO101_RELATIVE_ACTION_SCALE = 20.0
 SO101_DEFAULT_CROP_LEFT_KEEP_FRACTION = 23.0 / 320.0
 SO101_DEFAULT_CROP_RIGHT_KEEP_FRACTION = 297.0 / 320.0
 SO101_DEFAULT_CROP_BOTTOM_KEEP_FRACTION = 208.0 / 240.0
 LEROBOT_VIDEO_EPISODES_PATH = "meta/episodes.jsonl"
 LEROBOT_VIDEO_TASKS_PATH = "meta/tasks.jsonl"
 LEROBOT_VIDEO_ACTION_COLUMN_CANDIDATES = ("action", "actions")
+LEROBOT_ACTION_REPRESENTATIONS = ("absolute", "relative_delta")
 
 
 def resolve_lerobot_video_split(split: str) -> str:
@@ -81,6 +85,54 @@ def crop_bgr_frame(
     return frame_bgr[top:bottom, left:right]
 
 
+def resolve_exact_downsample_crop_bounds(
+    crop_bounds: tuple[int, int, int, int] | None,
+    *,
+    target_height: int,
+    target_width: int,
+    min_downsample_factor: int = 2,
+) -> tuple[tuple[int, int, int, int], int] | None:
+    """Return one centered crop that exactly area-downsamples into the target size."""
+
+    if crop_bounds is None:
+        return None
+    if target_height <= 0 or target_width <= 0:
+        raise ValueError("target_height and target_width must be positive integers.")
+    if min_downsample_factor < 1:
+        raise ValueError("min_downsample_factor must be at least 1.")
+    top, bottom, left, right = crop_bounds
+    crop_height = int(bottom - top)
+    crop_width = int(right - left)
+    max_factor = min(crop_height // target_height, crop_width // target_width)
+    if max_factor < min_downsample_factor:
+        return None
+    downsample_factor = int(max_factor)
+    aligned_height = int(target_height) * downsample_factor
+    aligned_width = int(target_width) * downsample_factor
+    trim_height = crop_height - aligned_height
+    trim_width = crop_width - aligned_width
+    aligned_bottom = bottom - trim_height
+    aligned_left = left + (trim_width // 2)
+    aligned_right = right - (trim_width - (trim_width // 2))
+    return (top, aligned_bottom, aligned_left, aligned_right), downsample_factor
+
+
+def bgr_frame_to_exact_area_downsampled_tensor(
+    frame_bgr: np.ndarray,
+    *,
+    crop_bounds: tuple[int, int, int, int],
+    target_height: int,
+    target_width: int,
+) -> torch.Tensor:
+    """Crop one BGR frame and exact-downsample it into a normalized RGB tensor."""
+
+    cropped = crop_bgr_frame(frame_bgr, crop_bounds)
+    resized = cv2.resize(cropped, (target_width, target_height), interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    pixels = np.asarray(rgb, dtype=np.float32) / 255.0
+    return torch.from_numpy(np.transpose(np.ascontiguousarray(pixels), (2, 0, 1))).contiguous()
+
+
 def read_jsonl_records(path: Path) -> list[dict[str, Any]]:
     """Load one JSONL file into a list of dictionaries."""
 
@@ -112,6 +164,55 @@ def render_episode_relative_path(
             video_key=video_key,
         )
     )
+
+
+def validate_lerobot_action_representation(
+    repo_id: str,
+    action_representation: str,
+) -> None:
+    """Reject unsupported action representations for the selected LeRobot dataset."""
+
+    if action_representation not in LEROBOT_ACTION_REPRESENTATIONS:
+        raise ValueError(
+            f"Unsupported LeRobot action_representation={action_representation!r}. "
+            f"Expected one of {LEROBOT_ACTION_REPRESENTATIONS}."
+        )
+    if (
+        action_representation != "absolute"
+        and repo_id != SO101_BASE_SIM_PICKPLACE_DATASET_ID
+    ):
+        raise ValueError(
+            "Relative LeRobot actions are currently only implemented for the SO101 base sim "
+            f"pickplace dataset, received repo_id={repo_id!r}."
+        )
+
+
+def so101_relative_actions_from_absolute_targets(
+    actions: torch.Tensor,
+    states: torch.Tensor,
+    *,
+    scale: float = SO101_RELATIVE_ACTION_SCALE,
+) -> torch.Tensor:
+    """Convert SO101 next-state targets into scaled relative next-step deltas."""
+
+    if actions.ndim != 2:
+        raise ValueError(
+            f"Expected SO101 actions with shape (T, A), received {tuple(actions.shape)}."
+        )
+    if states.ndim != 2 or states.shape[0] != actions.shape[0]:
+        raise ValueError(
+            "SO101 states must align one-to-one with actions; received "
+            f"actions={tuple(actions.shape)} states={tuple(states.shape)}."
+        )
+    if states.shape[1] < actions.shape[1]:
+        raise ValueError(
+            "SO101 states must expose at least as many channels as actions; received "
+            f"actions={tuple(actions.shape)} states={tuple(states.shape)}."
+        )
+    resolved_scale = float(scale)
+    if resolved_scale <= 0.0:
+        raise ValueError("SO101 relative action scale must be positive.")
+    return (actions - states[:, : actions.shape[1]]) * resolved_scale
 
 
 @dataclass(frozen=True)
@@ -348,6 +449,17 @@ class LeRobotEpisodeVideoRepository:
             f"Checked {LEROBOT_VIDEO_ACTION_COLUMN_CANDIDATES}."
         )
 
+    @lru_cache(maxsize=16)
+    def state_column_name(self, relative_path: str) -> str:
+        """Return the state column name required for relative SO101 actions."""
+
+        if SO101_STATE_COLUMN not in self.episode_schema_names(relative_path):
+            raise KeyError(
+                "LeRobot episode parquet is missing the observation.state column required "
+                "for SO101 relative actions."
+            )
+        return SO101_STATE_COLUMN
+
     @lru_cache(maxsize=8)
     def episode_table(self, relative_path: str) -> Any:
         """Load and cache one episode parquet table."""
@@ -433,14 +545,25 @@ class LeRobotEpisodeVideoRepository:
     ) -> torch.Tensor:
         """Crop and resize one decoded BGR frame into the training tensor format."""
 
-        cropped_frame_bgr = crop_bgr_frame(
-            frame_bgr,
-            resolve_default_lerobot_crop_bounds(
-                self.repo_id,
-                frame_bgr.shape[0],
-                frame_bgr.shape[1],
-            ),
+        crop_bounds = resolve_default_lerobot_crop_bounds(
+            self.repo_id,
+            frame_bgr.shape[0],
+            frame_bgr.shape[1],
         )
+        exact_downsample = resolve_exact_downsample_crop_bounds(
+            crop_bounds,
+            target_height=height,
+            target_width=width,
+        )
+        if exact_downsample is not None:
+            aligned_crop_bounds, _ = exact_downsample
+            return bgr_frame_to_exact_area_downsampled_tensor(
+                frame_bgr,
+                crop_bounds=aligned_crop_bounds,
+                target_height=height,
+                target_width=width,
+            )
+        cropped_frame_bgr = crop_bgr_frame(frame_bgr, crop_bounds)
         return bgr_frame_to_tensor(
             cropped_frame_bgr,
             height=height,
@@ -505,36 +628,36 @@ class LeRobotEpisodeVideoRepository:
             width=resolved_width,
         )
 
-    def load_action_tensor(self, frame: LeRobotVideoFrameRecord) -> torch.Tensor:
+    def load_action_tensor(
+        self,
+        frame: LeRobotVideoFrameRecord,
+        *,
+        action_representation: str = "absolute",
+        action_scale: float = 1.0,
+    ) -> torch.Tensor:
         """Load one action vector from the backing episode parquet shard."""
 
-        record = frame.episode
-        column_name = self.action_column_name(record.data_relative_path)
-        table = self.episode_table(record.data_relative_path)
-        if frame.frame_index >= table.num_rows:
-            raise IndexError(
-                f"Frame index {frame.frame_index} exceeds parquet rows for episode "
-                f"{record.episode_index}."
-            )
-        action = torch.as_tensor(
-            table[column_name][frame.frame_index].as_py(),
-            dtype=torch.float32,
+        actions = self.load_action_tensors(
+            frame.episode,
+            frame.frame_index,
+            frame.frame_index + 1,
+            action_representation=action_representation,
+            action_scale=action_scale,
         )
-        expected_dim = self.action_dim()
-        if action.ndim != 1 or action.shape[0] != expected_dim:
-            raise ValueError(
-                f"Expected LeRobot action shape ({expected_dim},), received {tuple(action.shape)}."
-            )
-        return action
+        return actions[0]
 
     def load_action_tensors(
         self,
         record: LeRobotVideoEpisodeRecord,
         frame_start: int,
         frame_end_exclusive: int,
+        *,
+        action_representation: str = "absolute",
+        action_scale: float = 1.0,
     ) -> torch.Tensor:
         """Load a contiguous action slice for the requested episode frame range."""
 
+        validate_lerobot_action_representation(self.repo_id, action_representation)
         expected_dim = self.action_dim()
         if frame_end_exclusive <= frame_start:
             return torch.zeros((0, expected_dim), dtype=torch.float32)
@@ -553,7 +676,20 @@ class LeRobotEpisodeVideoRepository:
             raise ValueError(
                 f"Expected LeRobot action shape (N, {expected_dim}), received {tuple(actions.shape)}."
             )
-        return actions
+        if action_representation == "absolute":
+            return actions
+        state_column_name = self.state_column_name(record.data_relative_path)
+        states = torch.as_tensor(
+            table[state_column_name]
+            .slice(frame_start, frame_end_exclusive - frame_start)
+            .to_pylist(),
+            dtype=torch.float32,
+        )
+        return so101_relative_actions_from_absolute_targets(
+            actions,
+            states,
+            scale=action_scale,
+        )
 
     def load_clip(
         self,
@@ -564,6 +700,8 @@ class LeRobotEpisodeVideoRepository:
         height: int | None,
         width: int | None,
         load_actions: bool = False,
+        action_representation: str = "absolute",
+        action_scale: float = 1.0,
         clamp_frame_end: bool = False,
     ) -> dict[str, Any]:
         """Load one resized frame slice from a specific episode video dataset."""
@@ -610,6 +748,8 @@ class LeRobotEpisodeVideoRepository:
                 record,
                 resolved_frame_start,
                 effective_frame_end,
+                action_representation=action_representation,
+                action_scale=action_scale,
             )
         return clip
 
@@ -627,6 +767,8 @@ def load_lerobot_video_clip(
     image_column: str = SO101_BASE_SIM_PICKPLACE_IMAGE_COLUMN,
     cache_dir: str | Path | None = None,
     load_actions: bool = False,
+    action_representation: str = "absolute",
+    action_scale: float = 1.0,
     clamp_frame_end: bool = False,
 ) -> dict[str, Any]:
     """Load one resized frame slice from an episode-sharded LeRobot video dataset."""
@@ -647,6 +789,8 @@ def load_lerobot_video_clip(
         height=height,
         width=width,
         load_actions=load_actions,
+        action_representation=action_representation,
+        action_scale=action_scale,
         clamp_frame_end=clamp_frame_end,
     )
 
@@ -949,11 +1093,16 @@ class LeRobotVideoTransitionDataset(Dataset[dict[str, Any]]):
         rollout_chunks: int = 0,
         all_episodes: bool = False,
         exclude_episodes: tuple[int, ...] = (),
+        action_representation: str = "absolute",
+        action_scale: float = 1.0,
     ) -> None:
         """Cache one clip or flatten all episodes for dynamics windows."""
 
         resolve_lerobot_video_split(split)
+        validate_lerobot_action_representation(repo_id, action_representation)
         self.frame_layout = frame_layout
+        self.action_representation = action_representation
+        self.action_scale = float(action_scale)
         self.rollout_context_frames = (
             frame_layout.context_frames
             if rollout_context_frames is None
@@ -1032,6 +1181,8 @@ class LeRobotVideoTransitionDataset(Dataset[dict[str, Any]]):
                 image_column=image_column,
                 cache_dir=cache_dir,
                 load_actions=True,
+                action_representation=self.action_representation,
+                action_scale=self.action_scale,
             )
             self._sampler = None
 
@@ -1072,6 +1223,8 @@ class LeRobotVideoTransitionDataset(Dataset[dict[str, Any]]):
             height=self.height,
             width=self.width,
             load_actions=True,
+            action_representation=self.action_representation,
+            action_scale=self.action_scale,
         )
 
     def __len__(self) -> int:
@@ -1107,9 +1260,12 @@ class LeRobotVideoValidationClipDataset(Dataset[dict[str, Any]]):
         repo_id: str = SO101_BASE_SIM_PICKPLACE_DATASET_ID,
         image_column: str = SO101_BASE_SIM_PICKPLACE_IMAGE_COLUMN,
         cache_dir: str | Path | None = None,
+        action_representation: str = "absolute",
+        action_scale: float = 1.0,
     ) -> None:
         """Cache one clip for validation preview generation."""
 
+        validate_lerobot_action_representation(repo_id, action_representation)
         self.clip = load_lerobot_video_clip(
             data_root=data_root,
             split=split,
@@ -1123,6 +1279,8 @@ class LeRobotVideoValidationClipDataset(Dataset[dict[str, Any]]):
             image_column=image_column,
             cache_dir=cache_dir,
             load_actions=True,
+            action_representation=action_representation,
+            action_scale=action_scale,
         )
 
     def __len__(self) -> int:

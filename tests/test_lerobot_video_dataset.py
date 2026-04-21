@@ -16,10 +16,14 @@ from world_model_v2.lerobot_video_dataset import (
     LeRobotVideoValidationClipDataset,
     SO101_BASE_SIM_PICKPLACE_ACTION_DIM,
     SO101_BASE_SIM_PICKPLACE_DATASET_ID,
+    SO101_RELATIVE_ACTION_SCALE,
+    bgr_frame_to_exact_area_downsampled_tensor,
     crop_bgr_frame,
     load_lerobot_video_clip,
+    resolve_exact_downsample_crop_bounds,
     resolve_default_lerobot_crop_bounds,
     resolve_lerobot_video_split,
+    so101_relative_actions_from_absolute_targets,
 )
 from world_model_v2.metaworld_dataset import bgr_frame_to_tensor
 
@@ -43,7 +47,7 @@ def test_load_lerobot_video_clip_returns_requested_slice(
     assert torch.equal(
         clip["actions"][0],
         torch.tensor(
-            [20.0 + offset for offset in range(SO101_BASE_SIM_PICKPLACE_ACTION_DIM)],
+            [30.0 + offset for offset in range(SO101_BASE_SIM_PICKPLACE_ACTION_DIM)],
             dtype=torch.float32,
         ),
     )
@@ -88,6 +92,75 @@ def test_load_lerobot_video_clip_applies_default_so101_crop(
     )
 
     assert torch.allclose(clip["frames"][0], manual)
+
+
+def test_resolve_exact_downsample_crop_bounds_prefers_largest_factor() -> None:
+    """Exact downsampling should trim only the sides and bottom while keeping the largest factor."""
+
+    crop_bounds = resolve_default_lerobot_crop_bounds(
+        SO101_BASE_SIM_PICKPLACE_DATASET_ID,
+        frame_height=480,
+        frame_width=640,
+    )
+
+    assert crop_bounds == (0, 416, 46, 594)
+    assert resolve_exact_downsample_crop_bounds(
+        crop_bounds,
+        target_height=208,
+        target_width=272,
+    ) == ((0, 416, 48, 592), 2)
+    assert resolve_exact_downsample_crop_bounds(
+        crop_bounds,
+        target_height=96,
+        target_width=128,
+    ) == ((0, 384, 64, 576), 4)
+
+
+def test_load_lerobot_video_clip_uses_exact_area_downsample_when_possible(
+    fake_lerobot_so101_base_sim_pickplace_root: Path,
+) -> None:
+    """SO101 clips should use exact area downsampling when the target size fits an integer factor."""
+
+    repository = LeRobotEpisodeVideoRepository(
+        data_root=str(fake_lerobot_so101_base_sim_pickplace_root),
+        repo_id=SO101_BASE_SIM_PICKPLACE_DATASET_ID,
+    )
+    record = repository.episode_record(0)
+    raw_frame = repository._read_video_frame(record, 0)
+    crop_bounds = resolve_default_lerobot_crop_bounds(
+        SO101_BASE_SIM_PICKPLACE_DATASET_ID,
+        raw_frame.shape[0],
+        raw_frame.shape[1],
+    )
+    exact_crop_bounds, factor = resolve_exact_downsample_crop_bounds(
+        crop_bounds,
+        target_height=4,
+        target_width=4,
+    )
+
+    assert factor == 3
+    manual = bgr_frame_to_exact_area_downsampled_tensor(
+        raw_frame,
+        crop_bounds=exact_crop_bounds,
+        target_height=4,
+        target_width=4,
+    )
+    bicubic_manual = bgr_frame_to_tensor(
+        crop_bgr_frame(raw_frame, crop_bounds),
+        height=4,
+        width=4,
+    )
+    clip = load_lerobot_video_clip(
+        data_root=str(fake_lerobot_so101_base_sim_pickplace_root),
+        split="train",
+        episode=0,
+        resolution=4,
+        height=4,
+        width=4,
+    )
+
+    assert torch.allclose(clip["frames"][0], manual)
+    assert not torch.allclose(clip["frames"][0], bicubic_manual)
 
 
 def test_lerobot_video_repository_pickle_drops_cached_video_handles(
@@ -162,7 +235,7 @@ def test_lerobot_video_transition_dataset_returns_sliding_windows(
     assert torch.equal(
         sample["actions"][0],
         torch.tensor(
-            [10.0 + offset for offset in range(SO101_BASE_SIM_PICKPLACE_ACTION_DIM)],
+            [20.0 + offset for offset in range(SO101_BASE_SIM_PICKPLACE_ACTION_DIM)],
             dtype=torch.float32,
         ),
     )
@@ -217,9 +290,91 @@ def test_lerobot_video_transition_dataset_exposes_future_rollout_targets(
         sample["future_actions"][:, :4],
         torch.tensor(
             [
-                [30.0, 31.0, 32.0, 33.0],
                 [40.0, 41.0, 42.0, 43.0],
+                [50.0, 51.0, 52.0, 53.0],
             ],
+            dtype=torch.float32,
+        ),
+    )
+
+
+def test_so101_relative_actions_match_next_state_deltas() -> None:
+    """SO101 relative actions should equal scaled next-state deltas."""
+
+    actions = torch.tensor(
+        [
+            [20.0, 21.0, 22.0, 23.0, 24.0, 25.0],
+            [30.0, 31.0, 32.0, 33.0, 34.0, 35.0],
+        ],
+        dtype=torch.float32,
+    )
+    states = torch.tensor(
+        [
+            [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 100.0],
+            [20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 101.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    relative = so101_relative_actions_from_absolute_targets(
+        actions,
+        states,
+        scale=1.0,
+    )
+
+    assert torch.equal(relative, torch.full((2, 6), 10.0, dtype=torch.float32))
+
+
+def test_load_lerobot_video_clip_can_return_relative_so101_actions(
+    fake_lerobot_so101_base_sim_pickplace_root: Path,
+) -> None:
+    """SO101 clip loading should optionally expose relative next-state deltas."""
+
+    clip = load_lerobot_video_clip(
+        data_root=str(fake_lerobot_so101_base_sim_pickplace_root),
+        split="train",
+        episode=0,
+        frame_start=0,
+        frame_end=2,
+        resolution=8,
+        load_actions=True,
+        action_representation="relative_delta",
+        action_scale=1.0,
+    )
+
+    assert clip["actions"].shape == (2, SO101_BASE_SIM_PICKPLACE_ACTION_DIM)
+    assert torch.equal(
+        clip["actions"],
+        torch.full((2, SO101_BASE_SIM_PICKPLACE_ACTION_DIM), 10.0, dtype=torch.float32),
+    )
+
+
+def test_lerobot_video_transition_dataset_can_return_relative_so101_actions(
+    fake_lerobot_so101_base_sim_pickplace_root: Path,
+) -> None:
+    """SO101 dynamics windows should support scaled relative actions."""
+
+    dataset = LeRobotVideoTransitionDataset(
+        data_root=str(fake_lerobot_so101_base_sim_pickplace_root),
+        split="train",
+        episode=0,
+        resolution=8,
+        frame_layout=DynamicsFrameLayout(
+            context_frames=1,
+            target_frames=1,
+            temporal_compression_ratio=1,
+        ),
+        action_representation="relative_delta",
+        action_scale=SO101_RELATIVE_ACTION_SCALE,
+    )
+
+    sample = dataset[0]
+
+    assert torch.equal(
+        sample["actions"],
+        torch.full(
+            (1, SO101_BASE_SIM_PICKPLACE_ACTION_DIM),
+            10.0 * SO101_RELATIVE_ACTION_SCALE,
             dtype=torch.float32,
         ),
     )

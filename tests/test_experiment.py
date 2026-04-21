@@ -38,6 +38,7 @@ from world_model_v2.utils.checkpointing import append_jsonl
 
 
 DEBUG_FRAME_KWARGS = {"frame_start": 111, "frame_end": 123}
+TEST_WAN_CONFIG = WanVAEConfig(dim=16, dec_dim=16, z_dim=DEFAULT_WAN_Z_DIM, num_res_blocks=1)
 
 
 def _all_trainable(module: torch.nn.Module) -> bool:
@@ -164,6 +165,27 @@ def test_experiment_dynamics_only_requires_validation_cap_to_cover_one_chunk(
         )
 
 
+def test_experiment_requires_non_empty_wandb_project_when_enabled(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """W&B-enabled runs should reject an empty project name."""
+
+    with pytest.raises(ValueError, match="wandb_project"):
+        Experiment(
+            ExperimentConfig(
+                mode="ae_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="missing_wandb_project",
+                **DEBUG_FRAME_KWARGS,
+                wandb_enabled=True,
+                wandb_project="",
+                device="cpu",
+            )
+        )
+
+
 def test_experiment_validation_max_frames_caps_validation_clip_length(
     fake_long_dataset_root: Path,
     saved_world_model_ae_checkpoint: Path,
@@ -253,23 +275,21 @@ def test_experiment_supports_custom_wan_autoencoder_shape(
     assert experiment.model.wan_cfg == WanVAEConfig(dim=96, z_dim=64, num_res_blocks=1)
 
 
-def test_experiment_resume_preserves_checkpoint_temporal_wan_metadata(
+def test_experiment_resume_preserves_checkpoint_wan_metadata(
     fake_long_dataset_root: Path,
     tmp_path: Path,
 ) -> None:
-    """Resume should reuse hidden Wan tokenizer metadata serialized in the checkpoint."""
+    """Resume should preserve compatible Wan tokenizer metadata serialized in the checkpoint."""
 
     checkpoint_path = tmp_path / "temporal_wan_resume.pt"
     checkpoint_wan_config = WanVAEConfig(
-        dim=DEFAULT_WAN_DIM,
-        z_dim=DEFAULT_WAN_Z_DIM,
-        num_res_blocks=DEFAULT_WAN_NUM_RES_BLOCKS,
-        dim_mult=(1, 2, 4),
-        temperal_downsample=(True, True),
+        dim=96,
+        z_dim=64,
+        num_res_blocks=1,
     )
     model = WorldModel(
         ae_backend="wan",
-        latent_channels=DEFAULT_WAN_Z_DIM,
+        latent_channels=checkpoint_wan_config.z_dim,
         wan_config=checkpoint_wan_config,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -300,6 +320,9 @@ def test_experiment_resume_preserves_checkpoint_temporal_wan_metadata(
             output_dir=str(tmp_path / "outputs"),
             run_name="temporal_wan_resume_target",
             resume=str(checkpoint_path),
+            wan_dim=checkpoint_wan_config.dim,
+            latent_channels=checkpoint_wan_config.z_dim,
+            wan_num_res_blocks=checkpoint_wan_config.num_res_blocks,
             device="cpu",
         )
     )
@@ -1910,7 +1933,7 @@ def test_experiment_supports_metaworld_ae_training(
             validation_episode=1,
             metaworld_task_index=0,
             batch_size=2,
-            resolution=8,
+            resolution=16,
             dynamics_target_frames=1,
             output_dir=str(tmp_path / "outputs"),
             run_name="metaworld_ae",
@@ -1920,10 +1943,10 @@ def test_experiment_supports_metaworld_ae_training(
     assert len(experiment.train_dataset) == 1
     train_batch = next(iter(experiment.train_loader))
     validation_batch = next(iter(experiment.val_loader))
-    assert train_batch["frames"].shape == (1, 5, 3, 8, 8)
+    assert train_batch["frames"].shape == (1, 5, 3, 16, 16)
     assert train_batch["episode_idx"].reshape(-1)[0].item() == 0
     assert validation_batch["episode_idx"].reshape(-1)[0].item() == 1
-    assert validation_batch["frames"].shape[1:] == (3, 3, 8, 8)
+    assert validation_batch["frames"].shape[1:] == (3, 3, 16, 16)
 
 
 def test_experiment_supports_aloha_ae_training(
@@ -1942,7 +1965,7 @@ def test_experiment_supports_aloha_ae_training(
             validation_split="val",
             validation_episode=1,
             batch_size=2,
-            resolution=8,
+            resolution=16,
             dynamics_target_frames=1,
             output_dir=str(tmp_path / "outputs"),
             run_name="aloha_ae",
@@ -1953,10 +1976,10 @@ def test_experiment_supports_aloha_ae_training(
     assert experiment.model.dynamics.cfg.action_dim == 14
     train_batch = next(iter(experiment.train_loader))
     validation_batch = next(iter(experiment.val_loader))
-    assert train_batch["frames"].shape == (1, 5, 3, 8, 8)
+    assert train_batch["frames"].shape == (1, 5, 3, 16, 16)
     assert train_batch["episode_idx"].reshape(-1)[0].item() == 0
     assert validation_batch["episode_idx"].reshape(-1)[0].item() == 1
-    assert validation_batch["frames"].shape[1:] == (3, 3, 8, 8)
+    assert validation_batch["frames"].shape[1:] == (3, 3, 16, 16)
 
 
 def test_experiment_supports_maniskill_ae_training(
@@ -1975,7 +1998,7 @@ def test_experiment_supports_maniskill_ae_training(
             validation_split="val",
             validation_episode=1,
             batch_size=2,
-            resolution=8,
+            resolution=16,
             dynamics_target_frames=1,
             output_dir=str(tmp_path / "outputs"),
             run_name="maniskill_ae",
@@ -1986,10 +2009,10 @@ def test_experiment_supports_maniskill_ae_training(
     assert experiment.model.dynamics.cfg.action_dim == 8
     train_batch = next(iter(experiment.train_loader))
     validation_batch = next(iter(experiment.val_loader))
-    assert train_batch["frames"].shape == (1, 5, 3, 8, 8)
+    assert train_batch["frames"].shape == (1, 5, 3, 16, 16)
     assert train_batch["episode_idx"].reshape(-1)[0].item() == 0
     assert validation_batch["episode_idx"].reshape(-1)[0].item() == 1
-    assert validation_batch["frames"].shape[1:] == (3, 3, 8, 8)
+    assert validation_batch["frames"].shape[1:] == (3, 3, 16, 16)
 
 
 def test_experiment_supports_lerobot_so101_base_sim_pickplace_ae_training(
@@ -2008,7 +2031,7 @@ def test_experiment_supports_lerobot_so101_base_sim_pickplace_ae_training(
             validation_split="val",
             validation_episode=1,
             batch_size=2,
-            resolution=8,
+            resolution=16,
             dynamics_target_frames=1,
             output_dir=str(tmp_path / "outputs"),
             run_name="lerobot_so101_base_sim_pickplace_ae",
@@ -2019,10 +2042,10 @@ def test_experiment_supports_lerobot_so101_base_sim_pickplace_ae_training(
     assert experiment.model.dynamics.cfg.action_dim == 6
     train_batch = next(iter(experiment.train_loader))
     validation_batch = next(iter(experiment.val_loader))
-    assert train_batch["frames"].shape == (1, 5, 3, 8, 8)
+    assert train_batch["frames"].shape == (1, 5, 3, 16, 16)
     assert train_batch["episode_idx"].reshape(-1)[0].item() == 0
     assert validation_batch["episode_idx"].reshape(-1)[0].item() == 1
-    assert validation_batch["frames"].shape[1:] == (3, 3, 8, 8)
+    assert validation_batch["frames"].shape[1:] == (3, 3, 16, 16)
 
 
 def test_experiment_dynamics_only_can_train_all_episodes_with_separate_validation_clip(
@@ -2046,7 +2069,7 @@ def test_experiment_dynamics_only_can_train_all_episodes_with_separate_validatio
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 233
+    assert len(experiment.train_dataset) == 221
     assert experiment.train_dataset[124]["episode_idx"].item() == 1
     validation_batch = next(iter(experiment.val_loader))
     assert validation_batch["episode_idx"].reshape(-1)[0].item() == 0
@@ -2069,7 +2092,7 @@ def test_experiment_ae_motion_loss_uses_clip_batches(
             validation_split="val",
             validation_episode=1,
             batch_size=2,
-            resolution=8,
+            resolution=16,
             dynamics_target_frames=1,
             recon_motion_weight=0.5,
             output_dir=str(tmp_path / "outputs"),
@@ -2078,9 +2101,44 @@ def test_experiment_ae_motion_loss_uses_clip_batches(
         )
     )
     train_batch = next(iter(experiment.train_loader))
-    assert train_batch["frames"].shape == (1, 5, 3, 8, 8)
+    assert train_batch["frames"].shape == (1, 5, 3, 16, 16)
     assert "prev_frame" not in train_batch
     assert "next_frame" not in train_batch
+
+
+def test_experiment_so101_dynamics_uses_relative_actions_by_default(
+    fake_lerobot_so101_base_sim_pickplace_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """SO101 dynamics runs should resolve actions into scaled relative deltas by default."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            dataset_format="lerobot_so101_base_sim_pickplace",
+            data_root=str(fake_lerobot_so101_base_sim_pickplace_root),
+            split="train",
+            validation_split="val",
+            validation_episode=1,
+            batch_size=1,
+            resolution=16,
+            dynamics_context_frames=1,
+            dynamics_target_frames=1,
+            load_encoder_decoder=str(saved_world_model_ae_checkpoint),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="lerobot_so101_relative_dynamics",
+            device="cpu",
+        )
+    )
+
+    train_batch = next(iter(experiment.train_loader))
+    validation_batch = next(iter(experiment.val_loader))
+
+    assert experiment.cfg.resolved_dynamics_action_representation() == "relative_delta"
+    assert experiment.cfg.resolved_dynamics_action_scale() == 20.0
+    assert torch.equal(train_batch["actions"], torch.full((1, 4, 6), 200.0))
+    assert torch.equal(validation_batch["actions"], torch.full((1, 2, 6), 200.0))
 
 
 def test_experiment_supports_metaworld_dynamics_training_across_all_episodes(
@@ -2100,7 +2158,7 @@ def test_experiment_supports_metaworld_dynamics_training_across_all_episodes(
             validation_split="val",
             metaworld_task_index=0,
             batch_size=2,
-            resolution=8,
+            resolution=16,
             dynamics_context_frames=1,
             dynamics_target_frames=1,
             load_encoder_decoder=str(saved_world_model_ae_checkpoint),
@@ -2114,11 +2172,11 @@ def test_experiment_supports_metaworld_dynamics_training_across_all_episodes(
     assert experiment.train_dataset[0]["episode_idx"].item() == 0
     train_batch = next(iter(experiment.train_loader))
     validation_batch = next(iter(experiment.val_loader))
-    assert train_batch["context_frames"].shape[1:] == (1, 3, 8, 8)
-    assert train_batch["target_frames"].shape[1:] == (4, 3, 8, 8)
+    assert train_batch["context_frames"].shape[1:] == (1, 3, 16, 16)
+    assert train_batch["target_frames"].shape[1:] == (4, 3, 16, 16)
     assert train_batch["episode_idx"].reshape(-1)[0].item() == 0
     assert validation_batch["episode_idx"].reshape(-1)[0].item() == 1
-    assert validation_batch["frames"].shape[1:] == (3, 3, 8, 8)
+    assert validation_batch["frames"].shape[1:] == (3, 3, 16, 16)
 
 
 def test_experiment_excludes_validation_episodes_from_same_split_all_episode_training(
@@ -2142,7 +2200,7 @@ def test_experiment_excludes_validation_episodes_from_same_split_all_episode_tra
             device="cpu",
         )
     )
-    assert len(experiment.train_dataset) == 109
+    assert len(experiment.train_dataset) == 103
     assert experiment.train_dataset[0]["episode_idx"].item() == 1
 
 
@@ -2162,7 +2220,7 @@ def test_experiment_excludes_metaworld_validation_episodes_from_all_episode_trai
             train_all_episodes=True,
             metaworld_task_index=0,
             batch_size=2,
-            resolution=8,
+            resolution=16,
             dynamics_context_frames=1,
             dynamics_target_frames=1,
             load_encoder_decoder=str(saved_world_model_ae_checkpoint),
@@ -2214,7 +2272,11 @@ def test_checkpoint_round_trip(tmp_path: Path, fake_long_dataset_root: Path) -> 
     """World-model checkpoints should save and load the expected metadata."""
 
     checkpoint_path = tmp_path / "round_trip.pt"
-    model = WorldModel(ae_backend="wan")
+    model = WorldModel(
+        ae_backend="wan",
+        latent_channels=TEST_WAN_CONFIG.z_dim,
+        wan_config=TEST_WAN_CONFIG,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     config = ExperimentConfig(
         mode="ae_only",
@@ -2251,7 +2313,11 @@ def test_save_training_checkpoint_retries_with_legacy_format_after_zip_write_fai
     """Checkpoint saves should retry with legacy serialization after the known zip-writer failure."""
 
     checkpoint_path = tmp_path / "fallback.pt"
-    model = WorldModel(ae_backend="wan")
+    model = WorldModel(
+        ae_backend="wan",
+        latent_channels=TEST_WAN_CONFIG.z_dim,
+        wan_config=TEST_WAN_CONFIG,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     config = ExperimentConfig(
         mode="ae_only",
@@ -2261,6 +2327,7 @@ def test_save_training_checkpoint_retries_with_legacy_format_after_zip_write_fai
         device="cpu",
     )
     original_torch_save = torch.save
+    save_paths: list[Path] = []
     save_kwargs: list[dict[str, object]] = []
 
     def _fake_torch_save(obj: object, path: str | Path, **kwargs: object) -> None:
@@ -2268,6 +2335,7 @@ def test_save_training_checkpoint_retries_with_legacy_format_after_zip_write_fai
 
         del obj
         resolved_path = Path(path)
+        save_paths.append(resolved_path)
         save_kwargs.append(dict(kwargs))
         if len(save_kwargs) == 1:
             raise RuntimeError(
@@ -2290,8 +2358,74 @@ def test_save_training_checkpoint_retries_with_legacy_format_after_zip_write_fai
         best_metric=0.5,
     )
 
+    assert len(save_paths) == 2
+    assert save_paths[0] != checkpoint_path
+    assert save_paths[0] == save_paths[1]
     assert save_kwargs == [{}, {"_use_new_zipfile_serialization": False}]
     assert torch.load(checkpoint_path, map_location="cpu", weights_only=False) == {"legacy_retry": True}
+
+
+def test_save_training_checkpoint_preserves_existing_checkpoint_when_temp_save_fails(
+    tmp_path: Path,
+    fake_long_dataset_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint saves should preserve the previous target when both temp-save attempts fail."""
+
+    checkpoint_path = tmp_path / "preserve_existing.pt"
+    torch.save({"existing": True}, checkpoint_path)
+    model = WorldModel(
+        ae_backend="wan",
+        latent_channels=TEST_WAN_CONFIG.z_dim,
+        wan_config=TEST_WAN_CONFIG,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    config = ExperimentConfig(
+        mode="ae_only",
+        data_root=str(fake_long_dataset_root),
+        output_dir=str(tmp_path / "outputs"),
+        ae_backend="wan",
+        device="cpu",
+    )
+    save_paths: list[Path] = []
+
+    def _fake_torch_save(obj: object, path: str | Path, **kwargs: object) -> None:
+        """Simulate repeated temp-file save failures without touching the target checkpoint."""
+
+        del obj, kwargs
+        resolved_path = Path(path)
+        save_paths.append(resolved_path)
+        if len(save_paths) == 1:
+            resolved_path.write_bytes(b"partial")
+            raise RuntimeError(
+                "[enforce fail at inline_container.cc:862] . "
+                "PytorchStreamWriter failed writing file data/108: file write failed"
+            )
+        raise RuntimeError(
+            "[enforce fail at inline_container.cc:659] . "
+            "unexpected pos 1073828672 vs 1073828624"
+        )
+
+    monkeypatch.setattr(torch, "save", _fake_torch_save)
+
+    with pytest.raises(RuntimeError, match="unexpected pos"):
+        save_training_checkpoint(
+            path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=None,
+            step=3,
+            config=config.to_dict(),
+            mode=config.mode,
+            clip_metadata=config.clip_metadata(),
+            best_metric=0.5,
+        )
+
+    assert len(save_paths) == 2
+    assert save_paths[0] != checkpoint_path
+    assert save_paths[0] == save_paths[1]
+    assert torch.load(checkpoint_path, map_location="cpu", weights_only=False) == {"existing": True}
+    assert not list(tmp_path.glob(".preserve_existing.pt.*.tmp"))
 
 
 def test_experiment_resume_restores_rng_state(
@@ -2572,6 +2706,103 @@ def test_experiment_can_partial_load_encoder_decoder(
     assert not torch.allclose(dynamics_weight, torch.full_like(dynamics_weight, 0.75))
 
 
+def _raw_dreamdojo_state_dict_from_world_model(model: WorldModel) -> dict[str, torch.Tensor]:
+    """Convert one repo world-model AE state dict into raw DreamDojo Wan 2.2 key prefixes."""
+
+    raw_state: dict[str, torch.Tensor] = {}
+    for key, value in model.encoder.state_dict().items():
+        if key.startswith("backbone."):
+            raw_state[f"encoder.{key.removeprefix('backbone.')}"] = value.detach().clone()
+        elif key.startswith("moments_conv."):
+            raw_state[f"conv1.{key.removeprefix('moments_conv.')}"] = value.detach().clone()
+        else:
+            raise AssertionError(f"Unexpected encoder key {key}.")
+    for key, value in model.decoder.state_dict().items():
+        if key.startswith("backbone."):
+            raw_state[f"decoder.{key.removeprefix('backbone.')}"] = value.detach().clone()
+        elif key.startswith("pre_decode_conv."):
+            raw_state[f"conv2.{key.removeprefix('pre_decode_conv.')}"] = value.detach().clone()
+        else:
+            raise AssertionError(f"Unexpected decoder key {key}.")
+    return raw_state
+
+
+def test_experiment_rejects_raw_dreamdojo_checkpoint_when_wan_config_is_not_exact(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Raw DreamDojo Wan checkpoints should require the exact Wan 2.2 architecture."""
+
+    source_model = WorldModel(
+        ae_backend="wan",
+        latent_channels=TEST_WAN_CONFIG.z_dim,
+        wan_config=TEST_WAN_CONFIG,
+    )
+    raw_checkpoint_path = tmp_path / "dreamdojo_raw_small.pth"
+    torch.save(_raw_dreamdojo_state_dict_from_world_model(source_model), raw_checkpoint_path)
+
+    with pytest.raises(ValueError, match="require the exact tokenizer config"):
+        Experiment(
+            ExperimentConfig(
+                mode="ae_only",
+                data_root=str(fake_long_dataset_root),
+                output_dir=str(tmp_path / "outputs"),
+                run_name="reject_raw_dreamdojo_small",
+                **DEBUG_FRAME_KWARGS,
+                load_encoder_decoder=str(raw_checkpoint_path),
+                wan_dim=TEST_WAN_CONFIG.dim,
+                latent_channels=TEST_WAN_CONFIG.z_dim,
+                wan_num_res_blocks=TEST_WAN_CONFIG.num_res_blocks,
+                device="cpu",
+            )
+        )
+
+
+def test_experiment_can_partial_load_raw_dreamdojo_encoder_decoder(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loading raw DreamDojo-style Wan weights should respect the fixed prefix remap."""
+
+    source_model = WorldModel(
+        ae_backend="wan",
+        latent_channels=TEST_WAN_CONFIG.z_dim,
+        wan_config=TEST_WAN_CONFIG,
+    )
+    for parameter in source_model.encoder.parameters():
+        torch.nn.init.constant_(parameter, 0.25)
+    for parameter in source_model.decoder.parameters():
+        torch.nn.init.constant_(parameter, 0.5)
+    raw_checkpoint_path = tmp_path / "dreamdojo_raw_small_load.pth"
+    torch.save(_raw_dreamdojo_state_dict_from_world_model(source_model), raw_checkpoint_path)
+    monkeypatch.setattr(
+        Experiment,
+        "_assert_requested_wan_matches_dreamdojo_raw_checkpoint",
+        lambda self, path: TEST_WAN_CONFIG,
+    )
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="load_raw_dreamdojo_encoder_decoder",
+            **DEBUG_FRAME_KWARGS,
+            load_encoder_decoder=str(raw_checkpoint_path),
+            wan_dim=TEST_WAN_CONFIG.dim,
+            latent_channels=TEST_WAN_CONFIG.z_dim,
+            wan_num_res_blocks=TEST_WAN_CONFIG.num_res_blocks,
+            device="cpu",
+        )
+    )
+
+    encoder_weight = next(experiment.model.encoder.parameters())
+    decoder_weight = next(experiment.model.decoder.parameters())
+    assert torch.allclose(encoder_weight, torch.full_like(encoder_weight, 0.25))
+    assert torch.allclose(decoder_weight, torch.full_like(decoder_weight, 0.5))
+
+
 def test_experiment_can_partial_load_dynamics(
     fake_long_dataset_root: Path,
     saved_world_model_ae_checkpoint: Path,
@@ -2681,6 +2912,34 @@ def test_experiment_resume_disables_learning_rate_warmup(
     assert experiment.current_step == 5
     assert experiment._active_learning_rate() == pytest.approx(1e-5)
     assert all(group["lr"] == pytest.approx(1e-5) for group in experiment.optimizer.param_groups)
+
+
+def test_experiment_can_resume_dynamics_with_changed_spatial_resolution(
+    fake_long_dataset_root: Path,
+    saved_world_model_ae_checkpoint: Path,
+    tmp_path: Path,
+) -> None:
+    """Resuming with a different latent width should ignore regenerable RoPE buffers."""
+
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="dynamics_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="resume_changed_spatial_resolution",
+            **DEBUG_FRAME_KWARGS,
+            height=128,
+            width=160,
+            resume=str(saved_world_model_ae_checkpoint),
+            device="cpu",
+        )
+    )
+
+    assert experiment.current_step == 5
+    assert experiment.model.dynamics.cfg.max_img_h == 8
+    assert experiment.model.dynamics.cfg.max_img_w == 10
+    loaded_block_weight = experiment.model.dynamics.net.blocks[0].self_attn.q_proj.weight
+    assert torch.allclose(loaded_block_weight, torch.full_like(loaded_block_weight, 0.75))
 
 
 def test_experiment_rejects_missing_action_conditioning_metadata(

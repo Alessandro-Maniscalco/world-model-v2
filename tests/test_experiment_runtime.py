@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 
+from world_model_v2 import wandb_logger
 from world_model_v2.dynamics_transformer import DYNAMICS_FRAME_LAYOUT
 from world_model_v2.experiment import (
     Experiment,
@@ -18,6 +19,7 @@ from world_model_v2.experiment import (
     load_training_checkpoint,
     validation_metric_value_from_stats,
 )
+from world_model_v2.model import LatentNormalizationStats
 
 
 pytestmark = pytest.mark.slow
@@ -26,6 +28,88 @@ pytestmark = pytest.mark.slow
 DEBUG_FRAME_KWARGS = {"frame_start": 111, "frame_end": 123}
 DYNAMICS_FIVE_FRAME_KWARGS = {"frame_start": 111, "frame_end": 123}
 DYNAMICS_TWO_FRAME_KWARGS = {"frame_start": 111, "frame_end": 115}
+
+
+class _FakeWandbRun:
+    """Capture the W&B calls made by one experiment run."""
+
+    def __init__(self, run_id: str) -> None:
+        """Store the fake run identity and captured logs."""
+
+        self.id = run_id
+        self.log_calls: list[dict[str, object]] = []
+        self.summary: dict[str, object] = {}
+        self.finished = False
+
+    def log(self, payload: dict[str, object], *, step: int) -> None:
+        """Record one fake log payload."""
+
+        self.log_calls.append({"payload": dict(payload), "step": int(step)})
+
+    def finish(self) -> None:
+        """Mark the fake run as finished."""
+
+        self.finished = True
+
+
+class _FakeWandbModule:
+    """Provide fake `wandb.init()` runs for training-loop integration tests."""
+
+    def __init__(self) -> None:
+        """Initialize the fake module state."""
+
+        self.init_calls: list[dict[str, object]] = []
+        self.runs: list[_FakeWandbRun] = []
+        self.errors = type(
+            "FakeErrors",
+            (),
+            {
+                "AuthenticationError": type("AuthenticationError", (Exception,), {}),
+                "CommError": type("CommError", (Exception,), {}),
+            },
+        )
+
+    def init(self, **kwargs: object) -> _FakeWandbRun:
+        """Return one fake W&B run for the requested init call."""
+
+        self.init_calls.append(dict(kwargs))
+        run = _FakeWandbRun(f"run-{len(self.runs) + 1}")
+        self.runs.append(run)
+        return run
+
+
+class _FlakyOnlineFakeWandbModule(_FakeWandbModule):
+    """Fail the first online init so the trainer must retry offline."""
+
+    def __init__(self) -> None:
+        """Initialize the fake module state and failure counter."""
+
+        super().__init__()
+        self.online_failures = 0
+
+    def init(self, **kwargs: object) -> _FakeWandbRun:
+        """Raise one retryable online init error before succeeding offline."""
+
+        self.init_calls.append(dict(kwargs))
+        if kwargs.get("mode") == "online" and self.online_failures == 0:
+            self.online_failures += 1
+            raise self.errors.CommError("returned error 401: user is not logged in")
+        run = _FakeWandbRun(f"run-{len(self.runs) + 1}")
+        self.runs.append(run)
+        return run
+
+
+def _install_fake_wandb_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_module: _FakeWandbModule,
+) -> None:
+    """Patch the lazy `wandb` import used by the training loop."""
+
+    monkeypatch.setattr(
+        wandb_logger,
+        "_import_wandb_module",
+        lambda: fake_module,
+    )
 
 
 def test_wan_ae_only_training_step_reports_kl_terms(
@@ -86,8 +170,6 @@ def test_wan_dynamics_only_training_step_reports_rf_terms(
         "loss",
         "latent_rf_mse",
         "target_sigma",
-        "conditioning_frames_mean",
-        "use_video_condition_mean",
         "active_self_forcing_loss_weight",
         "active_rollout_self_forcing_loss_weight",
     }
@@ -95,12 +177,6 @@ def test_wan_dynamics_only_training_step_reports_rf_terms(
     assert float(metrics["active_rollout_self_forcing_loss_weight"]) == 0.0
     assert torch.isclose(metrics["loss"], metrics["latent_rf_mse"])
     assert float(metrics["target_sigma"]) > 0.0
-    assert (
-        DYNAMICS_FRAME_LAYOUT.conditioning_frame_choices[0]
-        <= float(metrics["conditioning_frames_mean"])
-        <= DYNAMICS_FRAME_LAYOUT.conditioning_frame_choices[-1]
-    )
-    assert 0.0 <= float(metrics["use_video_condition_mean"]) <= 1.0
 
 
 @pytest.mark.parametrize(
@@ -158,6 +234,7 @@ def test_wan_experiment_run_writes_artifacts_for_each_mode(
     training_record = next(record for record in metrics_records if record.get("step") == 1 and "loss" in record)
     validation_record = next(record for record in metrics_records if "validation" in record)
     assert training_record["learning_rate"] == pytest.approx(config.lr / config.lr_warmup_steps)
+    assert training_record["elapsed_run_seconds"] >= 0.0
     assert validation_record["validation"]["elapsed_run_seconds"] >= 0.0
     assert saved_stats["checkpoint"] == str(run_dir / "checkpoints" / "last.pt")
     assert saved_stats["best_checkpoint"] == str(run_dir / "checkpoints" / "best.pt")
@@ -187,11 +264,92 @@ def test_wan_experiment_run_writes_artifacts_for_each_mode(
         assert stats["dynamics_backend"] == "rf_dit"
 
 
-def test_ae_best_checkpoint_uses_validation_clip_normalization_stats(
+def test_wan_experiment_run_logs_metrics_to_wandb_when_enabled(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Training runs should mirror train and validation metrics into W&B."""
+
+    fake_wandb = _FakeWandbModule()
+    _install_fake_wandb_runtime(monkeypatch, fake_wandb)
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="ae_wandb",
+            **DEBUG_FRAME_KWARGS,
+            max_steps=1,
+            validation_interval=1,
+            checkpoint_interval=1,
+            log_interval=1,
+            wandb_enabled=True,
+            wandb_mode="offline",
+            wandb_project="wm-v2",
+            wandb_group="smoke",
+            wandb_tags=("ae", "wandb"),
+            device="cpu",
+        )
+    )
+
+    experiment.run()
+
+    assert fake_wandb.init_calls[0]["name"] == "ae_wandb"
+    assert fake_wandb.init_calls[0]["project"] == "wm-v2"
+    assert fake_wandb.init_calls[0]["tags"] == ["ae", "wandb"]
+    assert fake_wandb.runs[0].finished is True
+    logged_payloads = [call["payload"] for call in fake_wandb.runs[0].log_calls]
+    assert any("train/loss" in payload for payload in logged_payloads)
+    assert any("validation/ae_loss" in payload for payload in logged_payloads)
+    assert fake_wandb.runs[0].summary["run/effective_train_batch_size"] == 64
+    assert (tmp_path / "outputs" / "ae_wandb" / "wandb_run.json").exists()
+
+
+def test_wan_experiment_run_falls_back_to_offline_when_online_wandb_init_fails(
+    fake_long_dataset_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Training should continue offline when online W&B init fails with auth/comm errors."""
+
+    fake_wandb = _FlakyOnlineFakeWandbModule()
+    _install_fake_wandb_runtime(monkeypatch, fake_wandb)
+    experiment = Experiment(
+        ExperimentConfig(
+            mode="ae_only",
+            data_root=str(fake_long_dataset_root),
+            output_dir=str(tmp_path / "outputs"),
+            run_name="ae_wandb_online_fallback",
+            **DEBUG_FRAME_KWARGS,
+            max_steps=1,
+            validation_interval=1,
+            checkpoint_interval=1,
+            log_interval=1,
+            wandb_enabled=True,
+            wandb_mode="online",
+            wandb_project="wm-v2",
+            device="cpu",
+        )
+    )
+
+    experiment.run()
+
+    captured = capsys.readouterr()
+    assert '"event": "wandb_init_fell_back_to_offline"' in captured.out
+    assert fake_wandb.init_calls[0]["mode"] == "online"
+    assert fake_wandb.init_calls[1]["mode"] == "offline"
+    assert fake_wandb.runs[0].summary["run/requested_wandb_mode"] == "online"
+    assert fake_wandb.runs[0].summary["run/active_wandb_mode"] == "offline"
+    assert any("train/loss" in call["payload"] for call in fake_wandb.runs[0].log_calls)
+
+
+def test_ae_best_checkpoint_uses_fixed_wan_2pt2_normalization_stats(
     fake_multi_episode_dataset_root: Path,
     tmp_path: Path,
 ) -> None:
-    """AE best checkpoints should reuse the configured validation clips for normalization stats."""
+    """AE best checkpoints should keep the fixed Wan 2.2 normalization stats."""
 
     episode_one_path = fake_multi_episode_dataset_root / "single_grasp" / "train" / "episode_1.hdf5"
     with h5py.File(episode_one_path, "r+") as handle:
@@ -221,15 +379,7 @@ def test_ae_best_checkpoint_uses_validation_clip_normalization_stats(
 
     run_dir = tmp_path / "outputs" / "ae_validation_stats_scope"
     checkpoint = load_training_checkpoint(run_dir / "checkpoints" / "best.pt", device="cpu")
-    validation_stats = experiment._compute_latent_normalization_stats_from_clips(
-        [batch["frames"][0] for batch in experiment.val_loader]
-    )
-    train_stats = experiment._compute_latent_normalization_stats_from_clips(
-        [sample["frames"] for sample in experiment.train_dataset]
-    )
-
-    assert checkpoint["autoencoder"]["normalization_stats"] == validation_stats.to_dict()
-    assert checkpoint["autoencoder"]["normalization_stats"] != train_stats.to_dict()
+    assert checkpoint["autoencoder"]["normalization_stats"] == LatentNormalizationStats.dreamdojo_wan_2pt2().to_dict()
 
 
 def test_dynamics_run_can_opt_into_open_rollout_validation_stats(

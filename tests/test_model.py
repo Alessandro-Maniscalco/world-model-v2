@@ -8,21 +8,39 @@ import pytest
 import torch
 
 from world_model_v2.model import WorldModel
+from world_model_v2.wan_vae import WanVAEConfig
+
+
+TEST_WAN_CONFIG = WanVAEConfig(dim=16, dec_dim=16, z_dim=48, num_res_blocks=1)
+
+
+def _build_world_model(**overrides: object) -> WorldModel:
+    """Create a compact Wan 2.2 world model for architecture-level tests."""
+
+    kwargs: dict[str, object] = {
+        "ae_backend": "wan",
+        "resolution": 128,
+        "latent_channels": TEST_WAN_CONFIG.z_dim,
+        "wan_config": TEST_WAN_CONFIG,
+        "dynamics_model_channels": 32,
+        "dynamics_num_blocks": 1,
+        "dynamics_num_heads": 1,
+    }
+    kwargs.update(overrides)
+    return WorldModel(**kwargs)
 
 
 def test_world_model_rejects_removed_conv_backend() -> None:
     """The world model should reject the removed conv fallback backend."""
 
     with pytest.raises(ValueError, match="only supports the Wan VAE"):
-        WorldModel(ae_backend="conv", resolution=128)
+        _build_world_model(ae_backend="conv")
 
 
 def test_world_model_preserves_requested_dynamics_architecture() -> None:
     """The world model should build the RF DiT with the requested dynamics settings."""
 
-    model = WorldModel(
-        ae_backend="wan",
-        resolution=128,
+    model = _build_world_model(
         dynamics_model_channels=384,
         dynamics_num_blocks=6,
         dynamics_num_heads=8,
@@ -46,35 +64,47 @@ def test_world_model_preserves_requested_dynamics_architecture() -> None:
 def test_world_model_keeps_first_dit_at_full_latent_resolution() -> None:
     """The first DiT should not add extra spatial downsampling beyond the Wan VAE."""
 
-    model = WorldModel(
-        ae_backend="wan",
-        resolution=120,
-        height=120,
+    model = _build_world_model(
+        resolution=128,
+        height=128,
         width=160,
     )
 
     assert model.dynamics.cfg.patch_spatial == 1
-    assert model.dynamics.cfg.max_img_h == 120 // model.spatial_downsample_factor
+    assert model.dynamics.cfg.max_img_h == 128 // model.spatial_downsample_factor
     assert model.dynamics.cfg.max_img_w == 160 // model.spatial_downsample_factor
+
+
+def test_world_model_preserves_requested_dynamics_patch_spatial() -> None:
+    """The world model should allow DreamDojo-style latent spatial patching when requested."""
+
+    model = _build_world_model(
+        resolution=96,
+        height=96,
+        width=128,
+        dynamics_patch_spatial=2,
+    )
+
+    assert model.dynamics.cfg.patch_spatial == 2
+    assert model.dynamics.cfg.max_img_h == 96 // model.spatial_downsample_factor
+    assert model.dynamics.cfg.max_img_w == 128 // model.spatial_downsample_factor
 
 
 def test_world_model_rejects_unsupported_dynamics_variants() -> None:
     """The world model should fail fast on removed non-DreamDojo dynamics options."""
 
     with pytest.raises(ValueError, match="chunk_per_frame"):
-        WorldModel(ae_backend="wan", resolution=128, dynamics_action_conditioning_mode="global_chunk")
+        _build_world_model(dynamics_action_conditioning_mode="global_chunk")
     with pytest.raises(ValueError, match="use_learned_temporal_embedding"):
-        WorldModel(ae_backend="wan", resolution=128, dynamics_use_learned_temporal_embedding=True)
+        _build_world_model(dynamics_use_learned_temporal_embedding=True)
     with pytest.raises(ValueError, match="use_adaln_lora=True"):
-        WorldModel(ae_backend="wan", resolution=128, dynamics_use_adaln_lora=False)
+        _build_world_model(dynamics_use_adaln_lora=False)
 
 
 def test_world_model_preserves_requested_dynamics_layout_controls() -> None:
     """The world model should retain custom frame-layout and validation settings."""
 
-    model = WorldModel(
-        ae_backend="wan",
-        resolution=128,
+    model = _build_world_model(
         dynamics_context_frames=1,
         dynamics_target_frames=3,
         conditional_frame_sigma=1e-4,

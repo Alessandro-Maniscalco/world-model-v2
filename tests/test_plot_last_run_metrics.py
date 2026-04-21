@@ -117,7 +117,7 @@ def test_filter_records_min_step_keeps_metadata_and_drops_earlier_steps() -> Non
 
 
 def test_build_plot_supports_dynamics_validation_metrics(tmp_path: Path) -> None:
-    """Dynamics validation runs should plot their preferred metrics when AE loss is absent."""
+    """Dynamics validation runs should only plot their configured primary metric."""
 
     run_dir = tmp_path / "run"
     output_path = run_dir / "metrics_validation_plot.png"
@@ -149,7 +149,31 @@ def test_build_plot_supports_dynamics_validation_metrics(tmp_path: Path) -> None
     assert output_path.exists()
     assert result["latest"] == {
         "validation.open_rollout_consistency_score": 0.01,
-        "validation.next_frame_mse": 0.02,
-        "validation.open_rollout_frame_mse": 0.03,
-        "validation.next_latent_mse": 0.04,
     }
+
+
+def test_select_validation_metric_names_prefers_configured_primary_metric_when_no_total_loss() -> None:
+    """Dynamics plots should fall back to the configured validation objective when needed."""
+
+    records = [
+        {
+            "run_start": {
+                "config": {
+                    "mode": "dynamics_only",
+                    "dynamics_validation_metric": "next_frame_mse",
+                }
+            }
+        },
+        {
+            "step": 250,
+            "validation": {
+                "next_frame_mse": 0.2,
+                "next_latent_mse": 0.3,
+                "worst_case_next_frame_mse": 0.4,
+            },
+        },
+    ]
+
+    series = collect_validation_series(records)
+
+    assert select_validation_metric_names(records, series) == ("next_frame_mse",)
